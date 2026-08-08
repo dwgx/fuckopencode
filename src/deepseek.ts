@@ -18,6 +18,13 @@ import type { AnthropicStreamEvent } from './types.js';
 
 export const DEFAULT_FALLBACK_MODEL = 'deepseek-v4-flash';
 
+/**
+ * thinking 开启时 max_tokens 的下限。deepseek 的 thinking 计入 max_tokens 预算，
+ * 客户端小预算（如 200）会被 thinking 吃光导致正文空（实测 max_tokens=30 只有 thinking、
+ * 无 text；4096 正常出正文）。上游接受大 max_tokens（实测 4096 OK）。
+ */
+export const DEEPSEEK_MIN_MAX_TOKENS = 4096;
+
 /** 模型名解析：命中 MODEL_MAP 用映射值，否则回落 fallback（opencodezen 只认 flash）。 */
 export function resolveModelName(
   model: string,
@@ -98,6 +105,16 @@ export function normalizeAnthropicRequest(
   // 6. thinking enabled + 带工具的多轮：assistant 历史缺 thinking 块则注入空块，
   //    否则 deepseek 次轮 400（reasoning_content 缺失）。
   injectMissingThinkingBlocks(body);
+
+  // 7. max_tokens 下限保护：deepseek 的 thinking 计入 max_tokens 预算，客户端小预算
+  //    （如 200）会被 thinking 吃光导致正文空。thinking 非 disabled 时把 < 下限的抬到
+  //    下限、缺失补下限；≥ 下限保持；thinking disabled 不调（尊重客户端意图）。
+  if (!thinkingDisabled) {
+    const current = typeof body.max_tokens === 'number' ? body.max_tokens : undefined;
+    if (current == null || current < DEEPSEEK_MIN_MAX_TOKENS) {
+      body.max_tokens = DEEPSEEK_MIN_MAX_TOKENS;
+    }
+  }
 
   return body;
 }

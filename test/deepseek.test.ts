@@ -154,6 +154,60 @@ describe('normalizeAnthropicRequest', () => {
     const assistant = messages[0]!;
     expect(assistant.content.some((b) => b.type === 'thinking')).toBe(false);
   });
+
+  it('max_tokens 下限保护：thinking 非 disabled 时 < 4096 抬到 4096', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', thinking: { type: 'enabled' }, max_tokens: 200 },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.max_tokens).toBe(4096);
+  });
+
+  it('adaptive thinking 归一化后同样抬升 max_tokens', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', thinking: { type: 'adaptive' }, max_tokens: 30 },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.max_tokens).toBe(4096);
+  });
+
+  it('thinking enabled 且缺失 max_tokens 时补 4096', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', thinking: { type: 'enabled' } },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.max_tokens).toBe(4096);
+  });
+
+  it('max_tokens ≥ 4096 时保持', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', thinking: { type: 'enabled' }, max_tokens: 5000 },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.max_tokens).toBe(5000);
+  });
+
+  it('thinking disabled 时不抬升 max_tokens', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', thinking: { type: 'disabled' }, max_tokens: 100 },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.max_tokens).toBe(100);
+  });
+
+  it('thinking disabled 且缺失 max_tokens 时不补', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', thinking: { type: 'disabled' } },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect('max_tokens' in out).toBe(false);
+  });
 });
 
 describe('filterThinkingFromStream', () => {
