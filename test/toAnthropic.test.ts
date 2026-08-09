@@ -150,7 +150,7 @@ describe('anthropicToOpenAIRequest', () => {
     expect(out.max_tokens).toBe(55);
   });
 
-  it('image 块 → image_url（base64 转 data URI）', () => {
+  it('image 块 → 文本占位（上游不支持图片）', () => {
     const out = anthropicToOpenAIRequest({
       ...base,
       messages: [
@@ -163,10 +163,10 @@ describe('anthropicToOpenAIRequest', () => {
         },
       ],
     });
-    expect(out.messages[0]!.content).toEqual([
-      { type: 'text', text: '看图' },
-      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
-    ]);
+    // 上游 opencode Zen 报 "unknown variant `image_url`, expected `text`"，
+    // 所以图片降级成文本占位，避免整条会话 400。
+    // 全是 text 块时会合并成字符串形式（更兼容）。
+    expect(out.messages[0]!.content).toBe('看图\n[图片内容暂不支持，已省略]');
   });
 });
 
