@@ -1,20 +1,24 @@
 /**
  * DSML 工具调用兜底解析。
  *
- * DeepSeek 偶发不吐结构化 `tool_calls`，而是把工具调用当普通文本吐出来，
- * 形如（`⟨` 代表实际的分隔字符，上游用的是 antml/DSML 风格标记）：
+ * DeepSeek 偶发不吐结构化 `tool_calls`，而是把工具调用当普通文本吐出来。
+ * 实测形态（2026-08-09 线上截图，claude-mythos-5）：**每个标签自己带命名空间
+ * 前缀**，不是外层包一层：
  *
- *   ⟨|DSML|function_calls⟩
- *   <invoke name="Bash">
- *   <parameter name="command">ls -la</parameter>
- *   </invoke>
- *   ⟨/DSML|function_calls⟩
+ *   <|DSML|function_calls>
+ *   <|DSML|invoke name="Bash">
+ *   <|DSML|parameter name="command" string="true">ls -la</|DSML|parameter>
+ *   </|DSML|invoke>
+ *   </|DSML|function_calls>
  *
- * 客户端（Claude Code）看到的就是一堆裸文本，工具不会被执行。这里把这类文本
- * 还原成真正的 `tool_use` 块。
+ * 前缀形态不稳定（`|DSML|`、`antml:`、全角 `｜`、或干脆没有），所以标签匹配
+ * 统一走 `NS` 这个宽松前缀模式，不硬编码某一种。
  *
- * 保守原则：只在文本里同时出现 `function_calls` 包裹标记和 `<invoke name=...>`
- * 时才介入；解析不出任何 invoke 就原样返回，绝不吞掉正常文本。
+ * 客户端（Claude Code / opencode）看到的就是一堆裸文本，工具不会被执行。
+ * 这里把这类文本还原成真正的 `tool_use` 块。
+ *
+ * 保守原则：只在文本里**同时**出现 function_calls 标记和 invoke 标签时才介入；
+ * 解析不出任何 invoke 就原样返回，绝不吞掉正常文本。
  */
 
 export interface DsmlToolCall {
@@ -23,29 +27,56 @@ export interface DsmlToolCall {
 }
 
 export interface DsmlExtraction {
-  /** 剥掉 DSML 块之后剩下的文本（已 trim，可能为空）。 */
+  /** 剥掉 DSML 标记之后剩下的文本（已 trim，可能为空）。 */
   text: string;
   /** 解析出的工具调用，按出现顺序。 */
   toolCalls: DsmlToolCall[];
 }
 
-/** 匹配整个 function_calls 包裹块。分隔符宽松：允许 antml/DSML 等前缀变体。 */
-const FUNCTION_CALLS_BLOCK =
-  /[<⟨]\s*\|?\s*[A-Za-z]*\s*\|?\s*function_calls\s*\|?\s*[>⟩]?([\s\S]*?)(?:[<⟨]\s*\/\s*\|?\s*[A-Za-z]*\s*\|?\s*function_calls\s*\|?\s*[>⟩]?|$)/gi;
+/**
+ * 标签名前的命名空间噪声。三种形态：
+ * - `|DSML|` / ` | DSML | ` / 全角 `｜DSML｜`（实测形态）
+ * - `antml:` / `foo:`（XML 命名空间风格）
+ * - 空（标准 `<invoke>`）
+ */
+const NS = String.raw`(?:\s*[|｜]\s*[A-Za-z][\w-]*\s*[|｜]\s*|\s*[A-Za-z][\w-]*\s*:\s*|\s*)`;
 
-/** 单个 invoke 及其参数。 */
-const INVOKE = /<invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)(?:<\/invoke\s*>|$)/gi;
+/** 开/闭标签。闭合标签允许缺失（上游被 max_tokens 截断时）。 */
+const openTag = (name: string) => String.raw`[<⟨]${NS}${name}`;
+const closeTag = (name: string) => String.raw`[<⟨]\s*/${NS}${name}[^>⟩]*[>⟩]?`;
 
-/** 单个 parameter。属性顺序不固定，额外属性（如 string="true"）忽略。 */
-const PARAMETER = /<parameter\s+([^>]*?)>([\s\S]*?)(?:<\/parameter\s*>|$)/gi;
+const HAS_FUNCTION_CALLS = /function_calls/i;
+const HAS_INVOKE = new RegExp(`${openTag('invoke')}\\b`, 'i');
+
+/** function_calls 的开闭标记（用于从残余文本里剥掉）。 */
+const FUNCTION_CALLS_MARKER = new RegExp(
+  `${openTag('function_calls')}[^>]*>?|${closeTag('function_calls')}`,
+  'gi',
+);
+
+/** 单个 invoke 及其内容。属性段单独捕获，name 从属性里取。 */
+const INVOKE = new RegExp(
+  `${openTag('invoke')}\\s+([^>]*?)>([\\s\\S]*?)(?:${closeTag('invoke')}|$)`,
+  'gi',
+);
+
+/** 单个 parameter。属性顺序不固定，额外属性（如 string="true"）单独判读。 */
+const PARAMETER = new RegExp(
+  `${openTag('parameter')}\\s+([^>]*?)>([\\s\\S]*?)(?:${closeTag('parameter')}|$)`,
+  'gi',
+);
 
 function attrValue(attrs: string, key: string): string | null {
-  const m = new RegExp(`${key}\\s*=\\s*["']([^"']*)["']`, 'i').exec(attrs);
+  const m = new RegExp(`\\b${key}\\s*=\\s*["']([^"']*)["']`, 'i').exec(attrs);
   return m ? (m[1] ?? null) : null;
 }
 
-/** 参数值按 JSON 试解析（数字/布尔/对象），失败则保留原字符串。 */
-function coerce(raw: string): unknown {
+/**
+ * 参数值类型还原。上游带 `string="true"` 时明确是字符串，直接原样返回 ——
+ * 否则像 `command="123"` 这种会被误转成数字。
+ */
+function coerce(raw: string, attrs: string): unknown {
+  if (attrValue(attrs, 'string') === 'true') return raw;
   const s = raw.trim();
   if (s === '') return '';
   if (s === 'true') return true;
@@ -62,46 +93,42 @@ function coerce(raw: string): unknown {
   return raw;
 }
 
-function parseInvokes(inner: string): DsmlToolCall[] {
-  const calls: DsmlToolCall[] = [];
+/**
+ * 从文本里抽出 DSML 工具调用。没有可解析的调用时返回 null
+ * （调用方保持原样，避免对正常文本做任何改写）。
+ */
+export function extractDsmlToolCalls(text: string): DsmlExtraction | null {
+  if (!text || !HAS_FUNCTION_CALLS.test(text) || !HAS_INVOKE.test(text)) return null;
+
+  const toolCalls: DsmlToolCall[] = [];
+  let rest = '';
+  let lastEnd = 0;
+
   INVOKE.lastIndex = 0;
   let m: RegExpExecArray | null;
-  while ((m = INVOKE.exec(inner)) != null) {
-    const name = (m[1] ?? '').trim();
+  while ((m = INVOKE.exec(text)) != null) {
+    const name = (attrValue(m[1] ?? '', 'name') ?? '').trim();
     if (!name) continue;
+
     const input: Record<string, unknown> = {};
     const body = m[2] ?? '';
     PARAMETER.lastIndex = 0;
     let p: RegExpExecArray | null;
     while ((p = PARAMETER.exec(body)) != null) {
-      const key = attrValue(p[1] ?? '', 'name');
-      if (key) input[key] = coerce(p[2] ?? '');
+      const attrs = p[1] ?? '';
+      const key = attrValue(attrs, 'name');
+      if (key) input[key] = coerce(p[2] ?? '', attrs);
     }
-    calls.push({ name, input });
-  }
-  return calls;
-}
 
-/**
- * 从文本里抽出 DSML 工具调用。没有可解析的调用时返回 null（调用方保持原样，
- * 避免对正常文本做任何改写）。
- */
-export function extractDsmlToolCalls(text: string): DsmlExtraction | null {
-  if (!text || !/function_calls/i.test(text) || !/<invoke\s/i.test(text)) return null;
-
-  const toolCalls: DsmlToolCall[] = [];
-  let rest = '';
-  let lastEnd = 0;
-  FUNCTION_CALLS_BLOCK.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = FUNCTION_CALLS_BLOCK.exec(text)) != null) {
-    const calls = parseInvokes(m[1] ?? '');
-    if (calls.length === 0) continue;
-    toolCalls.push(...calls);
+    toolCalls.push({ name, input });
     rest += text.slice(lastEnd, m.index);
     lastEnd = m.index + m[0].length;
   }
+
   if (toolCalls.length === 0) return null;
   rest += text.slice(lastEnd);
-  return { text: rest.trim(), toolCalls };
+  // 残余里还会留着 function_calls 的开闭标记，一并剥掉。
+  return { text: rest.replace(FUNCTION_CALLS_MARKER, '').trim(), toolCalls };
 }
+
+

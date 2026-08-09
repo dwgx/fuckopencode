@@ -382,12 +382,13 @@ describe('openAIStreamToAnthropic', () => {
 
 describe('DSML 泄漏兜底解析', () => {
   it('流式：DSML 包裹的工具调用被还原成 tool_use 块', async () => {
+    // 线上实测格式：每个标签自己带 |DSML| 前缀（见 DEEPSEEK-QUIRKS 第 12 条）。
     const leaked = [
-      '⟨|DSML|function_calls⟩',
-      '<invoke name="Bash">',
-      '<parameter name="command">ls -la</parameter>',
-      '</invoke>',
-      '⟨/DSML|function_calls⟩',
+      '< | DSML | function_calls',
+      '< | DSML | invoke name="Bash">',
+      '< | DSML | parameter name="command" string="true">ls -la</ | DSML | parameter>',
+      '</ | DSML | invoke>',
+      '</ | DSML | function_calls>',
     ].join('\n');
     const events = await collect(
       openAIStreamToAnthropic(
@@ -431,7 +432,8 @@ describe('DSML 泄漏兜底解析', () => {
   });
 
   it('非流式：DSML 文本被还原成 tool_use', () => {
-    const leaked = '⟨|DSML|function_calls⟩\n<invoke name="Bash"><parameter name="command">ls</parameter></invoke>\n⟨/DSML|function_calls⟩';
+    const leaked =
+      '<|DSML|function_calls>\n<|DSML|invoke name="Bash"><|DSML|parameter name="command">ls</|DSML|parameter></|DSML|invoke>\n</|DSML|function_calls>';
     const out = openAIToAnthropicResponse({
       id: 'c1',
       object: 'chat.completion',
@@ -441,7 +443,8 @@ describe('DSML 泄漏兜底解析', () => {
         {
           index: 0,
           message: { role: 'assistant', content: leaked },
-          finish_reason: 'tool_calls',
+          // 泄漏场景上游给的是 stop（它自己不认为这是工具调用）。
+          finish_reason: 'stop',
         },
       ],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
@@ -450,5 +453,8 @@ describe('DSML 泄漏兜底解析', () => {
     expect(tu).toBeDefined();
     expect((tu as { name: string }).name).toBe('Bash');
     expect((tu as { input: unknown }).input).toEqual({ command: 'ls' });
+    // 泄漏成文本时 finish_reason 是 stop；还原成工具调用后必须纠正为 tool_use，
+    // 否则客户端当成 end_turn 不会执行工具。
+    expect(out.stop_reason).toBe('tool_use');
   });
 });
