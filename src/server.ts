@@ -14,6 +14,7 @@ import { verifyAuth } from './security/auth.js';
 import { buildSystemGuard, detectInjection, extractAllText, scanMessagesForInjection } from './security/injection.js';
 import { isJsonContentType, validateAnthropicRequest, validateChatRequest } from './security/validate.js';
 import { extractDevice, recordEvent, snapshot, type RequestEvent } from './metrics.js';
+import { UsageDb } from './usagedb.js';
 import { DASHBOARD_HTML } from './dashboard.js';
 import { anthropicToOpenAIRequest } from './toOpenAI.js';
 import { anthropicEventToSSE, openAIStreamToAnthropic, openAIToAnthropicResponse } from './toAnthropic.js';
@@ -201,6 +202,28 @@ export function logKeyStateChange(ev: KeyStateEvent): void {
   console.warn(`[keypool] disabled key=${ev.fingerprint} reason=${ev.kind ?? '?'} cooldown=${cooldown} ${health}`);
 }
 
+/**
+ * 把状态变更同时写进日志和用量库。
+ *
+ * 为什么要包一层：日志只在 `journalctl` 里，重启后面板拿不到任何历史 ——
+ * 「这个 key 昨天被禁过几次」这类问题此前只能翻日志。落库之后面板能直接列
+ * 最近的禁用/恢复。db 不可用时 `recordKeyEvent` 是空操作，日志照旧。
+ */
+export function keyStateHandler(db: UsageDb): (ev: KeyStateEvent) => void {
+  return (ev) => {
+    logKeyStateChange(ev);
+    db.recordKeyEvent({
+      at: Date.now(),
+      keyFingerprint: ev.fingerprint,
+      type: ev.type,
+      kind: ev.kind,
+      cooldownMs: ev.cooldownMs,
+      healthyCount: ev.healthyCount,
+      poolSize: ev.poolSize,
+    });
+  };
+}
+
 /** 池空日志的节流窗口：整池被禁时请求会连续撞上来，不必每条都记。 */
 const POOL_EMPTY_LOG_INTERVAL_MS = 10_000;
 let lastPoolEmptyLogAt = 0;
@@ -224,13 +247,16 @@ function logPoolEmpty(pool: KeyPool): void {
   suppressedPoolEmptyCount = 0;
 }
 
-export function createApp(cfg: AppConfig, pool?: KeyPool) {  // 未显式传 pool 时，用 cfg.upstreamKeys 建默认池（兼容测试直连场景）。
+export function createApp(cfg: AppConfig, pool?: KeyPool, usageDb?: UsageDb) {
+  // 用量库：未显式传时按配置建。构造永不抛，不可用就退化成 no-op（面板无累计列）。
+  const db = usageDb ?? new UsageDb(cfg.usageDbPath, cfg.usageDbRetentionDays);
+  // 未显式传 pool 时，用 cfg.upstreamKeys 建默认池（兼容测试直连场景）。
   const keyPool =
     pool ??
     new KeyPool(cfg.upstreamKeys, {
       cooldownMs: cfg.keyCooldownMs,
       failThreshold: cfg.keyFailThreshold,
-      onStateChange: logKeyStateChange,
+      onStateChange: keyStateHandler(db),
     });
 
   // 后台拉一次上游模型清单，失败不影响服务启动。
@@ -297,6 +323,11 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {  // 未显式传 poo
               size: keyPool.size,
               healthy: keyPool.healthyCount,
               disabled: keyPool.disabledFingerprints(),
+              // 逐 key 明细：在飞请求数（= 几个号在扛并发）、禁用原因、剩余冷却。
+              keys: keyPool.snapshot(),
+              // 跨重启累计。db 不可用时为 null，面板据此隐藏累计列。
+              history: db.history(),
+              historyDisabledReason: db.enabled ? null : db.disabledReason,
             },
             config: {
               subscriptionBaseUrl: cfg.anthropicBaseUrl,
@@ -416,6 +447,23 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {  // 未显式传 poo
           requestBytes: ctx.requestBytes,
           device: extractDevice(req),
           keyFingerprint: ctx.keyFingerprint,
+          error: ctx.error,
+        });
+        // 同一份数据落库。内存指标环形缓冲重启即清零，落库的才能回答
+        // 「这个 key 这个月一共扛了多少」。不记 IP/UA —— 那是内存面板的事，
+        // 长期留存反而是隐私负担。
+        db.recordRequest({
+          at: startTime,
+          keyFingerprint: ctx.keyFingerprint,
+          model: ctx.model,
+          upstreamModel: ctx.upstreamModel,
+          endpoint: ctx.endpoint,
+          status: res.statusCode,
+          durationMs: elapsed,
+          stream: ctx.stream,
+          inputTokens: ctx.inputTokens,
+          outputTokens: ctx.outputTokens,
+          thinkingTokens: ctx.thinkingTokens,
           error: ctx.error,
         });
       }

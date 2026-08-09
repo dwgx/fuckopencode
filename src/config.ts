@@ -13,6 +13,15 @@ export interface AppConfig {
   keyFailThreshold: number;
   /** key 池：冷却期（ms） */
   keyCooldownMs: number;
+  /**
+   * 用量持久化 db 路径（SQLite）。空串 = 关闭持久化，面板只剩内存窗口。
+   *
+   * 默认在**代码目录旁的 `data/`**，刻意不在 `dist/` 里 —— `scripts/deploy.sh`
+   * 每次部署都 `mv dist dist.prev; mv dist.new dist`，放 dist 内会随部署丢。
+   */
+  usageDbPath: string;
+  /** 用量记录保留天数，0 = 不清理。 */
+  usageDbRetentionDays: number;
   /** 上游 base URL，末尾不带斜杠。订阅端点（opencode Zen 的 /zen/go）。 */
   anthropicBaseUrl: string;
   /**
@@ -120,6 +129,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     upstreamKeys,
     keyFailThreshold: intFromEnv(env.KEY_FAIL_THRESHOLD, 5, 1),
     keyCooldownMs: intFromEnv(env.KEY_COOLDOWN_MS, 300_000, 1_000),
+    // `USAGE_DB_PATH` 未设 → 默认 `<cwd>/data/usage.db`。cwd 在 systemd unit 里是
+    // `WorkingDirectory=/root/fuckopencode`（已核实），即与 dist/ 同级的 data/。
+    // 显式设为空串 = 关闭持久化（此时面板只有内存窗口，代理行为完全不变）。
+    usageDbPath: env.USAGE_DB_PATH === '' ? '' : (env.USAGE_DB_PATH || 'data/usage.db'),
+    usageDbRetentionDays: intFromEnv(env.USAGE_DB_RETENTION_DAYS, 30, 0),
     anthropicBaseUrl: (env.ANTHROPIC_BASE_URL || 'https://opencode.ai/zen/go').replace(/\/+$/, ''),
     payAsYouGoBaseUrl: (env.PAYG_BASE_URL || 'https://opencode.ai/zen').replace(/\/+$/, ''),
     modelMap: parseModelMap(env.MODEL_MAP),

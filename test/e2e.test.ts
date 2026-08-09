@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createApp } from '../src/server.js';
 import type { AppConfig } from '../src/config.js';
 import type { OpenAIChatRequest } from '../src/types.js';
@@ -146,6 +149,8 @@ describe('v1 代理端到端', () => {
     trustClaudeCodeHeaders: false,
     dashboardOpen: false,
     dashboardPublic: false,
+    usageDbPath: '',  // 单测不落盘（专门的用量持久化用例在下面自建临时库）
+    usageDbRetentionDays: 30,
   };
 
   beforeAll(async () => {
@@ -427,6 +432,8 @@ describe('未鉴权放行模式的安全加固', () => {
     trustClaudeCodeHeaders: false,
     dashboardOpen: false,
     dashboardPublic: false,
+    usageDbPath: '',  // 单测不落盘（专门的用量持久化用例在下面自建临时库）
+    usageDbRetentionDays: 30,
   };
 
   beforeAll(async () => {
@@ -528,6 +535,8 @@ describe('监控面板访问控制', () => {
     trustClaudeCodeHeaders: false,
     dashboardOpen: true,
     dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
   };
 
   beforeAll(async () => {
@@ -573,6 +582,40 @@ describe('监控面板访问控制', () => {
     expect(json.pool.size).toBe(1);
   });
 
+  it('/__metrics 带逐 key 明细，且只暴露指纹不暴露 key 原文', async () => {
+    const raw = await (await fetch(`${baseUrl}/__metrics`)).text();
+    // 上游 key 原文（`sk-fake`）绝不能出现在响应任何位置。
+    expect(raw).not.toContain('sk-fake');
+    const json = JSON.parse(raw) as {
+      pool: {
+        size: number;
+        healthy: number;
+        disabled: string[];
+        keys: Array<Record<string, unknown>>;
+        history: unknown;
+        historyDisabledReason: string | null;
+      };
+    };
+    expect(json.pool.keys).toHaveLength(1);
+    const k = json.pool.keys[0]!;
+    // 面板要能不做任何计算就渲染出来：状态、在飞数、冷却剩余全部现成。
+    expect(k).toMatchObject({
+      fingerprint: '****fake',
+      healthy: true,
+      inFlight: 0,
+      failCount: 0,
+      disabledUntil: 0,
+      recoverInMs: 0,
+    });
+    expect(typeof k.totalAcquired).toBe('number');
+    expect(typeof k.lastUsedAt).toBe('number');
+    // usageDbPath='' → 持久化关闭，history 为 null，面板据此隐藏累计列。
+    expect(json.pool.history).toBeNull();
+    expect(json.pool.historyDisabledReason).toBe('disabled by config');
+    // 旧字段保留（向后兼容）。
+    expect(json.pool.disabled).toEqual([]);
+  });
+
   it('面板自身的轮询不计入指标（否则会把自己刷满）', async () => {
     // metrics 是模块级状态，同文件其他 describe 已有计数，所以比较增量而非绝对值。
     const before = (await (await fetch(`${baseUrl}/__metrics`)).json()) as { totalRequests: number };
@@ -608,6 +651,8 @@ describe('面板完全公开模式（DASHBOARD_PUBLIC=1）', () => {
     trustClaudeCodeHeaders: false,
     dashboardOpen: false,
     dashboardPublic: true,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
   };
 
   beforeAll(async () => {
@@ -640,5 +685,106 @@ describe('面板完全公开模式（DASHBOARD_PUBLIC=1）', () => {
   it('但 API 端点仍然要 key —— 公开面板不等于公开 API', async () => {
     const res = await fetch(`${baseUrl}/v1/models`, { headers: { 'cf-connecting-ip': '8.8.8.8' } });
     expect(res.status).toBe(401);
+  });
+});
+
+/**
+ * 用量持久化的**接线**测试。
+ *
+ * 为什么单独写：`test/usagedb.test.ts` 只验证 UsageDb 这个类自己对不对，
+ * 证明不了 server.ts 真的调了它 —— 同类接线漏洞刚在 kirostudio 上踩过一次
+ * （算法测试全绿，但公共入口那条路径压根没接上）。所以这里必须走真实
+ * HTTP 请求，再从 /__metrics 读回累计值。
+ */
+describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+  let tmpDir: string;
+
+  const dbCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: [],
+    anthropicApiKey: 'sk-usage-fake',
+    upstreamKeys: ['sk-usage-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: true,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: true,
+    dashboardPublic: true,
+    usageDbPath: '',  // beforeAll 里指向临时目录
+    usageDbRetentionDays: 30,
+  };
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-e2e-usage-'));
+    dbCfg.usageDbPath = path.join(tmpDir, 'usage.db');
+    fake = await startFakeUpstream();
+    dbCfg.anthropicBaseUrl = fake.baseUrl;
+    proxy = createApp(dbCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('请求结束后累计进 sqlite，且面板能读到逐 key 累计', async () => {
+    const chat = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: '累计测试' }] }),
+    });
+    expect(chat.status).toBe(200);
+
+    const raw = await (await fetch(`${baseUrl}/__metrics`)).text();
+    // 落库路径同样不能把 key 原文带出来。
+    expect(raw).not.toContain('sk-usage-fake');
+    const json = JSON.parse(raw) as {
+      pool: {
+        keys: Array<{ fingerprint: string; totalAcquired: number }>;
+        history: {
+          since: number;
+          totalRequests: number;
+          byKey: Array<{ fingerprint: string; requests: number; ok: number; tokens: number }>;
+          recentKeyEvents: unknown[];
+        } | null;
+      };
+    };
+    // sqlite 不可用（Node 20 无 node:sqlite）时 history 为 null —— 那种环境下
+    // 这条断言无意义，跳过而不是假装通过。
+    if (json.pool.history === null) {
+      expect(json.pool.keys[0]!.totalAcquired).toBeGreaterThan(0);
+      return;
+    }
+    expect(json.pool.history.totalRequests).toBeGreaterThan(0);
+    expect(json.pool.history.since).toBeGreaterThan(0);
+    const fp = json.pool.keys[0]!.fingerprint;
+    const mine = json.pool.history.byKey.find((r) => r.fingerprint === fp);
+    expect(mine).toBeDefined();
+    expect(mine!.requests).toBeGreaterThan(0);
+    expect(mine!.ok).toBeGreaterThan(0);
+    expect(mine!.tokens).toBeGreaterThan(0);
+  });
+
+  it('db 文件真的落在配置指定的位置（不在 dist/ 内，deploy 时不会被 mv 掉）', () => {
+    const exists = fs.existsSync(dbCfg.usageDbPath);
+    // Node 20 无 node:sqlite 时不会建文件，此时只要求「没崩」。
+    if (exists) expect(fs.statSync(dbCfg.usageDbPath).size).toBeGreaterThan(0);
+    expect(dbCfg.usageDbPath.includes('/dist/')).toBe(false);
   });
 });

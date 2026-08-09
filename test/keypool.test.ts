@@ -371,3 +371,119 @@ describe('多 key 公平分担（RPM 均摊）', () => {
     expect(pool.acquire()).toBeTruthy();
   });
 });
+
+/**
+ * `snapshot()` 是面板的数据源。这组测试的存在理由：2026-08-10 用户问「有个 key
+ * 是不是用完了」，回答这个问题要去 journalctl 翻 `[keypool] disabled` 行、再读
+ * 源码算冷却公式、再在服务器上手算恢复时刻 —— 而这些信息本来就在内存里。
+ * 所以这里逐字段坐实「面板能直接显示，不需要任何推算」。
+ */
+describe('KeyPool.snapshot（面板可观测面）', () => {
+  it('健康池：字段齐全、不含 key 原文', () => {
+    const pool = new KeyPool(['sk-secret-tail0osU', 'sk-other-tailZOBb'], OPTS);
+    const snap = pool.snapshot();
+    expect(snap).toHaveLength(2);
+    // 顺序与配置顺序一致，方便对号
+    expect(snap.map((s) => s.fingerprint)).toEqual(['****0osU', '****ZOBb']);
+    // 绝不泄露原文
+    expect(JSON.stringify(snap)).not.toContain('secret');
+    expect(JSON.stringify(snap)).not.toContain('sk-');
+    for (const s of snap) {
+      expect(s.healthy).toBe(true);
+      expect(s.inFlight).toBe(0);
+      expect(s.failCount).toBe(0);
+      expect(s.disabledReason).toBeUndefined();
+      expect(s.disabledUntil).toBe(0);
+      expect(s.recoverInMs).toBe(0);
+      expect(s.totalAcquired).toBe(0);
+    }
+  });
+
+  it('inFlight 反映当前并发 —— 回答「几个号在扛分流」', () => {
+    // key 长于 4 位，否则两个指纹都是 `****`（见下一个用例的说明）。
+    const pool = new KeyPool(['sk-key-aaaa', 'sk-key-bbbb'], OPTS);
+    const k1 = pool.acquire();
+    const k2 = pool.acquire();
+    const k3 = pool.acquire(); // 第三个请求回到最闲的那个
+    const snap = pool.snapshot();
+    expect(snap).toHaveLength(2);
+    // 两个 key 各承载并发，总和等于活跃请求数
+    expect(snap.reduce((n, s) => n + s.inFlight, 0)).toBe(3);
+    // 分流均匀：3 个并发落在 2 个 key 上，没有一个 key 独吞
+    expect(snap.every((s) => s.inFlight >= 1)).toBe(true);
+    // 每个 key 的 totalAcquired 累计
+    expect(snap.reduce((n, s) => n + s.totalAcquired, 0)).toBe(3);
+    pool.release(k1);
+    pool.release(k2);
+    pool.release(k3);
+    expect(pool.snapshot().reduce((n, s) => n + s.inFlight, 0)).toBe(0);
+    // release 不该回退累计次数
+    expect(pool.snapshot().reduce((n, s) => n + s.totalAcquired, 0)).toBe(3);
+  });
+
+  it('额度耗尽：带原因 + 恢复时刻 + 剩余毫秒（面板无需推算）', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
+    // 复刻线上实况：上游给 22620s 重置时间，keypool 加 60s 余量 = 22680s
+    pool.markFailure('a', 'quota-exhausted', 22_620_000);
+    const s = pool.snapshot().find((x) => !x.healthy)!;
+    expect(s.disabledReason).toBe('quota-exhausted');
+    expect(s.recoverInMs).toBe(22_680_000);
+    expect(s.disabledUntil).toBe(clock.now() + 22_680_000);
+
+    // 时间推进后剩余递减，绝对时刻不变（面板可本地倒计时）
+    const until = s.disabledUntil;
+    clock.advance(680_000);
+    const s2 = pool.snapshot().find((x) => !x.healthy)!;
+    expect(s2.recoverInMs).toBe(22_000_000);
+    expect(s2.disabledUntil).toBe(until);
+  });
+
+  it('各类禁用原因都记下来，恢复后清空', () => {
+    const clock = fakeClock();
+    // ⚠️ key 必须长于 4 位：keyFingerprint 对 <=4 位统一返回 `****`，
+    // 用 'a'/'b'/'c' 会让三个 key 指纹全相同、按指纹建 Map 直接互相覆盖。
+    const [ka, kb, kc] = ['sk-key-aaaa', 'sk-key-bbbb', 'sk-key-cccc'];
+    const pool = new KeyPool([ka!, kb!, kc!], { ...OPTS, now: clock.now });
+    pool.markFailure(ka!, 'auth');
+    pool.markFailure(kb!, 'rate-limit');
+    for (let i = 0; i < 3; i++) pool.markFailure(kc!, 'transient'); // 达阈值才禁
+
+    const reasons = new Map(pool.snapshot().map((s) => [s.fingerprint, s.disabledReason]));
+    expect(reasons.get(keyFingerprint(ka!))).toBe('auth');
+    expect(reasons.get(keyFingerprint(kb!))).toBe('rate-limit');
+    expect(reasons.get(keyFingerprint(kc!))).toBe('transient');
+
+    // 冷却全部到期 + acquire 触发 reapRecovered → 原因清空，不留「healthy 但带原因」
+    clock.advance(OPTS.cooldownMs * 100);
+    pool.acquire();
+    for (const s of pool.snapshot()) {
+      expect(s.healthy).toBe(true);
+      expect(s.disabledReason).toBeUndefined();
+      expect(s.disabledUntil).toBe(0);
+    }
+  });
+
+  it('冷却自然到期但还没 acquire：不显示自相矛盾的 healthy+原因', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a'], { ...OPTS, now: clock.now });
+    pool.markFailure('a', 'quota-exhausted', 1000);
+    expect(pool.snapshot()[0]!.healthy).toBe(false);
+    // 冷却过期，但没调 acquire（reapRecovered 未跑，内部 disabledUntil 仍是旧值）
+    clock.advance(999_999);
+    const s = pool.snapshot()[0]!;
+    expect(s.healthy).toBe(true);
+    expect(s.disabledReason).toBeUndefined();
+    expect(s.disabledUntil).toBe(0);
+    expect(s.recoverInMs).toBe(0);
+  });
+
+  it('reset 显式恢复也清掉原因', () => {
+    const pool = new KeyPool(['a'], OPTS);
+    pool.markFailure('a', 'auth');
+    expect(pool.snapshot()[0]!.disabledReason).toBe('auth');
+    pool.reset('a');
+    expect(pool.snapshot()[0]!.disabledReason).toBeUndefined();
+    expect(pool.snapshot()[0]!.healthy).toBe(true);
+  });
+});

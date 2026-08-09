@@ -142,6 +142,40 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .dev dt { color: var(--fg-weaker); }
   .dev dd { color: var(--fg-weak); word-break: break-all; }
 
+  /* ── key pool ───────────────────────────────────── */
+  /* 不写死列数：key 数量由配置决定（线上 2 个，本地 3 个，以后可能 5 个），
+     任何固定值在别的数量下都会难看。
+     用 auto-fit 而非 auto-fill —— auto-fill 会留下空轨道，容器那层
+     半透明底色就会露出一整块空白（3 个卡片 4 列时实测如此）。 */
+  .keys {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(288px, 1fr));
+    gap: 1px; background: var(--line-weak); border: 1px solid var(--line-weak);
+  }
+  .kc { background: var(--bg); padding: 12px 14px; min-width: 0; }
+  .kc.off { background: var(--bg-strong); }
+  .kc .hd { display: flex; align-items: baseline; gap: 8px; }
+  .kc .fp { color: var(--fg); font-size: 13px; }
+  .kc .badge { margin-left: auto; font-size: 12px; white-space: nowrap; }
+  .kc dl { display: grid; grid-template-columns: 64px 1fr; gap: 3px 10px; margin-top: 8px; font-size: 12px; }
+  .kc dt { color: var(--fg-weaker); }
+  .kc dd { color: var(--fg-weak); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .kc dd b { font-weight: 400; color: var(--fg-base); }
+  .kc .glyph { color: var(--accent); letter-spacing: 1px; }
+  .kc .glyph em { font-style: normal; color: var(--fg-weaker); }
+  .kc .t { height: 2px; background: var(--bg-weak); margin-top: 9px; }
+  .kc .t .f { display: block; height: 100%; background: var(--accent); opacity: .8; transition: width .4s ease; }
+  .kc.off .t .f { background: var(--bad); }
+
+  .kevs { display: flex; flex-direction: column; margin-top: 12px; }
+  .kev {
+    display: grid; grid-template-columns: 62px 84px 1fr auto;
+    gap: 10px; padding: 5px 0; font-size: 12px;
+    border-bottom: 1px solid var(--line-weak); color: var(--fg-weak);
+  }
+  .kev:last-child { border-bottom: 0; }
+  .kev .w { color: var(--fg-weaker); }
+  @media (max-width: 620px) { .kev { grid-template-columns: 62px 84px 1fr; } .kev .kv-h { display: none; } }
+
   /* ── ascii banner ───────────────────────────────── */
   /* ASCII banner：41 字符宽，11px 等宽约 270px。max-width:100% + overflow
      保证窄屏也不会把文档撑出横向滚动条。 */
@@ -262,24 +296,33 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     <div class="pipe" id="pipe"></div>
   </section>
 
+  <section>
+    <div class="sec-hd">
+      <h2 data-i18n="keypool">Key pool</h2><span class="fig">Fig 3.</span>
+      <span class="note" id="n-pool">—</span>
+    </div>
+    <div class="keys" id="keys"></div>
+    <div class="kevs" id="kevs"></div>
+  </section>
+
   <section class="grid cols-3" style="background:transparent;border:0;gap:28px">
     <div style="grid-column:span 1">
-      <div class="sec-hd"><h2 data-i18n="models">Models</h2><span class="fig">Fig 3.</span></div>
+      <div class="sec-hd"><h2 data-i18n="models">Models</h2><span class="fig">Fig 4.</span></div>
       <div class="bars" id="b-model"></div>
     </div>
     <div style="grid-column:span 1">
-      <div class="sec-hd"><h2 data-i18n="clients">Clients</h2><span class="fig">Fig 4.</span></div>
+      <div class="sec-hd"><h2 data-i18n="clients">Clients</h2><span class="fig">Fig 5.</span></div>
       <div class="bars" id="b-client"></div>
     </div>
     <div style="grid-column:span 1">
-      <div class="sec-hd"><h2 data-i18n="devices">Devices</h2><span class="fig">Fig 5.</span></div>
+      <div class="sec-hd"><h2 data-i18n="devices">Devices</h2><span class="fig">Fig 6.</span></div>
       <div class="devs" id="devs"></div>
     </div>
   </section>
 
   <section>
     <div class="sec-hd">
-      <h2 data-i18n="requests">Requests</h2><span class="fig">Fig 6.</span>
+      <h2 data-i18n="requests">Requests</h2><span class="fig">Fig 7.</span>
       <span class="note" data-i18n="recentFirst">most recent first</span>
     </div>
     <div class="log">
@@ -307,7 +350,16 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       tagline: 'openai <-> anthropic protocol gateway · deepseek via opencode zen',
       overview: 'Overview', pipeline: 'Pipeline', models: 'Models',
       clients: 'Clients', devices: 'Devices', requests: 'Requests',
-      recentFirst: 'most recent first',
+      keypool: 'Key pool', recentFirst: 'most recent first',
+      kInflight: 'in flight', kState: 'state', kPicked: 'picked', kLastUse: 'last use',
+      kFails: 'fails', kRecover: 'recovers in', kTotal: 'lifetime', kReason: 'reason',
+      kHealthy: 'healthy', kDisabled: 'disabled', kNever: 'never',
+      carrying: 'carrying load', ofKeys: 'of', poolIdle: 'no in-flight requests',
+      histSince: 'lifetime since', noHist: 'no persisted history',
+      recentEvents: 'recent key events', noKeyEvents: 'no key state changes recorded',
+      evDisabled: 'disabled', evRecovered: 'recovered', reqShort: 'req',
+      authErr: 'invalid credential', rateErr: 'rate limited',
+      quotaErr: 'quota exhausted', transientErr: 'repeated transient errors',
       kRequests: 'requests', kLatency: 'latency', kTokens: 'tokens', kDevices: 'devices',
       hTime: 'time', hStatus: 'status', hRequest: 'request', hMs: 'ms', hTokens: 'tokens', hClient: 'client',
       noReq: 'no requests yet', noData: 'no data', noDev: 'no devices',
@@ -321,13 +373,23 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       passthrough: 'passthrough', sub: 'subscription', payg: 'pay-as-you-go',
       sse: 'sse stream', single: 'single body',
       fallback: 'fallback', upModels: 'upstream models', injection: 'injection',
-      poll: 'poll 2s · in-memory', mobile: 'mobile', langBtn: '中文'
+      poll: 'poll 2s · in-memory', pollSql: 'poll 2s · window in-memory, totals in sqlite',
+      mobile: 'mobile', langBtn: '中文'
     },
     zh: {
       tagline: 'OpenAI 与 Anthropic 协议转换网关 · 经 opencode zen 使用 DeepSeek',
       overview: '总览', pipeline: '数据流动', models: '模型分布',
       clients: '客户端', devices: '设备', requests: '请求明细',
-      recentFirst: '最新在前',
+      keypool: 'Key 池', recentFirst: '最新在前',
+      kInflight: '在飞请求', kState: '状态', kPicked: '本次启动', kLastUse: '最近使用',
+      kFails: '连续失败', kRecover: '剩余冷却', kTotal: '累计', kReason: '原因',
+      kHealthy: '可用', kDisabled: '已禁用', kNever: '未用过',
+      carrying: '个号在扛并发', ofKeys: '/', poolIdle: '当前无在飞请求',
+      histSince: '累计自', noHist: '未启用历史持久化',
+      recentEvents: '最近状态变更', noKeyEvents: '暂无状态变更记录',
+      evDisabled: '禁用', evRecovered: '恢复', reqShort: '请求',
+      authErr: '凭据无效', rateErr: '限流',
+      quotaErr: '额度耗尽', transientErr: '连续瞬时错误',
       kRequests: '请求总数', kLatency: '响应耗时', kTokens: 'Token 用量', kDevices: '活跃设备',
       hTime: '时间', hStatus: '状态', hRequest: '请求', hMs: '毫秒', hTokens: 'Token', hClient: '客户端',
       noReq: '暂无请求', noData: '暂无数据', noDev: '暂无设备',
@@ -341,7 +403,8 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       passthrough: '直通', sub: '订阅端点', payg: '按量付费',
       sse: 'SSE 流式', single: '整包返回',
       fallback: '兜底模型', upModels: '个可用模型', injection: '注入检测',
-      poll: '每 2 秒轮询 · 内存存储', mobile: '移动端',
+      poll: '每 2 秒轮询 · 内存存储', pollSql: '每 2 秒轮询 · 窗口在内存，累计在 SQLite',
+      mobile: '移动端',
       langBtn: 'EN'
     }
   };
@@ -456,6 +519,128 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     }).join('');
   }
 
+  /** 失败类型 -> 词条。原始值是 keypool 的 UpstreamFailureKind。 */
+  var KIND_KEY = {
+    'auth': 'authErr', 'rate-limit': 'rateErr',
+    'quota-exhausted': 'quotaErr', 'transient': 'transientErr'
+  };
+  var kindText = function (k) { return k ? T(KIND_KEY[k] || k) + ' (' + k + ')' : '—'; };
+
+  /** 冷却倒计时用的 h/m/s。upt() 是给运行时长的（会省掉秒），倒计时要看到秒。 */
+  var hms = function (ms) {
+    var s = Math.floor(Math.max(0, ms) / 1000);
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    if (h) return h + 'h' + p(m) + 'm' + p(s % 60) + 's';
+    if (m) return m + 'm' + p(s % 60) + 's';
+    return (s % 60) + 's';
+  };
+
+  /**
+   * Key 池明细。回答的是「当前几个号在扛并发分流、每个号什么状态」——
+   * 这些数据本来就在 KeyPool 的内存里，此前只是没暴露出来，
+   * 想知道得去 journalctl 翻日志再照着源码算冷却时间。
+   *
+   * key 一律只显示指纹（****XXXX，末 4 位），原文不出现在任何响应里。
+   * 注意：这段注释在 String.raw 模板里，不能出现反引号 —— 会提前闭合模板。
+   */
+  function keypool(pool) {
+    var keys = pool.keys || [];
+    var lifetime = pool.history;  // 别叫 hist —— 外层 hist 是 sparkline 的历史缓冲
+    var byFp = {};
+    if (lifetime) lifetime.byKey.forEach(function (r) { byFp[r.fingerprint] = r; });
+
+    var busy = 0, inflight = 0, maxIn = 1;
+    keys.forEach(function (k) {
+      if (k.inFlight > 0) busy++;
+      inflight += k.inFlight;
+      if (k.inFlight > maxIn) maxIn = k.inFlight;
+    });
+    // 「几个号在扛并发分流」—— 用户明确要的那个数，直接摆在小节标题右边。
+    // en: "2 carrying load of 3 · 7 req" / zh: "2 个号在扛并发 / 3 · 7 请求"
+    $('n-pool').textContent = inflight
+      ? busy + ' ' + T('carrying') + ' ' + T('ofKeys') + ' ' + keys.length + ' · ' + inflight + ' ' + T('reqShort')
+      : T('poolIdle');
+
+    if (!keys.length) {
+      $('keys').innerHTML = '<div class="kc"><div class="w">' + T('noData') + '</div></div>';
+      $('kevs').innerHTML = '';
+      return;
+    }
+
+    var now = Date.now();
+    $('keys').innerHTML = keys.map(function (k) {
+      var lt = byFp[k.fingerprint];
+      // 倒计时基于**客户端**时刻推进：recoverInMs 是服务端给的相对量，
+      // 用它加本地 now 避免两端时钟不一致造成的负数/跳变。
+      var rows = [
+        ['kInflight', '<b>' + k.inFlight + '</b>'],
+        ['kState', k.healthy
+          ? '<span class="s-ok">' + T('kHealthy') + '</span>'
+          : '<span class="s-bad">' + T('kDisabled') + '</span>']
+      ];
+      if (!k.healthy) {
+        rows.push(['kReason', '<span class="s-warn">' + esc(kindText(k.disabledReason)) + '</span>']);
+        rows.push(['kRecover', '<b data-rc="' + (now + k.recoverInMs) + '">' + hms(k.recoverInMs) + '</b>']);
+      }
+      rows.push(['kFails', String(k.failCount)]);
+      rows.push(['kPicked', '<b>' + fmt(k.totalAcquired) + '</b>']);
+      rows.push(['kLastUse', k.lastUsedAt ? hhmmss(k.lastUsedAt) : '<span class="w">' + T('kNever') + '</span>']);
+      if (lt) {  // 跨重启累计（来自 sqlite）；db 关掉时这行不出现
+        rows.push(['kTotal', '<b>' + fmt(lt.requests) + '</b> ' + T('reqShort') + ' · <b>' + fmt(lt.tokens) + '</b> tok' +
+          (lt.failed ? ' · <span class="s-bad">' + fmt(lt.failed) + ' ' + T('fail') + '</span>' : '')]);
+      }
+      // 在飞请求的字形化显示：一个方块一条请求，扫一眼就知道谁在扛。
+      var glyph = k.inFlight > 0
+        ? new Array(Math.min(k.inFlight, 24) + 1).join('#') + (k.inFlight > 24 ? '+' : '')
+        : '<em>idle</em>';
+      return '<div class="kc' + (k.healthy ? '' : ' off') + '">' +
+        '<div class="hd"><span class="fp">' + esc(k.fingerprint) + '</span>' +
+        '<span class="badge ' + (k.healthy ? 's-ok' : 's-bad') + '">' +
+        (k.healthy ? '[ok]' : '[!]') + '</span></div>' +
+        '<div class="glyph">' + glyph + '</div>' +
+        '<dl>' + rows.map(function (r) {
+          return '<dt>' + T(r[0]) + '</dt><dd>' + r[1] + '</dd>';
+        }).join('') + '</dl>' +
+        '<span class="t"><span class="f" style="width:' + (k.inFlight / maxIn * 100).toFixed(1) + '%"></span></span>' +
+        '</div>';
+    }).join('');
+
+    if (!lifetime) {
+      $('kevs').innerHTML = '<div class="kev"><span class="w" style="grid-column:1/-1">' + T('noHist') +
+        (pool.historyDisabledReason ? ' · ' + esc(pool.historyDisabledReason) : '') + '</span></div>';
+      return;
+    }
+    var evs = lifetime.recentKeyEvents;
+    if (!evs.length) {
+      $('kevs').innerHTML = '<div class="kev"><span class="w" style="grid-column:1/-1">' + T('noKeyEvents') + '</span></div>';
+      return;
+    }
+    var head = '<div class="kev"><span class="w" style="grid-column:1/-1">' +
+      T('recentEvents') + ' · ' + T('histSince') + ' ' +
+      (lifetime.since ? esc(new Date(lifetime.since).toLocaleString()) : '—') +
+      ' · ' + fmt(lifetime.totalRequests) + ' ' + T('reqShort') + '</span></div>';
+    $('kevs').innerHTML = head + evs.map(function (e) {
+      var dis = e.type === 'disabled';
+      return '<div class="kev">' +
+        '<span class="w">' + hhmmss(e.at) + '</span>' +
+        '<span class="' + (dis ? 's-bad' : 's-ok') + '">' + T(dis ? 'evDisabled' : 'evRecovered') + '</span>' +
+        '<span class="cut">' + esc(e.fingerprint) + (e.kind ? ' · ' + esc(kindText(e.kind)) : '') + '</span>' +
+        '<span class="w kv-h">' + (e.cooldownMs ? hms(e.cooldownMs) : '—') + '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  /** 每秒推进冷却倒计时，不必等下一次 2s 轮询（读秒卡住会显得像挂了）。 */
+  function tickCountdown() {
+    var now = Date.now();
+    var nodes = document.querySelectorAll('[data-rc]');
+    for (var i = 0; i < nodes.length; i++) {
+      var left = Number(nodes[i].getAttribute('data-rc')) - now;
+      nodes[i].textContent = hms(left);
+    }
+  }
+
   /**
    * 请求日志：每条两行。
    * 第一行是扫读用的固定列（时间/状态/请求/耗时/token/客户端），
@@ -522,7 +707,8 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       b(s.byClient.length) + ' ' + T('nClients') + ' · ' + b(s.byModel.length) + ' ' + T('nModels');
 
     var p = $('h-pool');
-    p.textContent = T('pool') + ' ' + m.pool.healthy + '/' + m.pool.size;
+    var busyNow = (m.pool.keys || []).filter(function (k) { return k.inFlight > 0; }).length;
+    p.textContent = T('pool') + ' ' + m.pool.healthy + '/' + m.pool.size + (busyNow ? ' [' + busyNow + ']' : '');
     p.className = 'stat-inline ' + (m.pool.size === 0 || m.pool.healthy === 0 ? 'bad' : m.pool.healthy < m.pool.size ? '' : 'ok');
     $('h-up').textContent = T('up') + ' ' + upt(m.uptimeMs);
     $('n-window').textContent = ev.length + ' / 200 ' + T('inWindow');
@@ -532,13 +718,14 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       T('fallback') + ' <em style="font-style:normal;color:var(--fg-weak)">' + esc(m.config.fallbackModel) + '</em>',
       m.config.upstreamModels.length + ' ' + T('upModels'),
       T('injection') + ' ' + esc(m.config.injectionMode),
-      T('poll')
+      T(m.pool.history ? 'pollSql' : 'poll')
     ].map(function (s) { return '<span>' + s + '</span>'; }).join('');
 
     push('req', m.totalRequests); push('lat', s.avgDurationMs);
     push('tok', s.inputTokens + s.outputTokens); push('dev', nDev);
     redraw();
     pipeline(ev[0]);
+    keypool(m.pool);
     bars($('b-model'), s.byModel, function (i) { return i.model; }, function (i) { return i.count; });
     bars($('b-client'), s.byClient, function (i) { return i.client; }, function (i) { return i.count; });
     devices(ev);
@@ -569,6 +756,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 
   applyLang();
   tick(); setInterval(tick, 2000);
+  setInterval(tickCountdown, 1000);  // 冷却读秒；与轮询解耦，暂停时也照走
   window.addEventListener('resize', redraw);
 })();
 </script>
