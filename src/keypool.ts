@@ -100,6 +100,35 @@ export type UpstreamFailureKind = 'auth' | 'rate-limit' | 'quota-exhausted' | 't
 /** 额度耗尽但解析不出重置时间时的默认冷却：1 小时。 */
 const QUOTA_FALLBACK_COOLDOWN_MS = 3_600_000;
 
+/**
+ * 冷却策略的对外描述（面板用）。
+ *
+ * 为什么要暴露：面板此前只显示「剩余 3h16m」这个**结果**，
+ * 得出结果的规则（哪种失败冷却多久、连续几次才禁用、选路怎么挑）只在源码里。
+ * 用户最初的问题恰恰是「你怎么知道 6 小时」—— 光给数字不够，
+ * 还得能当场看出这个数字是按什么规则算出来的、正常不正常。
+ *
+ * 每条都从**真实配置值**算出来，不写死文案 —— 否则改了 cooldownMs 面板会说谎。
+ */
+export interface PoolPolicy {
+  /** 基础冷却（毫秒），即 `COOLDOWN_MS` 配置值。 */
+  cooldownMs: number;
+  /** 连续失败多少次触发禁用（transient 类）。 */
+  failThreshold: number;
+  /** 选路算法的稳定标识，面板据此显示对应说明。 */
+  strategy: 'least-loaded';
+  /** 逐失败类型的冷却规则。`ms` 为 null 表示时长由上游给的重置时间决定。 */
+  rules: Array<{
+    kind: UpstreamFailureKind;
+    /** 该类型实际冷却时长（毫秒）；null = 取决于上游返回的重置时间。 */
+    ms: number | null;
+    /** 是否累计 failCount 到阈值才禁用（false = 首次即禁用）。 */
+    countsToThreshold: boolean;
+    /** 兜底时长（仅 quota-exhausted 解析失败时用）。 */
+    fallbackMs?: number;
+  }>;
+}
+
 /** 池空时抛出的错误。server 层应转成 503，而不是被兜底 catch 吞成 500。 */
 export class PoolEmptyError extends Error {
   constructor() {
@@ -181,6 +210,29 @@ export class KeyPool {
   /** 当前禁用（含冷却未到期）的 key 指纹列表，日志用。 */
   disabledFingerprints(): string[] {
     return this.keys.filter((k) => !this.isAvailable(k)).map((k) => keyFingerprint(k.key));
+  }
+
+  /**
+   * 冷却策略描述，喂 `/__metrics` 与面板。
+   *
+   * 每个 `ms` 都用和 `markFailure` **同一套算式**从当前配置算出来，
+   * 而不是另抄一份常量 —— 否则改了冷却规则面板会继续显示旧数字。
+   * transient 给的是首次触发禁用时的时长（退避基数，之后按 2 的幂增长）。
+   */
+  policy(): PoolPolicy {
+    const base = this.opts.cooldownMs;
+    return {
+      cooldownMs: base,
+      failThreshold: this.opts.failThreshold,
+      strategy: 'least-loaded',
+      rules: [
+        // 与 markFailure 的 quota-exhausted 分支一致：上游重置时间 + 60s 余量。
+        { kind: 'quota-exhausted', ms: null, countsToThreshold: false, fallbackMs: QUOTA_FALLBACK_COOLDOWN_MS },
+        { kind: 'auth', ms: base * 12, countsToThreshold: false },
+        { kind: 'rate-limit', ms: Math.min(3000, Math.max(500, Math.floor(base / 100))), countsToThreshold: false },
+        { kind: 'transient', ms: base, countsToThreshold: true },
+      ],
+    };
   }
 
   /**
@@ -283,21 +335,17 @@ export class KeyPool {
       // 周/月额度耗尽：按上游给的重置时间冷却（解析不出用 1 小时兜底）。
       // 这类 key 短时间内不可能恢复，放它回池只会让每个请求都先撞一次 429
       // 再换号 —— 既慢又白耗。加 60s 余量，避免边界抖动反复试探。
-      k.disabledUntil = now + (resetDelayMs != null && resetDelayMs > 0
-        ? resetDelayMs + 60_000
-        : QUOTA_FALLBACK_COOLDOWN_MS);
       k.failCount = 0;
-      k.disabledReason = kind;
-      this.emitDisabled(k, kind, k.disabledUntil - now);
+      this.disableUntil(k, kind, now, now + (resetDelayMs != null && resetDelayMs > 0
+        ? resetDelayMs + 60_000
+        : QUOTA_FALLBACK_COOLDOWN_MS));
       return;
     }
 
     if (kind === 'auth') {
       // 凭据无效：立即禁用，超长冷却（12 × cooldownMs），之后自动恢复（可能被重新配额）。
-      k.disabledUntil = now + this.opts.cooldownMs * 12;
       k.failCount = 0;
-      k.disabledReason = kind;
-      this.emitDisabled(k, kind, this.opts.cooldownMs * 12);
+      this.disableUntil(k, kind, now, now + this.opts.cooldownMs * 12);
       return;
     }
 
@@ -309,11 +357,14 @@ export class KeyPool {
       // 连续两次 429 就把整池打光、之后 50 秒全部 503 —— Claude Code 遇 503
       // 直接报错中断，表现为「用一会儿就挂」。所以这里固定 3 秒上限，
       // 让请求快速重回池子，把重试节奏交给客户端而不是拖死整池。
-      k.disabledUntil = now + Math.min(3000, Math.max(500, Math.floor(this.opts.cooldownMs / 100)));
-      k.disabledReason = kind;
       // 短冷却也上报：整池同时 rate-limit 一样会造成 503 空窗，
       // 而这恰好是排查 2026-08-09 那 295 个 503 时最大的盲区。
-      this.emitDisabled(k, kind, k.disabledUntil - now);
+      this.disableUntil(
+        k,
+        kind,
+        now,
+        now + Math.min(3000, Math.max(500, Math.floor(this.opts.cooldownMs / 100))),
+      );
       return;
     }
 
@@ -323,11 +374,37 @@ export class KeyPool {
       const backoff = this.opts.cooldownMs * 2 ** Math.min(k.failCount - this.opts.failThreshold, 4);
       // 加 ±20% 抖动，避免整池冷却同时到期后 thundering herd。
       const jittered = Math.floor(backoff * (0.8 + Math.random() * 0.4));
-      k.disabledUntil = now + jittered;
       k.failCount = 0;
-      k.disabledReason = kind;
-      this.emitDisabled(k, kind, jittered);
+      this.disableUntil(k, kind, now, now + jittered);
     }
+  }
+
+  /**
+   * 统一的禁用入口：**只延长冷却，绝不缩短**，原因跟着实际生效的冷却走。
+   *
+   * 为什么必须这样：`markFailure` 原本四个分支都无条件覆写 `disabledUntil`
+   * 和 `disabledReason`。一个已被 19 小时额度冷却禁用的 key，只要再收到一次
+   * 迟到的失败上报（同一 key 上早于禁用就已 acquire 的请求断流 → transient，
+   * 或一个裸 429 → rate-limit），冷却就会被冲成 4 分钟甚至 3 秒，原因也被改写。
+   * 后果正是 `quota-exhausted` 分支注释想避免的：额度耗尽的 key 反复被选中，
+   * 每个请求先撞一次 429 再换号；而面板会把「额度耗尽」显示成「临时故障」，
+   * 把排查引向反面。
+   *
+   * 冷却相同或更短时保留原状（含原因），只在真正延长时才更新并上报事件。
+   */
+  private disableUntil(
+    k: PooledKey,
+    kind: UpstreamFailureKind,
+    now: number,
+    until: number,
+  ): void {
+    if (k.disabledUntil > now && until <= k.disabledUntil) {
+      // 已在更长的冷却里：不缩短、不改原因、不重复上报。
+      return;
+    }
+    k.disabledUntil = until;
+    k.disabledReason = kind;
+    this.emitDisabled(k, kind, until - now);
   }
 
   /** 显式恢复一个 key（测试/运维用）。 */

@@ -92,6 +92,31 @@ export interface UsageHistory {
 const PRUNE_INTERVAL_MS = 6 * 3_600_000;
 
 /**
+ * `history()` 结果的缓存时长。面板每 2 秒轮询，但那条全表 `GROUP BY` 在
+ * 十万行量级要几百毫秒且同步阻塞事件循环 —— 详见 `history()` 的注释。
+ */
+const HISTORY_CACHE_MS = 15_000;
+
+/**
+ * 首次清理的宽限期。进程启动后等这么久才允许惰性清理跑第一次，
+ * 既不让「每次重启都全表 DELETE」，也不至于像原来那样在重启频繁时永不清理。
+ */
+const FIRST_PRUNE_DELAY_MS = 10 * 60_000;
+
+/**
+ * 把底层错误归成粗粒度标签，供面板显示。**不含路径、不含原始 message。**
+ * 完整原因只进日志（journalctl 本来就要 root 才看得到）。
+ */
+function classifyDbFailure(detail: string): string {
+  if (/Cannot find module|not supported|no such built-in/i.test(detail)) return 'sqlite unavailable on this runtime';
+  if (/EACCES|EPERM|permission denied/i.test(detail)) return 'permission denied';
+  if (/ENOSPC|disk/i.test(detail)) return 'no disk space';
+  if (/ENOENT|EEXIST|ENOTDIR|EISDIR/i.test(detail)) return 'db path unusable';
+  if (/corrupt|malformed|not a database/i.test(detail)) return 'db file corrupt';
+  return 'unavailable';
+}
+
+/**
  * 用量库。构造**永不抛**：任何失败都退化成 `enabled === false` 的 no-op 实例。
  */
 export class UsageDb {
@@ -102,12 +127,20 @@ export class UsageDb {
   private insertKeyEvent: any = null;
   private retentionMs: number;
   /**
-   * 上次清理时刻。**初值是构造时刻，不是 0** —— 用 0 会让 `now - lastPruneAt`
-   * 恒大于间隔，于是进程启动后的**第一条请求**就触发一次全表 DELETE。
-   * 那样「每 6 小时清一次」实际退化成「每次重启 + 每 6 小时」，重启频繁时
-   * 白白在请求路径上做全表扫描。
+   * 下次允许清理的最早时刻。
+   *
+   * 原来这里是 `lastPruneAt = Date.now()` 配 6 小时间隔，用意是避免「每次重启
+   * 都在第一条请求上做全表 DELETE」。但代价没被算到：**进程只要活不满 6 小时，
+   * 清理就永远不会跑**（`pruneNow` 只有测试在调，没有定时器）。正常的部署/重启
+   * 节奏下 `retention 30d` 因此是一条永不执行的死配置，库无限增长 ——
+   * 而库越大，`history()` 那条全表聚合越慢，直接喂大上面那个阻塞问题。
+   *
+   * 改成 10 分钟宽限：重启不会立刻付全表扫描的代价，但只要进程正常服务
+   * 十分钟以上，清理就一定有机会跑。
    */
-  private lastPruneAt = Date.now();
+  private nextPruneAt = Date.now() + FIRST_PRUNE_DELAY_MS;
+  private historyCache: UsageHistory | null = null;
+  private historyCacheAt = 0;
   /** 降级原因（面板可显示，便于知道「为什么没有历史数据」）。 */
   readonly disabledReason: string | null;
 
@@ -152,6 +185,15 @@ export class UsageDb {
       // 完全可接受，卡住代理请求不可接受。
       this.db.exec('PRAGMA journal_mode = WAL');
       this.db.exec('PRAGMA synchronous = NORMAL');
+      // 部署切换时可能短暂有两个进程同时持有库（旧进程 shutdown 有 5 秒兜底）。
+      // 默认 busy_timeout=0 意味着一撞锁立刻失败、丢一条用量记录 + 刷一行 warn。
+      // 给 200ms 重试窗口就基本消掉这类丢失；写都是单条 autocommit INSERT，
+      // 不会长时间占锁，所以这个等待不会拖住请求。
+      this.db.exec('PRAGMA busy_timeout = 200');
+      // WAL 高水位不回落（journal_size_limit 默认 -1）。实测正常写入下 WAL 稳定在
+      // autocheckpoint 阈值 4MB 左右，但一旦有长事务读者让 checkpoint 饿死，
+      // 文件会涨到几百 MB 且不缩。设个上限，checkpoint 后把超出部分还给文件系统。
+      this.db.exec('PRAGMA journal_size_limit = 16777216');
       this.migrate();
       this.insertRequest = this.db.prepare(
         `INSERT INTO requests
@@ -169,9 +211,14 @@ export class UsageDb {
     } catch (err) {
       // 降级：Node 20 无 node:sqlite、盘满、权限不足、db 损坏 —— 一律不影响代理。
       this.enabled = false;
-      this.disabledReason = err instanceof Error ? err.message : String(err);
+      const detail = err instanceof Error ? err.message : String(err);
+      // 对外只给分类标签，不给原始 message。原文里通常带绝对路径
+      // （`EACCES: permission denied, mkdir '/root/fuckopencode/data'`），
+      // 而这个字段会经 `/__metrics` 出现在面板上 —— 公开模式下等于把部署路径
+      // 和「服务跑在 root 下」这两件事白送给匿名访问者。完整原因进日志。
+      this.disabledReason = classifyDbFailure(detail);
       this.db = null;
-      this.log(`[usagedb] 持久化不可用，降级为内存模式（面板无历史累计）: ${this.disabledReason}`);
+      this.log(`[usagedb] 持久化不可用，降级为内存模式（面板无历史累计）: ${detail}`);
     }
   }
 
@@ -199,6 +246,9 @@ export class UsageDb {
         healthy_count INTEGER, pool_size INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_key_events_key_at ON key_events(key_fp, at);
+      -- history() 取「最近 20 条状态变更」是 ORDER BY at DESC，上面那个复合索引
+      -- 前导列是 key_fp，用不上；没这条就是全表扫 + 临时 B-tree 排序。
+      CREATE INDEX IF NOT EXISTS idx_key_events_at ON key_events(at);
     `);
   }
 
@@ -247,11 +297,36 @@ export class UsageDb {
   /**
    * 面板用的历史聚合。不可用时返回 null（面板据此隐藏累计列）。
    *
-   * 查询很轻：`requests` 有 `(key_fp, at)` 索引，聚合走索引扫描；
-   * 30 天保留期下行数在几万量级，毫秒级返回。
+   * **结果带缓存，这是承重设计而不是优化。** `node:sqlite` 是同步 API，
+   * 而 `byKey` 那条是全表 `GROUP BY key_fp`：索引 `(key_fp, at)` 只提供有序性，
+   * 不覆盖 `status`/`input_tokens`/`output_tokens`，每行都要回主表取值。
+   * 实测（本机 M2，warm cache）15 万行 p50=646ms、60 万行最坏 10s，
+   * 而面板每 2 秒轮询一次 —— Node 单线程下这段时间**所有在飞的代理请求
+   * （含流式 SSE 转发）全部停住**，实测把一个 0ms 的请求拖到 1.4 秒。
+   * 生产是 2 核 VPS 且 `cache_size` 默认仅 2MB，只会更差。
+   *
+   * 这会让观测设施变成主链路的故障源，正是本文件开头明确要避免的事。
+   * 缓存把「每 2 秒一次全表扫描」降到「每 15 秒最多一次」，面板看到的
+   * 累计数字最多滞后 15 秒 —— 对「这个 key 用得怎么样」这类判断无影响，
+   * 而实时性要求高的 `inFlight`/冷却剩余来自 `KeyPool.snapshot()`（纯内存），
+   * 不走这条路径。
    */
   history(): UsageHistory | null {
     if (!this.enabled) return null;
+    const now = Date.now();
+    if (this.historyCache && now - this.historyCacheAt < HISTORY_CACHE_MS) {
+      return this.historyCache;
+    }
+    const fresh = this.queryHistory();
+    // 查询失败（返回 null）时不写缓存，下次调用会重试。
+    if (fresh) {
+      this.historyCache = fresh;
+      this.historyCacheAt = now;
+    }
+    return fresh;
+  }
+
+  private queryHistory(): UsageHistory | null {
     try {
       const byKey = this.db
         .prepare(
@@ -312,20 +387,22 @@ export class UsageDb {
    */
   private maybePrune(now: number): void {
     if (this.retentionMs <= 0) return;
-    if (now - this.lastPruneAt < PRUNE_INTERVAL_MS) return;
-    this.lastPruneAt = now;
+    if (now < this.nextPruneAt) return;
+    this.nextPruneAt = now + PRUNE_INTERVAL_MS;
     this.prune(now);
   }
 
   /** 立即执行一次保留期清理（跳过节流）。`retentionDays=0` 时是空操作。 */
   pruneNow(now: number): void {
     if (!this.enabled || this.retentionMs <= 0) return;
-    this.lastPruneAt = now;
+    this.nextPruneAt = now + PRUNE_INTERVAL_MS;
     this.prune(now);
   }
 
   private prune(now: number): void {
     const cutoff = now - this.retentionMs;
+    // 删了行，缓存的聚合就不再成立，作废它。
+    this.historyCache = null;
     try {
       this.db.prepare('DELETE FROM requests WHERE at < ?').run(cutoff);
       this.db.prepare('DELETE FROM key_events WHERE at < ?').run(cutoff);

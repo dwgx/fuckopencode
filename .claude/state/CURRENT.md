@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-08-10 04:50（第四轮会话）
+更新时间：2026-08-10 05:12（第四轮会话，自我审计进行中）
 
 ## 一句话
 
@@ -17,7 +17,7 @@ OpenAI ↔ Anthropic 协议转换网关（面向 DeepSeek），线上跑在 nbus
 | `npm test` | 326 passed / 12 files |
 | `npm run build` | 干净 |
 | 本地面板实机验证 | 三种状态（在飞 / 禁用+倒计时 / 累计）都渲染正确，中英文都对 |
-| 线上 | **已上线** `b7f7a29`，进程 04:43:47 重启，两服务 active |
+| 线上 | **已上线**。代码对应 `b7f7a29`（vitest 配置那次），进程 04:43:47 重启，两服务 active；`4d0d1b7` 是 docs commit（README/DEPLOY.md），不动 dist，线上无变化 |
 | 线上持久化 | `[proxy] usage db: data/usage.db (retention 30d)`，无降级 warn |
 | 线上端到端 | 经盾 8787 发 Anthropic 请求 200 有内容，累计计数实时 +1 |
 
@@ -43,12 +43,18 @@ usagedb 的降级设计会把失败吞成一行 warn，只看服务 active 根�
 部署当时正好抓到一次真实的额度耗尽，说明这套东西解决的是真问题：
 
 ```
-****ZOBb  quota-exhausted  剩余 3h16m  恢复于 2026/8/10 08:01:48
+****ZOBb  quota-exhausted  剩余 3h16m
 ****0osU  healthy  inFlight=2  本次启动被选中 9 次
 ```
 
 同一个问题上一轮要翻 journalctl + 读源码找冷却公式 + 在服务器上 `date` 手算，
-现在 `recoverInMs` / `disabledUntil` 都是现成的。
+现在剩余冷却是现成的。
+
+**审计更正**：上一版这里写了「恢复于 2026/8/10 08:01:48」，那是错的 ——
+面板**从不渲染绝对恢复时刻**。`snapshot()` 确实同时给了 `disabledUntil` 和
+`recoverInMs`，但 `dashboard.ts` 只用了后者，`disabledUntil` 是个死字段
+（全文只有 `lifetime.since` 用过 `toLocaleString`）。下面「两个设计点」里
+同样的说法也是这个问题。
 
 注意：**当时池子只有 1 个健康 key 扛全部流量**（`size 2, healthy 1`）。
 这不是部署造成的，是上游额度，但现在它在面板上可见。
@@ -121,13 +127,14 @@ e2e 里有断言直接扫 `/__metrics` 原始响应体，确认 `sk-` 原文不�
 卡片下面是最近 20 条状态变更（时间 / 禁用或恢复 / 指纹+原因 / 冷却时长），
 带「累计自 <时刻> · N 请求」。倒计时每秒走，暂停轮询也照走（实测过）。
 
-## 本轮的三个提交
+## 本轮的四个提交
 
 | commit | 内容 |
 |---|---|
 | `66914de` | feat: key 池全量上面板，用量落 SQLite |
 | `ba9ab77` | fix: 面板 topbar 窄屏不再横向溢出 |
 | `b7f7a29` | chore: vitest 排除 .claude，避免扫到 worktree 里的测试 |
+| `4d0d1b7` | docs: 记录上线结果与 usagedb 验证步骤 |
 
 `ba9ab77` 是一个并行 worktree agent（`claude/elated-banach-39cfdd`）做的，
 它自己 rebase 到了 `66914de` 之上，成果逐字节核对后由我提交、worktree 已删。
@@ -143,15 +150,195 @@ e2e 里有断言直接扫 `/__metrics` 原始响应体，确认 `sk-` 原文不�
 vitest 默认 include 会把它里面的整套测试也扫进来（326 变 630），
 worktree 的失败会算到主仓库头上。
 
+## 自我审计结论（2026-08-10 06:50）
+
+用户要求「全面自我审计」，按「焚诀」开了 6 路独立视角 agent（只给审计目标和
+已确认事实，**不给实现者的辩解理由**）：keypool 正确性 / usagedb 持久化 /
+安全与隐私 / 全新视角需求覆盖 / 面板前端渲染 / 测试有效性变异。
+
+**代码全部未改动** —— 这一轮只产出结论，修不修由用户定。
+
+### 修复状态：审计发现的问题**已全部修完**（2026-08-10 07:32，未提交、未上线）
+
+见后面「审计后的修复」一节。下面这张表是审计当时的原始记录，保留作为背景。
+
+### 审计发现的问题（按优先级）
+
+| # | 问题 | 位置 | 严重度 |
+|---|---|---|---|
+| 1 | `history()` 同步全表 `GROUP BY` 阻塞事件循环，15 万行 p50=646ms；面板 2 秒轮询会周期性冻结代理（60 万行时 max 10s） | `usagedb.ts:253-269` | blocker |
+| 2 | 错误路径**双重 `release()`**，把别的在飞请求的 `inFlight` 偷减 —— 面板「几个号在扛并发」会偏低甚至为 0 | `server.ts:576` + `:590` | major |
+| 3 | `markFailure` 无条件覆写 `disabledReason`/`disabledUntil`：19h 的额度冷却会被一个迟到的裸 429 冲成 3 秒，且面板**归因错误**（真因额度耗尽，显示 transient） | `keypool.ts:286-291,312-313,326-328` | major |
+| 4 | `lastPruneAt = Date.now()` + 6h 节流 ⇒ 进程活不过 6 小时时 30 天保留期**永不执行**，库无限增长（喂大问题 1） | `usagedb.ts:110,313` | major |
+| 5 | 冷却倒计时**实际从不生效**：2 秒轮询 `innerHTML` 整段重建，把 1 秒 tick 改的节点丢掉；后台标签页回来后显示陈旧值 | `dashboard.ts:591,654-661` | major |
+| 6 | `ctx.error` 从初始化后**从未被赋值** ⇒ `requests.error` 列恒 NULL，失败原因无法从 db 回溯 | `server.ts:287` | major |
+| 7 | `pool.history` 结构不完整时 `keypool()` 抛异常，整个面板**永久停止更新**且报成上游故障 | `dashboard.ts:570,634` | 潜在 blocker |
+| 8 | 指纹只取末 4 位 + `GROUP BY key_fp`：碰撞时两个 key 用量合并、面板双倍呈现 | `usagedb.ts:266` / `dashboard.ts:570` | major |
+| 9 | idle 池只要来 1 个请求进度条就满格（`maxIn` 是当前最大值，纯相对） | `dashboard.ts:572,624` | major |
+| 10 | `historyDisabledReason` 把绝对路径回给面板（`mkdir '/root/fuckopencode/data'`），公开模式下泄漏部署路径 + 暴露跑在 root 下 | `server.ts:330` | minor |
+
+另有：`handleCountTokens` 没被 await，落库 tokens 恒 0 / status 恒 200；
+换 key 重试时第一个 key 的失败**不产生 requests 行**（恰是诊断额度耗尽最该看的失败）；
+`key_events` 缺 `(at)` 索引；`busy_timeout=0` 一撞就丢记录；`journal_size_limit` 未设。
+
+### 测试的真实盲区（最重要的一条）
+
+我自己独立验证过：**在 `dashboard.ts` 的 `String.raw` 模板里塞一个语法错误
+（`keypool(m.pool;` + `function {{ BROKEN`），`npm run typecheck`、`npm run build`、
+`npm test` 326/326 全部通过。** 这和本轮踩的 `require` 坑是同一类漏洞：
+面板那 231 行新代码对 TypeScript 而言只是个字符串，没有任何自动化检查看得见它。
+
+上面 10 条缺陷，现有 326 个测试**一条都没抓到**。
+
+兜底办法很便宜（已验证可行）：
+```
+node -e "const{DASHBOARD_HTML}=require('./dist/dashboard.js');new Function(DASHBOARD_HTML.match(/<script>([\s\S]*)<\/script>/)[1])"
+```
+把内联 JS 拿出来 `new Function()` 解析一次，语法错误立刻暴露。建议进测试。
+
+### 经查是「非问题」的（有证据，别重复排查）
+
+- **WAL 4.1MB 不是泄漏**：`wal_autocheckpoint` 默认 1000 页 × 4096 = 4.0MB，
+  实测写 20000 行 WAL 稳在 3.95MB 不再涨，`close()` 清零。但**长事务读者会让
+  checkpoint 饿死**（实测 30k 行撑到 522MB 且不回落）—— 现在 `.all()`/`.get()`
+  不留快照所以安全，是个只差一步的地雷
+- **鉴权路径没被动过**：`git show 68fba3d:src/server.ts` 与 HEAD 逐字节相同
+- **db 里确实没存 IP/UA**，key 原文在 db + WAL 原始字节里扫不到
+- **XSS 全部插值点已过 `esc()`**（畸形 key 确实能带 HTML 元字符，但被兜住）
+- **`snapshot()` 无并发撕裂**：全同步无 await，Node 单线程下是一致快照
+- **i18n 81 个词条 en/zh 齐备**，`KIND_KEY` 四个值全覆盖
+- **双进程写不损坏数据**（实测交替写 200 条零失败）
+- **`history()` 每次 prepare 不泄漏内存**（15 万轮 external 持平）
+
+### 需求覆盖：「你能知道的一切」这条只算部分满足
+
+「星号挡住」「自动生成」完全满足。但差集里有几项系统知道、面板看不到：
+
+- **上游原始错误文案哪里都不留** —— 不在面板、不在 db（`error` 恒 NULL）、
+  连 journalctl 都没打。用户的原始痛点恰恰是「不想再翻日志」
+- 冷却策略本身（倍率规则、`failThreshold`）仍只在源码里 —— 数字给了，
+  「为什么是这个数」没给，而用户问的正是「你怎么知道 6 小时」
+- per-key 历史禁用次数/时长分布（数据在 `key_events` 里，只返回全局最近 20 条）
+- `lastFailAt` 根本没进 snapshot
+- 「30 天保留期」与用户说的「所有」有分歧，**没向用户说明过**
+
+### 文档已修正
+
+`disabledUntil` 从不渲染 —— 上一版本文件里「恢复于 08:01:48」和「两个设计点」
+两处都在描述一个不存在的界面，已改。`DEPLOY.md:73` 把两个真实指纹写进了
+受 git 管理的文档，按「星号挡住」口径不算泄露，但值得知情。
+
+### 审计过程本身的两个教训
+
+- **后台 agent 不可靠**：6 路 agent 首轮全挂（错误信息说 `claude-opus-5`
+  不可用，但翻 transcript 发现实际跑的是 `deepseek-v4-flash`，**错误信息是误导的**）。
+  同步跑就正常。以后这类审计直接同步跑，别开后台
+- 测试有效性那路 agent 中途断连，**在工作区留下了它埋的语法错误变异**。
+  已 `git checkout` 还原并复验（typecheck 干净 + 326/326 + dist 里
+  `keypool(m.pool)` 在位 + 内联 JS 能解析）。**派 agent 做变异测试要盯着还原**
+
+## 审计后的修复（2026-08-10 07:32）
+
+**改了 5 个源文件 + 3 个测试文件，未提交、未上线。** 测试 326 → **340 全绿**，typecheck 干净。
+
+| 审计 # | 怎么修的 | 文件 |
+|---|---|---|
+| 1 | `history()` 加 15 秒结果缓存。实测 15 万行：首次真查询 226ms，缓存命中 0.000ms —— 40 秒窗口内本该阻塞 4.7s，现在只 0.23s。`prune` 会作废缓存 | `usagedb.ts` |
+| 2 | 在 `UpstreamCall` 层给 `release` 加一次性标志（文件头本来就写着「幂等」，只是没实现）。调用方不必再逐条排查控制流 | `upstream.ts` |
+| 3 | 抽出 `disableUntil()` 统一禁用入口：**只延长冷却，绝不缩短**，原因跟着实际生效的冷却走 | `keypool.ts` |
+| 4 | `lastPruneAt` 改成 `nextPruneAt`，首次宽限 10 分钟。重启不付全表扫描代价，但进程正常服务 10 分钟以上清理就一定有机会跑 | `usagedb.ts` |
+| 5 | 倒计时归零钳到 0 并摘掉 `data-rc`；加 `visibilitychange` 回前台立刻补一次（后台标签页定时器会被浏览器停摆） | `dashboard.ts` |
+| 6 | 加 `noteUpstreamError()`，在**能读到 body 的那个分支**记（body 只能读一次）。上游原文现在落进 `error` 列 | `server.ts` |
+| 7 | `keypool()` 逐字段兜底（`pool` / `history` / `byKey` / `recentKeyEvents`），不再让半截结构把整个面板打死 | `dashboard.ts` |
+| 9 | 进度条刻度从「当前最大并发」改成 `max(4, maxIn)`。1 条在飞画 25% 而不是满格 | `dashboard.ts` |
+| 10 | `disabledReason` 对外只给分类标签（`classifyDbFailure`），原始 message（含绝对路径）只进日志 | `usagedb.ts` |
+| 附带 | `key_events(at)` 索引、`busy_timeout=200`、`journal_size_limit=16MB` | `usagedb.ts` |
+
+**修 6 的时候顺手逮到一个客户端可见的真 bug**：统一错误出口会对已被消费的 body
+再 `.json()` 一次，在「没换 key」的路径上必然拿到空 —— 于是回给客户端的错误文案
+退化成按状态码生成的通用句子。现在复用第一次读到的 body，客户端能看到上游原话
+（实测：`Weekly usage limit reached. Resets in 6hr 17min.`）。
+
+**修 6 还暴露了一个潜伏的溢出**：`error` 列以前恒 NULL，所以请求日志里那个
+`.s-bad` span 从来没有内容；一旦真有长文案，`.ent .r2 span { white-space: nowrap }`
+就把 375px 下的 `scrollWidth` 顶到 604px。已给这个 span 单独放开折行。
+
+### 新增的测试（都验证过「去掉修复就变红」）
+
+- `test/keypool.test.ts` +5：额度耗尽后收到迟到的 transient / 裸 429 / auth 被
+  rate-limit 冲，冷却与原因都不能被改；更长的冷却仍能延长；到期后能按新原因重新禁用。
+  **实测把 `disableUntil` 的守卫删掉，3 条立刻变红**
+- `test/e2e.test.ts` +1：假上游加额度耗尽钩子，断言上游原文真的进了 db 的 `error` 列
+- **`test/dashboard.test.ts`（新文件，8 条）** —— 补上那个最大的盲区。核心是把内联
+  `<script>` 抠出来 `new Function()` 解析一次。**实测：埋进语法错误后 typecheck
+  仍然 exit 0，而这条测试报 `SyntaxError: missing ) after argument list`**。
+  另外钉住 `keypool(m.pool)` 调用、`setInterval(tickCountdown)`、挂载点、
+  以及 en/zh 词条键集合对齐
+
+### 浏览器实测（本地假上游，构造出真实的额度耗尽 + 在飞并发）
+
+- 面板 `2 carrying load of 3 · 3 req`，进度条 `50% / 0% / 25%`（旧代码这里最忙的永远满格）
+- 倒计时真的在走：`6h17m28s → 24s → 20s`（旧代码冻结在首帧）
+- 禁用卡片显示 `quota exhausted (quota-exhausted)`，中文 `额度耗尽 / 剩余冷却`
+- 半截 `history` 结构（缺 `byKey` / 缺 `recentKeyEvents`）灌进去，面板照常渲染
+  3 张卡、状态保持 `[*] live`；A/B 对照证明旧写法在同样输入下抛
+  `Cannot read properties of undefined (reading 'forEach')`
+- 375px 无横向溢出（`scrollWidth` 375 = `clientWidth`），桌面 1280 无溢出，无 console 报错
+- 页面不含 key 原文
+
 ## 下一步
 
-线上已是最新，无阻塞待办。可选观察项：
+**代码改完但没提交、没上线** —— 等用户拍板。上线前建议：
 
-- `****ZOBb` 预计 08:01:48 自动恢复，届时面板会显示 `2/2`，
-  「最近状态变更」里会多一条 recovered
-- 保留期清理是惰性触发的（每 6 小时跟着写入走），第一次触发要等一段时间。
-  想确认可以看 `data/usage.db` 大小是否稳定在几 MB 量级
-- 工作区仍有上一轮未提交的 `scripts/dwgx/` + `SHIELD.md`（盾的部署脚本与文档）
+1. `npm test`（340）+ `npm run build` 已过，可以直接 `./scripts/deploy.sh`
+2. 上线后按 DEPLOY.md 第 5 条查启动日志 `usage db:` 不是 `off (...)`
+3. 线上那两个真 key 的状态在部署重启后会清零（`totalAcquired` 是进程级），
+   但 sqlite 里的累计会保留
+
+## 冷却策略上面板（2026-08-10 07:45，用户要求，已做完）
+
+审计差集里的第 2 条（「数字给了，但为什么是这个数没给」）已补上。这是用户最初
+那句「你怎么知道 6 小时」的正解 —— 光有剩余冷却不够，得能当场看出规则。
+
+做法：`KeyPool.policy()` 返回 `PoolPolicy`，经 `/__metrics` 的 `pool.policy` 到面板，
+在 key 池小节下新增一块 `#kpol`。
+
+**关键设计：每条规则都用和 `markFailure` 同一套算式从真实配置算出来**，
+前端不写死时长。改了 `COOLDOWN_MS` 面板会跟着变，不会说谎。
+
+面板实际显示（英文，`COOLDOWN_MS=300000` / `FAIL_THRESHOLD=5`）：
+
+```
+cooldown policy · why a key recovers when it does
+quota exhausted   from upstream  首次即禁用 · 上游重置时间+60s余量 · 兜底 1h00m00s
+invalid credential  1h00m00s     首次即禁用 · 12x base cooldown
+rate limited        3s           首次即禁用 · 刻意很短：429 是账号级，换 key 没用
+repeated transient  5m00s        连续 5 次后禁用 · 之后翻倍最多 16 倍，±20% 抖动
+base cooldown 5m00s · fail threshold 5 · routing: least in-flight first
+```
+
+**测试 +11（351 全绿）**，其中最重要的是「声明 = 实际行为」那组：
+逐个失败类型断言 `policy()` 声明的时长/是否累计阈值，与 `markFailure` 跑出来的
+`recoverInMs` 一致。面板显示错的规则比不显示更糟，所以这组必须钉住。
+另加 `policy(pool.policy)` 接线断言、`#kpol` 挂载点、占位符 `{n}`/`{base}` 真做了替换。
+
+浏览器实测：中英文都对、375px 无溢出（`scrollWidth` 375）、桌面 1280 无溢出、
+无 console 报错、占位符没漏给用户看。
+
+顺带修了我自己新写的 i18n 对齐测试的一个假阳性：原来的正则会把词条**内容**里
+的英文单词误当成键（`kept short on purpose:` 里的 purpose、`routing:` 里的 routing）。
+改成只认行首/逗号后的标识符，并验证过它仍能抓出真的缺词条。
+
+审计里**没修**的，属于需求判断不是缺陷，留给用户决定：
+
+- per-key 历史禁用统计、`lastFailAt` 仍没上面板。要做就是新功能，不是修 bug
+- 「30 天保留期」与用户说的「所有」的分歧 —— 现在清理真的会跑了，
+  所以这个分歧从「反正不生效」变成真实存在。要改就改 `USAGE_DB_RETENTION_DAYS`
+- `handleCountTokens` 没被 await 导致落库 tokens 恒 0（既存 bug，本轮没碰）
+- 换 key 重试时第一个 key 的失败不产生 requests 行（`error` 列现在能记到原因了，
+  但那条记录仍归属到第二个 key）
+- 指纹末 4 位碰撞（审计 #8）—— 线上 2 个 key 碰撞概率极低，真要修得在
+  snapshot 和 byKey 里带上池内索引作为真键，改动面比收益大
 
 ## 环境须知
 

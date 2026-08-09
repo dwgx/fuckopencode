@@ -52,6 +52,17 @@ export async function postUpstreamChat(
   const baseUrl = resolveUpstreamBaseUrl(model, cfg.anthropicBaseUrl, cfg.payAsYouGoBaseUrl);
 
   const key = pool.acquire();
+  // release 的契约是幂等（见文件头注释）。`pool.release` 只防负数，防不住重复调用
+  // 偷减**别的在飞请求**的计数 —— 错误路径上确实存在连续两次 release 的调用序列
+  // （整池无健康 key 时先 release，再落到统一错误出口又 release），会把面板
+  // 「几个号在扛并发」的数字压低甚至压到 0，并污染 least-loaded 选路。
+  // 用一次性标志兜住，调用方就不必逐条排查控制流。
+  let released = false;
+  const releaseOnce = (): void => {
+    if (released) return;
+    released = true;
+    pool.release(key);
+  };
   const timeoutSignal = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS);
   const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
@@ -69,13 +80,13 @@ export async function postUpstreamChat(
     return {
       response,
       key,
-      release: () => pool.release(key),
+      release: releaseOnce,
       markFailure: (kind: UpstreamFailureKind, resetDelayMs?: number) => pool.markFailure(key, kind, resetDelayMs),
       markSuccess: () => pool.markSuccess(key),
     };
   } catch (err) {
     // fetch 阶段失败（网络错误/超时）：并发计数已 acquire，必须释放。
-    pool.release(key);
+    releaseOnce();
     pool.markFailure(key, 'transient');
     throw err;
   }

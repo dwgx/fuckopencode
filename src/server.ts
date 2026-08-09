@@ -186,6 +186,27 @@ type MetricsCtx = Pick<
 >;
 
 /**
+ * 把上游错误体里的原始文案记进 ctx，供内存指标与 usagedb 落库。
+ *
+ * 为什么值得单独做：`ctx.error` 此前从初始化的 null 之后**从未被赋值**，
+ * 于是 `requests.error` 列恒为 NULL —— 失败请求在库里只剩一个状态码。
+ * 而上游那句原文（例如 `Weekly usage limit reached. Resets in 19hr 22min.`）
+ * 是判断「这个 key 到底怎么了」最直接的证据，此前它既不落库、也没有任何
+ * 一处 console 打它，只能靠 `key_events.cooldown_ms` 反推。
+ *
+ * 截断到 300 字符：上游偶尔会回很长的 HTML 错误页，没必要整页进库。
+ * 只给运维看，不回给客户端（客户端拿的仍是规范化后的错误体）。
+ */
+function noteUpstreamError(ctx: MetricsCtx, status: number, errBody: unknown): void {
+  let detail = '';
+  const e = errBody as { error?: { message?: unknown; type?: unknown } } | null;
+  const raw = e && e.error && typeof e.error.message === 'string' ? e.error.message : '';
+  const kind = e && e.error && typeof e.error.type === 'string' ? e.error.type : '';
+  if (raw) detail = kind ? `${kind}: ${raw}` : raw;
+  ctx.error = stripControl(`upstream ${status}${detail ? ` ${detail}` : ''}`).slice(0, 300);
+}
+
+/**
  * key 池状态变更日志。禁用/恢复都记一行，带指纹、原因、冷却时长与池健康度。
  *
  * 为什么必须有：2026-08-09 线上出过 295 个 503（`/v1/messages` 整池被禁约 3 分钟），
@@ -325,6 +346,9 @@ export function createApp(cfg: AppConfig, pool?: KeyPool, usageDb?: UsageDb) {
               disabled: keyPool.disabledFingerprints(),
               // 逐 key 明细：在飞请求数（= 几个号在扛并发）、禁用原因、剩余冷却。
               keys: keyPool.snapshot(),
+              // 冷却策略本身：让面板能解释「为什么是这个恢复时刻」，
+              // 而不是只给一个数字让人回去读源码。
+              policy: keyPool.policy(),
               // 跨重启累计。db 不可用时为 null，面板据此隐藏累计列。
               history: db.history(),
               historyDisabledReason: db.enabled ? null : db.disabledReason,
@@ -419,6 +443,10 @@ export function createApp(cfg: AppConfig, pool?: KeyPool, usageDb?: UsageDb) {
     } catch (err) {
       // 内部异常只进日志，回给调用方的统一固定文案（防配置/堆栈细节泄露）。
       const message = err instanceof Error ? err.message : 'internal error';
+      // 记进 ctx 让它落库/进内存指标。回给客户端的仍是固定文案，
+      // 这里只影响运维自己能看到的记账 —— 否则失败请求在库里只剩一个状态码，
+      // 「为什么失败」得回去翻 journalctl，而那恰是这个库要消灭的动作。
+      ctx.error = stripControl(message).slice(0, 300);
       console.error(`[proxy] ${stripControl(message)}`);
       if (!res.headersSent) {
         sendJson(res, 500, { error: INTERNAL_SERVER_ERROR });
@@ -546,6 +574,11 @@ async function handleChatCompletion(
     return;
   }
 
+  // 第一次读到的上游错误体。响应 body 只能读一次，所以读完要留着 ——
+  // 下面那个统一错误出口原本会再 `.json()` 一次，在「没换 key」的路径上
+  // 必然拿到空，于是连回给客户端的错误文案都退化成按状态码生成的通用句子。
+  let firstErrBody: unknown = null;
+
   // 非流式：上游返回错误状态时，若尚未写响应字节，可换 key 重试一次。
   if (!upstream.response.ok && !res.headersSent) {
     // 读取错误体用于分级（余额不足 → rate-limit，而非 auth 长期禁用）。
@@ -555,14 +588,22 @@ async function handleChatCompletion(
     } catch {
       // body 不是 JSON（如空/HTML）：忽略，按状态码分级。
     }
+    firstErrBody = errBody;
     const kind = classifyUpstreamFailure(upstream.response.status, errBody);
     upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+    // 在这里记：body 只能读一次，下面那个统一错误出口再 .json() 会拿到空。
+    // 记下的是「第一个 key 上到底出了什么」—— 恰是换 key 重试会掩盖掉的证据。
+    noteUpstreamError(ctx, upstream.response.status, errBody);
     if (pool.healthyCount > 0 && !res.headersSent) {
       upstream.release();
       // 换 key 重试（最多一次）。
       try {
         upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal);
         ctx.keyFingerprint = keyFingerprint(upstream.key);
+        // 换了 key 就是一个全新的响应：上一个 key 的错误体不能再用来描述它。
+        firstErrBody = null;
+        // 重试成功就不该在这条 200 记录上留着上一个 key 的错误文案。
+        if (upstream.response.ok) ctx.error = null;
       } catch (err) {
         if (err instanceof PoolEmptyError) {
           logPoolEmpty(pool);
@@ -578,12 +619,17 @@ async function handleChatCompletion(
   }
 
   if (!upstream.response.ok) {
-    let errBody: unknown = null;
-    try {
-      errBody = await upstream.response.json();
-    } catch {
-      // ignore
+    // 没换 key 时 body 已在上面读过（只能读一次），复用那份；换过 key 的话
+    // 这是新响应，firstErrBody 属于上一个 key，得重新读。
+    let errBody: unknown = firstErrBody;
+    if (errBody == null) {
+      try {
+        errBody = await upstream.response.json();
+      } catch {
+        // ignore
+      }
     }
+    noteUpstreamError(ctx, upstream.response.status, errBody);
     const err = anthropicErrorToOpenAI(upstream.response.status, errBody);
     const retryAfter = upstream.response.headers.get('retry-after');
     if (retryAfter) res.setHeader('retry-after', retryAfter);
@@ -791,6 +837,7 @@ async function handleMessagesPassThrough(
     }
     const kind = classifyUpstreamFailure(upstream.response.status, errBody);
     upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+    noteUpstreamError(ctx, upstream.response.status, errBody);
     const requestId = upstream.response.headers.get('request-id');
     const retryAfter = upstream.response.headers.get('retry-after');
     res.writeHead(upstream.response.status, {
