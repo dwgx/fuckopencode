@@ -1,88 +1,68 @@
 # 当前状态
 
-更新时间：2026-08-09
+更新时间：2026-08-09 20:30
 
-## 基线
+## 一句话
 
-`npx tsc --noEmit` 干净，`npx vitest run` 210 passed（10 files）。
-依赖已装。注意 `tsc`/`vitest` 不在 PATH，用 `npx`。
+OpenAI ↔ Anthropic 协议转换网关（面向 DeepSeek），线上跑在 nbus，功能完整、测试全绿。
+最近一轮工作全在修 DeepSeek 上游怪癖，不是加功能。
 
-## 线上
+## 基线（已验证）
 
-nbus（`ssh nbus`）已部署并验证，见 [DEPLOY.md](../docs/DEPLOY.md)。
-上游改走 **OpenAI 协议 + 订阅端点** `/zen/go`（cost=0），`-free` 模型自动走按量端点。
+| 项 | 状态 |
+|---|---|
+| `npx tsc --noEmit` | 干净 |
+| `npx vitest run` | 275 passed（11 files） |
+| 线上 nbus | `active`，`/healthz` ok，key 池 2/2 |
+| 最新 commit | `3f844a7` |
 
-验证过的：messages 非流式返回正文、工具调用 `stop_reason: tool_use` +
-`input: {"city":"北京"}`、chat 带 reasoning_effort、流式 74 个事件、
-监控面板无 key 401 / 带 key 200。key 池 2/2，上游模型 25 个。
-
-## 这轮做了什么
-
-**文档整理**
-
-建了 `.claude/docs/` 维护者文档区。宣传落地页从 `docs/index.html` 降级到
-`docs/site/index.html` 并重写（左右对照「直连会撞什么报错 → 网关做了什么」），
-浏览器验证过桌面/移动布局。README 去掉会过期的测试数字，补了漏掉的
-`STRIP_CONTROL_CHARS`。
-
-**keypool 重建（关键）**
-
-线上跑的版本比本地新，带一个本地完全没有的 `keypool` 模块（多 key 池 +
-失败熔断 + 冷却），而服务器上没有源码、没有 git remote。从 `dist/` 的
-`.js` + `.d.ts` 反推重建了 `src/keypool.ts`，并补回四处一起丢失的逻辑：
-
-- `errors.ts` 的 `classifyUpstreamFailure`（失败分级）
-- `deepseek.ts` 的 `completeStreamEvents`（补全 SSE 事件骨架）+ web_search 剥离
-- `sse.ts` 的裸 JSON 行解析 + `{}` 心跳跳过
-- `tool.ts` 的 `$ref` 降级 + 七键白名单 + properties 特殊处理
-- `stream.ts` 的 `partial_json` 计入 token 估算
-
-重建后逐文件对比编译产物与线上 `dist/`（忽略注释/空白），确认只剩有意的改动。
-新增 20 个 keypool 测试。
-
-**修的 bug**
-
-- chat 端点发顶层 `reasoning_effort`（DeepSeek 必 400）→ 改 `output_config.effort`
-- 流式漏发 `finish_reason`（上游只发 `message_stop` 时）→ 加 `emittedFinish` 兜底
-- **content 字符串上游报 Empty input messages** → 归一化转内容块数组。
-  这条是部署时实测发现的，旧版本同样有，不是本轮回归
+线上部署方式见 [DEPLOY.md](../docs/DEPLOY.md)。改代码前先读
+[DEEPSEEK-QUIRKS.md](../docs/DEEPSEEK-QUIRKS.md)。
 
 ## 未提交
 
-工作区有大量改动没提交，包括 keypool 重建、bug 修复、文档区、落地页重写。
-提交前 `git diff` 确认范围。`.deploy-backup/` 是线上 dist 备份，**不要提交**
-（需要加进 `.gitignore`）。
+- `.claude/docs/DEEPSEEK-QUIRKS.md` — 新增第 12 条（DSML 泄漏）
+- `src/anthropic.ts` 已 `git rm` — 死代码（被 `upstream.ts` 取代，全仓零引用，
+  删后 typecheck + 275 测试均通过）
 
-## 下一步
+这两项可以直接提交，不需要额外验证。
 
-看 [PLAN.md](../docs/PLAN.md)。优先级 1 仍是消掉双路径适配债（I-3）——
-本轮又一次印证了它的危害：keypool 只接在直通路径，chat 路径的 deepseek
-适配是另一套。
+## 这轮做完的事（2026-08-09）
 
-## 监控面板
+按时间倒序，每条都已部署到 nbus 并验证：
 
-`/__dash`（页面）+ `/__metrics`（JSON）。设计对齐 opencode 的 token 体系
-（爬他们编译 CSS 与 `packages/ui/src/styles/theme.css` 得到）：全站等宽、
-零渐变零阴影、圆角 4px、文字用 rgba 透明度分级、单一强调色 `#9dbefe`、
-`[*]` 与 `Fig n.` 记号、`█▀▄`+`_^~` 半块 ASCII banner（照 `packages/tui/src/logo.ts` 的写法）。
+1. **DSML 泄漏兜底**（`3f844a7` + `b3ace1a`）— 上游偶发把工具调用当文本吐，
+   客户端看到裸 `invoke` 文本、工具不执行。新增 [dsml.ts](../../src/dsml.ts)
+   还原成 `tool_use` 块并纠正 `stop_reason`。**注意两版的区别**：第一版正则假设
+   「外层包一层 DSML」，实测格式是「每个标签自带前缀」，第一版等于空操作，
+   `3f844a7` 才是有效的那版。
+2. **图片块降级**（`6826069`）— 上游解析图片失败打成 400，改为降级文本占位。
+3. **system 消息放行 + thinking 全量回传**（`0baac21`）。
+4. **key 池公平轮转 + 额度耗尽长冷却**（`8cc54cb`）。
 
-**面板要求 API key**（`DASHBOARD_OPEN=0`）—— cloudflared 隧道把 8787 整体
-暴露成 `fuckopencode.dwgx.top`，而面板含调用方 IP 与 UA。
+## 下一步（按价值排序）
 
-请求日志从 15 列宽表改成两行式条目：第一行固定列扫读，第二行细节 flex-wrap
-自动换行。之前宽表 15 列挤在 1080px 里会叠字，footer 也只有 4px 间距贴住表格。
+见 [PLAN.md](../docs/PLAN.md) 的完整清单。当前最该做的：
 
-## 待你决定
+1. **修 key 池 `quota-exhausted` 误判**（有实证，未修）。
+   [errors.ts:155-159](../../src/errors.ts) 的 `/balance|credit|billing|quota/i`
+   正则过宽，把含 "quota" 字样的非额度错误也判成额度耗尽 → 1 小时长冷却。
+   **实测后果**：两个 key 直连上游都返回 200，却双双被禁，网关整池返回
+   `all upstream keys are disabled`。重启服务才恢复。
+   修法方向：收窄正则，或让 `quota-exhausted` 只在明确的 `GoUsageLimitError` /
+   带 reset 时间的响应上生效，其余归 `rate-limit`（短冷却）。
+2. 消掉双路径适配债（PLAN 优先级 1）— chat 路径和直通路径是两套 deepseek 适配
+   实现，改一处必须检查另一处。这是当前最大的维护风险。
 
-- `I-5`：`/v1/messages` 要不要加 system 护栏
-- 上游 key 与客户端 key 曾以明文进对话，建议轮换（SECRETS.md 第 126 行记过同类教训）
-- `deepseek-v4-flash-free` 的 output_tokens 偏高（一次「部署成功」耗 2139 token），
-  要不要查是不是 thinking 计入
+## 环境须知
 
-## 坑
+- `tsc` / `vitest` 不在 PATH，用 `npx` 或 npm script
+- 线上操作走 `ssh nbus`
+- 常用命令见 [CLAUDE.md](../../CLAUDE.md)
 
-- 这个项目约 3000 行源码，直接读比派 subagent 稳。本轮曾派 6 个 agent，
-  5 个因 API 错误死掉、1 个丢失进程状态。
-- **判断线上与本地差异时，要对比编译产物，不能只读源码。** 本轮靠逐文件
-  diff 才发现四处本地缺失的逻辑，只看 keypool 会漏掉。
-- 服务 active 不代表能用 —— 零上游 key 也能正常启动监听。必须发真实请求。
+## 不要做的事
+
+- 不要因为「看起来多余」就删兜底逻辑 —— 基本每条都对应一个 DeepSeek 怪癖，
+  删之前查 DEEPSEEK-QUIRKS.md
+- 不要只改一条路径的 deepseek 适配
+- 不要引入运行时依赖（零依赖是刻意的）

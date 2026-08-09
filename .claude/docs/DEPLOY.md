@@ -34,30 +34,33 @@
 
 ## 更新流程
 
-本地验证 → 构建 → 推产物 → 原子替换 → 重启 → 验证。
+用脚本，不要手敲。[scripts/deploy.sh](../../scripts/deploy.sh) 把
+「本地验证 → 构建 → 推产物 → 原子替换 → 重启 → 健康检查」串成一条：
 
 ```bash
-npm run typecheck && npm test && npm run build
+./scripts/deploy.sh
 ```
+
+回滚到上一个版本：
 
 ```bash
-tar czf /tmp/fc.tar.gz dist && scp -P 52535 -i ~/.ssh/id_nbus /tmp/fc.tar.gz root@38.244.34.15:/root/
+./scripts/deploy.sh rollback
 ```
 
-远端替换（保留 `dist.prev2` 可回滚）：
+只清线上旧备份：
 
 ```bash
-ssh nbus 'cd /root/fuckopencode && rm -rf dist.new && mkdir dist.new && tar xzf /root/fc.tar.gz -C dist.new --strip-components=1 && test -f dist.new/keypool.js && rm -rf dist.prev2 && mv dist dist.prev2 && mv dist.new dist && systemctl restart fuckopencode && sleep 3 && systemctl is-active fuckopencode'
+./scripts/deploy.sh clean
 ```
 
-**替换前一定要校验 `dist.new/keypool.js` 存在。** 少了它 env 里的
-`OPENSEA_KEYS` 就没人读，服务会以零上游 key 启动，所有请求 503。
+脚本里有两条承重设计，改它之前先理解：
 
-回滚：
-
-```bash
-ssh nbus 'cd /root/fuckopencode && rm -rf dist && mv dist.prev2 dist && systemctl restart fuckopencode'
-```
+1. **替换前校验 `dist.new/keypool.js` 与 `dist.new/dsml.js` 存在。**
+   少了 keypool 就没人读 env 里的 `OPENSEA_KEYS`，服务以零上游 key 启动，
+   所有请求 503。缺失时脚本中止，不会把坏产物换上去。
+2. **备份只保留一个 `dist.prev`。** 早期手敲部署留下了 `dist.prev2` 一路到
+   `dist.prevJ` 共 17 份陈旧备份（占 9.9M，已清理到 1.3M）。脚本每次轮转时
+   先删旧备份再挪当前 dist，不再堆积。
 
 ## 环境变量
 
