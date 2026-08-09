@@ -59,6 +59,9 @@ export function openAIToAnthropicResponse(
   const choice = res.choices?.[0];
   const message = choice?.message;
   const content: AnthropicResponseContentBlock[] = [];
+  // 上游把工具调用泄漏成文本时 finish_reason 通常是 stop；还原成 tool_use 块后
+  // 必须把 stop_reason 一并纠正，否则客户端当成 end_turn，不会执行工具。
+  let recoveredToolUse = false;
 
   if (message?.reasoning_content) {
     content.push({ type: 'thinking', thinking: message.reasoning_content, signature: '' });
@@ -69,9 +72,11 @@ export function openAIToAnthropicResponse(
     const dsml = extractDsmlToolCalls(message.content);
     if (dsml) {
       if (dsml.text) content.push({ type: 'text', text: dsml.text });
-      for (const c of dsml.toolCalls) {
-        content.push({ type: 'tool_use', id: `dsml_${c.name}`, name: c.name, input: c.input });
-      }
+      dsml.toolCalls.forEach((c, i) => {
+        // 同名工具可能被调用多次，序号保证 id 唯一。
+        content.push({ type: 'tool_use', id: `dsml_${i}_${c.name}`, name: c.name, input: c.input });
+      });
+      recoveredToolUse = dsml.toolCalls.length > 0;
     } else {
       content.push({ type: 'text', text: message.content });
     }
@@ -98,7 +103,7 @@ export function openAIToAnthropicResponse(
     role: 'assistant',
     model: options.model ?? res.model,
     content,
-    stop_reason: openAIFinishReasonToAnthropic(choice?.finish_reason),
+    stop_reason: recoveredToolUse ? 'tool_use' : openAIFinishReasonToAnthropic(choice?.finish_reason),
     stop_sequence: null,
     usage: openAIUsageToAnthropic(res.usage),
   };
@@ -142,6 +147,8 @@ export async function* openAIStreamToAnthropic(
    * 本来就要等工具结果，牺牲可接受；纯长文对话会有感知延迟。
    */
   let bufferedText = '';
+  /** DSML 还原出工具调用时要把 stop_reason 纠正为 tool_use（同非流式）。 */
+  let recoveredToolUse = false;
 
   const ensureStart = function* (): Generator<AnthropicStreamEvent> {
     if (started) return;
@@ -266,12 +273,14 @@ export async function* openAIStreamToAnthropic(
         openTextBlock = null;
       }
       // 每个解析出的调用一个 tool_use 块
-      for (const c of dsml.toolCalls) {
+      recoveredToolUse = dsml.toolCalls.length > 0;
+      for (let i = 0; i < dsml.toolCalls.length; i++) {
+        const c = dsml.toolCalls[i]!;
         const idx = nextIndex++;
         yield {
           type: 'content_block_start',
           index: idx,
-          content_block: { type: 'tool_use', id: `dsml_${c.name}`, name: c.name, input: c.input },
+          content_block: { type: 'tool_use', id: `dsml_${i}_${c.name}`, name: c.name, input: c.input },
         };
         yield { type: 'content_block_stop', index: idx };
       }
@@ -314,7 +323,9 @@ export async function* openAIStreamToAnthropic(
   yield {
     type: 'message_delta',
     delta: {
-      stop_reason: openAIFinishReasonToAnthropic(finishReason) ?? 'end_turn',
+      stop_reason: recoveredToolUse
+        ? 'tool_use'
+        : (openAIFinishReasonToAnthropic(finishReason) ?? 'end_turn'),
       stop_sequence: null,
     },
     usage: { output_tokens: anthropicUsage.output_tokens },
