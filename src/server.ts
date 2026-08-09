@@ -100,7 +100,8 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<{ ok: true; t
     });
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > maxBytes) {
+      // maxBytes=0 表示不限制（对齐 kirostudio：大请求体常见，限制反而误伤）。
+      if (maxBytes > 0 && size > maxBytes) {
         finish({ ok: false, status: 413 });
         req.destroy();
         return;
@@ -123,12 +124,28 @@ const BODY_READ_STATUS_MESSAGE: Record<number, string> = {
   413: 'request body too large',
 };
 
-function parseJson(text: string): { ok: true; body: unknown } | { ok: false } {
+function parseJson(text: string): { ok: true; body: unknown } | { ok: false; empty: boolean } {
+  // 区分「请求体为空」与「JSON 写错」：空 body 通常意味着上游代理/透传层把
+  // 请求体丢了（实测 kirostudio 透传曾发出 0 字节 body），而不是客户端写错 JSON。
+  // 报错文案不同才能一眼定位是哪一层的问题。
+  if (text.length === 0) return { ok: false, empty: true };
   try {
     return { ok: true, body: JSON.parse(text) };
   } catch {
-    return { ok: false };
+    return { ok: false, empty: false };
   }
+}
+
+/** 空 body / 畸形 JSON 的统一错误响应。 */
+function badBodyError(empty: boolean): { error: { message: string; type: string } } {
+  return {
+    error: {
+      message: empty
+        ? 'request body is empty — a proxy or relay in front of this gateway likely dropped it'
+        : 'invalid JSON body',
+      type: 'invalid_request_error',
+    },
+  };
 }
 
 /**
@@ -210,11 +227,13 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {
         return;
       }
 
-      // 监控面板。面板含调用方 IP/UA，所以只对「确实来自本机」的请求免鉴权：
-      // socket 源地址是回环 + 没有 CDN 转发头。经 cloudflared 反代进来的请求
-      // socket 也是回环，但会带 cf-* 头，据此区分，防止隧道把面板暴露到公网。
+      // 监控面板：公开访问，无需鉴权（用户明确要求 HTML 公开）。
+      //
+      // 注意这意味着**任何人都能看到全部调用方的 IP、完整 UA、转发链**。
+      // 这是刻意的选择，不是漏配。想收回去就把 DASHBOARD_PUBLIC 设成 0，
+      // 那时会退回「本机直连免 key、其余要 key」的行为。
       if (req.method === 'GET' && (path === '/__dash' || path === '/__metrics')) {
-        if (!(cfg.dashboardOpen && isDirectLocalRequest(req))) {
+        if (!cfg.dashboardPublic && !(cfg.dashboardOpen && isDirectLocalRequest(req))) {
           const auth = verifyAuth(cfg, req.headers as Record<string, string | undefined>);
           if (!auth.ok) {
             // 浏览器地址栏没法带 header，所以给一句能照做的提示，而不是干巴巴的 401。
@@ -380,7 +399,7 @@ async function handleChatCompletion(
   }
   const parsed = parseJson(read.text);
   if (!parsed.ok) {
-    sendJson(res, 400, { error: { message: 'invalid JSON body', type: 'invalid_request_error' } });
+    sendJson(res, 400, badBodyError(parsed.empty));
     return;
   }
 
@@ -585,7 +604,7 @@ async function handleMessagesPassThrough(
   }
   const parsed = parseJson(read.text);
   if (!parsed.ok) {
-    sendJson(res, 400, { error: { message: 'invalid JSON body', type: 'invalid_request_error' } });
+    sendJson(res, 400, badBodyError(parsed.empty));
     return;
   }
   const body = parsed.body as Record<string, unknown>;
@@ -754,7 +773,7 @@ function handleCountTokens(req: IncomingMessage, res: ServerResponse, cfg: AppCo
     }
     const parsed = parseJson(read.text);
     if (!parsed.ok) {
-      sendJson(res, 400, { error: { message: 'invalid JSON body', type: 'invalid_request_error' } });
+      sendJson(res, 400, badBodyError(parsed.empty));
       return;
     }
     const bodyObj = parsed.body as Record<string, unknown> | null;

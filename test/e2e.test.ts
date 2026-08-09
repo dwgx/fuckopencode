@@ -113,6 +113,7 @@ describe('v1 代理端到端', () => {
     stripControlChars: true,
     trustClaudeCodeHeaders: false,
     dashboardOpen: false,
+    dashboardPublic: false,
   };
 
   beforeAll(async () => {
@@ -329,6 +330,7 @@ describe('未鉴权放行模式的安全加固', () => {
     stripControlChars: true,
     trustClaudeCodeHeaders: false,
     dashboardOpen: false,
+    dashboardPublic: false,
   };
 
   beforeAll(async () => {
@@ -353,6 +355,31 @@ describe('未鉴权放行模式的安全加固', () => {
       body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] }),
     });
     expect(res.status).toBe(403);
+  });
+
+  it('空请求体给出可定位的错误（区分于 JSON 写错）', async () => {
+    // 回归：kirostudio 透传曾发出 0 字节 body，报 "invalid JSON body" 时
+    // 分不清是上游丢了 body 还是客户端写错 JSON，排查绕了很久。
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '',
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string } };
+    expect(json.error.message).toContain('empty');
+    expect(json.error.message).toContain('proxy or relay');
+  });
+
+  it('畸形 JSON 仍报 invalid JSON body', async () => {
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{bad',
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string } };
+    expect(json.error.message).toBe('invalid JSON body');
   });
 
   it('Content-Type 非 application/json 返回 415', async () => {
@@ -404,6 +431,7 @@ describe('监控面板访问控制', () => {
     stripControlChars: true,
     trustClaudeCodeHeaders: false,
     dashboardOpen: true,
+    dashboardPublic: false,
   };
 
   beforeAll(async () => {
@@ -456,5 +484,65 @@ describe('监控面板访问控制', () => {
     await fetch(`${baseUrl}/__dash`);
     const after = (await (await fetch(`${baseUrl}/__metrics`)).json()) as { totalRequests: number };
     expect(after.totalRequests).toBe(before.totalRequests);
+  });
+});
+
+describe('面板完全公开模式（DASHBOARD_PUBLIC=1）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  const publicCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['secret'],
+    anthropicApiKey: 'sk-fake',
+    upstreamKeys: ['sk-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: true,
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    publicCfg.anthropicBaseUrl = fake.baseUrl;
+    proxy = createApp(publicCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  it('公开模式下带 CDN 头也免 key（模拟公网访问）', async () => {
+    const res = await fetch(`${baseUrl}/__dash`, { headers: { 'cf-connecting-ip': '8.8.8.8' } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+  });
+
+  it('/__metrics 同样公开', async () => {
+    const res = await fetch(`${baseUrl}/__metrics`, { headers: { 'cf-connecting-ip': '8.8.8.8' } });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { pool: { size: number } };
+    expect(json.pool.size).toBe(1);
+  });
+
+  it('但 API 端点仍然要 key —— 公开面板不等于公开 API', async () => {
+    const res = await fetch(`${baseUrl}/v1/models`, { headers: { 'cf-connecting-ip': '8.8.8.8' } });
+    expect(res.status).toBe(401);
   });
 });

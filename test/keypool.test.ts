@@ -91,8 +91,19 @@ describe('KeyPool 失败分级与禁用', () => {
     // 连续多次 429 也不该永久禁用，只是短冷却。
     for (let i = 0; i < 10; i++) pool.markFailure('a', 'rate-limit');
     expect(pool.healthyCount).toBe(1);
-    // 短冷却 = cooldownMs / 6 = 10s。
-    clock.advance(OPTS.cooldownMs / 6 + 1);
+    // 短冷却上限 3s：429 是账号级状态，冷却太长会把小池打光导致整池 503。
+    clock.advance(3001);
+    expect(pool.healthyCount).toBe(2);
+  });
+
+  it('回归：连续 429 不会让小池长时间整体 503', () => {
+    const clock = fakeClock();
+    // 线上就是 2 个 key + cooldownMs=300s 的组合，曾导致 2 次 429 打光整池 50 秒。
+    const pool = new KeyPool(['a', 'b'], { cooldownMs: 300_000, failThreshold: 5, now: clock.now });
+    for (const k of ['a', 'b']) pool.markFailure(k, 'rate-limit');
+    expect(pool.healthyCount).toBe(0);
+    // 3 秒后必须恢复，而不是 50 秒。
+    clock.advance(3001);
     expect(pool.healthyCount).toBe(2);
   });
 
