@@ -7,7 +7,12 @@ import {
   openAIUsageToAnthropic,
 } from '../src/toAnthropic.js';
 import { resolveUpstreamBaseUrl } from '../src/deepseek.js';
-import type { AnthropicRequest, AnthropicStreamEvent, OpenAIStreamChunk } from '../src/types.js';
+import type {
+  AnthropicContentBlock,
+  AnthropicRequest,
+  AnthropicStreamEvent,
+  OpenAIStreamChunk,
+} from '../src/types.js';
 
 async function* chunks(list: OpenAIStreamChunk[]): AsyncGenerator<OpenAIStreamChunk> {
   for (const c of list) yield c;
@@ -289,7 +294,8 @@ describe('openAIStreamToAnthropic', () => {
     expect(texts.join('')).toBe('你好');
   });
 
-  it('reasoning_content → thinking 块，切到 content 时关旧块开新块', async () => {
+  it('reasoning_content → thinking 块；content 缓冲到收尾统一发', async () => {
+    // 流式文本改为缓冲到流结束（为 DSML 兜底解析），所以 text 块在收尾才出现。
     const events = await collect(
       openAIStreamToAnthropic(
         chunks([chunk({ reasoning_content: '想' }), chunk({ content: '答' }), chunk({}, 'stop')]),
@@ -299,12 +305,16 @@ describe('openAIStreamToAnthropic', () => {
       (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_start' }> => e.type === 'content_block_start',
     );
     expect(starts[0]!.content_block.type).toBe('thinking');
+    // text 块在收尾才发（缓冲后），位于 thinking 块之后。
     expect(starts[1]!.content_block.type).toBe('text');
-    // 两个块 index 不同，且 thinking 块在 text 块开始前已 stop。
     expect(starts[0]!.index).not.toBe(starts[1]!.index);
-    const stopIdx = events.findIndex((e) => e.type === 'content_block_stop');
-    const textStartIdx = events.indexOf(starts[1]!);
-    expect(stopIdx).toBeLessThan(textStartIdx);
+    // 文本内容最终到达。
+    const text = events
+      .filter((e): e is Extract<AnthropicStreamEvent, { type: 'content_block_delta' }> => e.type === 'content_block_delta')
+      .filter((e) => 'text' in e.delta)
+      .map((e) => ('text' in e.delta ? e.delta.text : ''))
+      .join('');
+    expect(text).toBe('答');
   });
 
   it('tool_calls → tool_use 块 + input_json_delta', async () => {
@@ -367,5 +377,78 @@ describe('openAIStreamToAnthropic', () => {
   it('空流也补出自洽骨架，不让客户端挂死', async () => {
     const events = await collect(openAIStreamToAnthropic(chunks([])));
     expect(events.map((e) => e.type)).toEqual(['message_start', 'message_delta', 'message_stop']);
+  });
+});
+
+describe('DSML 泄漏兜底解析', () => {
+  it('流式：DSML 包裹的工具调用被还原成 tool_use 块', async () => {
+    const leaked = [
+      '⟨|DSML|function_calls⟩',
+      '<invoke name="Bash">',
+      '<parameter name="command">ls -la</parameter>',
+      '</invoke>',
+      '⟨/DSML|function_calls⟩',
+    ].join('\n');
+    const events = await collect(
+      openAIStreamToAnthropic(
+        chunks([
+          // 分片发：真实上游会按 chunk 增量吐出
+          chunk({ content: leaked.slice(0, 20) }),
+          chunk({ content: leaked.slice(20, 60) }),
+          chunk({ content: leaked.slice(60) }),
+          chunk({}, 'stop'),
+        ]),
+      ),
+    );
+    const toolUse = events.find(
+      (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_start' }> =>
+        e.type === 'content_block_start' && e.content_block.type === 'tool_use',
+    );
+    expect(toolUse).toBeDefined();
+    const tb = toolUse!.content_block as Extract<AnthropicContentBlock, { type: 'tool_use' }>;
+    expect(tb.name).toBe('Bash');
+    expect(tb.input).toEqual({ command: 'ls -la' });
+    // 不残留 DSML 文本。
+    const text = events
+      .filter((e): e is Extract<AnthropicStreamEvent, { type: 'content_block_delta' }> => e.type === 'content_block_delta')
+      .filter((e) => 'text' in e.delta)
+      .map((e) => ('text' in e.delta ? e.delta.text : ''))
+      .join('');
+    expect(text).not.toContain('DSML');
+    expect(text).not.toContain('<invoke');
+  });
+
+  it('普通文本流式不被缓冲改动', async () => {
+    const events = await collect(
+      openAIStreamToAnthropic(chunks([chunk({ content: '你好' }), chunk({ content: '世界' }), chunk({}, 'stop')])),
+    );
+    const text = events
+      .filter((e): e is Extract<AnthropicStreamEvent, { type: 'content_block_delta' }> => e.type === 'content_block_delta')
+      .filter((e) => 'text' in e.delta)
+      .map((e) => ('text' in e.delta ? e.delta.text : ''))
+      .join('');
+    expect(text).toBe('你好世界');
+  });
+
+  it('非流式：DSML 文本被还原成 tool_use', () => {
+    const leaked = '⟨|DSML|function_calls⟩\n<invoke name="Bash"><parameter name="command">ls</parameter></invoke>\n⟨/DSML|function_calls⟩';
+    const out = openAIToAnthropicResponse({
+      id: 'c1',
+      object: 'chat.completion',
+      created: 1,
+      model: 'm',
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: leaked },
+          finish_reason: 'tool_calls',
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    } as never);
+    const tu = out.content.find((b) => b.type === 'tool_use');
+    expect(tu).toBeDefined();
+    expect((tu as { name: string }).name).toBe('Bash');
+    expect((tu as { input: unknown }).input).toEqual({ command: 'ls' });
   });
 });
