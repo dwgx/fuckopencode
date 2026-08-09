@@ -91,6 +91,12 @@ claude
 | `MAX_BODY_BYTES` | `10485760` | 请求体上限 |
 | `MAX_MESSAGE_CHARS` | `200000` | 单条消息文本上限 |
 | `STRIP_CONTROL_CHARS` | `1` | 剥离日志/转发内容里的控制符 |
+| `USAGE_DB_PATH` | `data/usage.db` | 用量库路径（相对工作目录）。设为空串关闭持久化 |
+| `USAGE_DB_RETENTION_DAYS` | `30` | 用量记录保留天数，`0` = 不清理 |
+
+用量库用 Node 内置 `node:sqlite`（Node 22+），**不引入任何 npm 依赖**。
+Node 20 上该模块不存在，此时自动降级：只记一条 warn，面板不显示历史累计，
+代理功能不受影响。库里只存 key 指纹（末 4 位），不存 key 原文，也不存 IP/UA。
 
 ## 架构
 

@@ -80,8 +80,43 @@
 | `KEY_COOLDOWN_MS` | 300000 |
 | `HOST` / `PORT` | `127.0.0.1` / `8788`（8787 已被盾接管，见 SHIELD.md） |
 | `INJECTION_MODE` | `block` |
+| `USAGE_DB_PATH` | 不设 = `data/usage.db`（相对 `WorkingDirectory`）。设为空串关闭持久化 |
+| `USAGE_DB_RETENTION_DAYS` | 不设 = 30。`0` = 不清理 |
 
 改 env 后要 `systemctl restart`（`EnvironmentFile` 只在启动时读）。
+
+## 用量库（data/usage.db）
+
+面板的「累计」列和「最近状态变更」来自 SQLite，用 Node 内置 `node:sqlite`
+（**不引入任何 npm 包** —— `dependencies` 保持为空是刻意的）。
+
+三件关于位置的事，改部署脚本前必须知道：
+
+1. **db 必须在 `dist/` 外面。** `deploy.sh` 每次做
+   `rm -rf dist.prev; mv dist dist.prev; mv dist.new dist`。放 `dist/` 里
+   等于每次部署丢历史、回滚还会把旧数据带回来。
+2. 路径相对 **`WorkingDirectory`**（systemd unit 里是 `/root/fuckopencode`），
+   所以默认落在 `/root/fuckopencode/data/usage.db`。
+3. WAL 模式会额外产生 `usage.db-wal` / `usage.db-shm`。备份要一起拿，
+   或者先 `sqlite3 usage.db "PRAGMA wal_checkpoint(TRUNCATE)"`。
+
+**降级是设计的一部分，不是故障：** Node 20 没有 `node:sqlite`、盘满、权限不足、
+db 损坏 —— 任何一种情况都只打一行 warn，然后整个模块退化成 no-op。面板照常工作，
+只是不显示累计列（会显示降级原因）。**代理链路一个字节都不受影响。**
+
+启动日志能直接看出状态：
+
+```
+[proxy] usage db: data/usage.db (retention 30d)   # 正常
+[proxy] usage db: off (<原因>)                     # 降级
+```
+
+盘占用量级：每条请求约 100 字节，30 天保留期下几万行 ≈ 几 MB。清理是惰性触发的
+（跟着写入走，每 6 小时一次），不占常驻定时器 —— 那台机器 1.9 GB 内存、
+网关 `MemoryMax=400M`。
+
+隐私口径与日志/面板一致：**只存 key 指纹（末 4 位），不存 key 原文，不存 IP/UA。**
+IP 和 UA 只在内存窗口里（200 条），长期留存反而是负担。
 
 改 env 的正确姿势：**不要把凭证写进命令行**（`ps` 可见，也会进 shell 历史）。
 scp 一个临时文件上去，远端处理完 `shred -u` 删掉。

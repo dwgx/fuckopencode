@@ -12,3 +12,6 @@ coverage/
 
 # 本地预览配置（含测试用 key，不入库）
 .claude/launch.json
+
+# 用量库（运行时产物；线上落在 dist/ 外面，deploy 时不会被覆盖）
+data/

@@ -23,6 +23,44 @@ interface PooledKey {
   lastFailAt: number;
   /** 上次被选中的单调序号，用于并发相同时的公平轮转。 */
   lastUsedSeq: number;
+  /**
+   * 当前禁用的原因（未禁用时 undefined）。**只用于展示/审计，不参与选路。**
+   *
+   * 为什么要存：原因此前只出现在 `KeyStateEvent` 里飘过一次（进日志），
+   * 面板拿不到 —— 排查「这个 key 怎么了」得去 `journalctl` 翻日志再读源码
+   * 算冷却时间。存下来才能在面板上直接显示「disabled · quota-exhausted」。
+   */
+  disabledReason?: UpstreamFailureKind;
+  /** 被 `acquire()` 选中的累计次数（进程级，重启清零）。判断分流是否均匀用。 */
+  totalAcquired: number;
+}
+
+/**
+ * 单个 key 的对外快照（面板 / `/__metrics` 用）。**key 只以指纹出现，绝不含原文。**
+ *
+ * 设计要点：`disabledUntil`（绝对时刻）与 `recoverInMs`（相对剩余）**两个都给**。
+ * 面板要显示「恢复于 08:01:42（还剩 5h58m）」，给绝对值它不用推算日期、
+ * 给相对值它能本地每秒倒计时，不依赖轮询精度。
+ */
+export interface PoolKeySnapshot {
+  /** key 指纹（末 4 位），如 `****ZOBb`。 */
+  fingerprint: string;
+  /** 当前是否可用（冷却已过）。 */
+  healthy: boolean;
+  /** 当前活跃请求数 —— 「几个号在扛并发分流」的直接答案。 */
+  inFlight: number;
+  /** 连续失败计数（距上次成功清零）。 */
+  failCount: number;
+  /** 禁用原因；健康时为 undefined。 */
+  disabledReason?: UpstreamFailureKind;
+  /** 禁用截止的绝对时间戳；0 = 未禁用。 */
+  disabledUntil: number;
+  /** 距恢复还剩多少毫秒；未禁用为 0。 */
+  recoverInMs: number;
+  /** 最后被选中的时间戳；0 = 从未使用。 */
+  lastUsedAt: number;
+  /** 被选中的累计次数（进程级）。 */
+  totalAcquired: number;
 }
 
 export interface KeyPoolOptions {
@@ -95,8 +133,9 @@ export class KeyPool {
         failCount: 0,
         inFlight: 0,
         lastUsedAt: 0,
-      lastUsedSeq: 0,
+        lastUsedSeq: 0,
         lastFailAt: -1,
+        totalAcquired: 0,
       });
     }
     this.opts = {
@@ -145,6 +184,38 @@ export class KeyPool {
   }
 
   /**
+   * 每个 key 的当前状态快照，喂 `/__metrics` 与面板。
+   *
+   * 为什么需要：此前对外只有 `size`/`healthyCount`/`disabledFingerprints()` 三个
+   * 聚合值，面板上就是一行 `pool 1/2`。要回答「哪个 key 在扛并发」「为什么被禁」
+   * 「什么时候恢复」，得去 journalctl 翻 `[keypool]` 行、再读源码算冷却公式 ——
+   * 那些信息本来就在内存里，只是没暴露。
+   *
+   * **不含 key 原文**：只输出 `keyFingerprint()` 的末 4 位形式。
+   * 顺序与 `OPENSEA_KEYS` 的配置顺序一致（构造时去重后的顺序），方便对号。
+   */
+  snapshot(): PoolKeySnapshot[] {
+    const now = this.now();
+    return this.keys.map((k) => {
+      const healthy = k.disabledUntil <= now;
+      return {
+        fingerprint: keyFingerprint(k.key),
+        healthy,
+        inFlight: k.inFlight,
+        failCount: k.failCount,
+        // 健康的 key 不带原因（禁用字段在 reapRecovered/reset 里清，但冷却自然到期
+        // 而还没走到 acquire 时 disabledUntil 仍是旧值 —— 用 healthy 兜住，
+        // 保证面板不会显示「healthy 但带着 quota-exhausted」这种自相矛盾的状态）。
+        ...(healthy ? {} : { disabledReason: k.disabledReason }),
+        disabledUntil: healthy ? 0 : k.disabledUntil,
+        recoverInMs: healthy ? 0 : k.disabledUntil - now,
+        lastUsedAt: k.lastUsedAt,
+        totalAcquired: k.totalAcquired,
+      };
+    });
+  }
+
+  /**
    * 选择一个 key 并递增 inFlight。同步完成（无 await），保证原子性。
    * least-loaded：优先选 inFlight 最少的健康 key；全 0 时按 lastUsedAt 最旧优先轮转。
    * 所有 key 都禁用时抛 PoolEmptyError。
@@ -172,6 +243,7 @@ export class KeyPool {
     selected.inFlight += 1;
     selected.lastUsedAt = now;
     selected.lastUsedSeq = ++this.seq;
+    selected.totalAcquired += 1;
     return selected.key;
   }
 
@@ -215,6 +287,7 @@ export class KeyPool {
         ? resetDelayMs + 60_000
         : QUOTA_FALLBACK_COOLDOWN_MS);
       k.failCount = 0;
+      k.disabledReason = kind;
       this.emitDisabled(k, kind, k.disabledUntil - now);
       return;
     }
@@ -223,6 +296,7 @@ export class KeyPool {
       // 凭据无效：立即禁用，超长冷却（12 × cooldownMs），之后自动恢复（可能被重新配额）。
       k.disabledUntil = now + this.opts.cooldownMs * 12;
       k.failCount = 0;
+      k.disabledReason = kind;
       this.emitDisabled(k, kind, this.opts.cooldownMs * 12);
       return;
     }
@@ -236,6 +310,7 @@ export class KeyPool {
       // 直接报错中断，表现为「用一会儿就挂」。所以这里固定 3 秒上限，
       // 让请求快速重回池子，把重试节奏交给客户端而不是拖死整池。
       k.disabledUntil = now + Math.min(3000, Math.max(500, Math.floor(this.opts.cooldownMs / 100)));
+      k.disabledReason = kind;
       // 短冷却也上报：整池同时 rate-limit 一样会造成 503 空窗，
       // 而这恰好是排查 2026-08-09 那 295 个 503 时最大的盲区。
       this.emitDisabled(k, kind, k.disabledUntil - now);
@@ -250,6 +325,7 @@ export class KeyPool {
       const jittered = Math.floor(backoff * (0.8 + Math.random() * 0.4));
       k.disabledUntil = now + jittered;
       k.failCount = 0;
+      k.disabledReason = kind;
       this.emitDisabled(k, kind, jittered);
     }
   }
@@ -261,6 +337,7 @@ export class KeyPool {
     k.disabledUntil = 0;
     k.failCount = 0;
     k.lastFailAt = -1;
+    delete k.disabledReason;
   }
 
   /**
@@ -274,6 +351,7 @@ export class KeyPool {
         k.disabledUntil = 0;
         k.failCount = 0;
         k.lastFailAt = -1;
+        delete k.disabledReason;
         this.opts.onStateChange({
           type: 'recovered',
           fingerprint: keyFingerprint(k.key),

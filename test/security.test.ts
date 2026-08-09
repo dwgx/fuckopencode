@@ -30,6 +30,8 @@ const cfg: AppConfig = {
   trustClaudeCodeHeaders: false,
   dashboardOpen: false,
   dashboardPublic: false,
+  usageDbPath: '',  // 单测不落盘
+  usageDbRetentionDays: 30,
 };
 
 describe('detectInjection', () => {
