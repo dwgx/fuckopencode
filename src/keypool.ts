@@ -21,6 +21,8 @@ interface PooledKey {
   inFlight: number;
   lastUsedAt: number;
   lastFailAt: number;
+  /** 上次被选中的单调序号，用于并发相同时的公平轮转。 */
+  lastUsedSeq: number;
 }
 
 export interface KeyPoolOptions {
@@ -32,7 +34,10 @@ export interface KeyPoolOptions {
   now?: () => number;
 }
 
-export type UpstreamFailureKind = 'auth' | 'rate-limit' | 'transient';
+export type UpstreamFailureKind = 'auth' | 'rate-limit' | 'quota-exhausted' | 'transient';
+
+/** 额度耗尽但解析不出重置时间时的默认冷却：1 小时。 */
+const QUOTA_FALLBACK_COOLDOWN_MS = 3_600_000;
 
 /** 池空时抛出的错误。server 层应转成 503，而不是被兜底 catch 吞成 500。 */
 export class PoolEmptyError extends Error {
@@ -51,6 +56,8 @@ export function keyFingerprint(key: string): string {
 export class KeyPool {
   private keys: PooledKey[];
   private readonly opts: Required<KeyPoolOptions>;
+  /** 单调递增的选中序号，驱动公平轮转（见 PooledKey.lastUsedSeq）。 */
+  private seq = 0;
 
   constructor(rawKeys: string[], options: KeyPoolOptions) {
     const seen = new Set<string>();
@@ -65,6 +72,7 @@ export class KeyPool {
         failCount: 0,
         inFlight: 0,
         lastUsedAt: 0,
+      lastUsedSeq: 0,
         lastFailAt: -1,
       });
     }
@@ -115,13 +123,15 @@ export class KeyPool {
       if (k.inFlight < minInFlight) minInFlight = k.inFlight;
     }
     const candidates = healthy.filter((k) => k.inFlight === minInFlight);
-    // 并发全 0（或并列最闲）：按 lastUsedAt 最旧优先，均匀轮转。
+    // 并发并列最闲：按单调序号最旧优先，实现真正均匀的轮转（不能用毫秒时间戳，
+    // 串行请求同毫秒会导致永远选第一个 —— 实测 3 key 分布 10/1/1）。
     let selected = candidates[0]!;
     for (const k of candidates) {
-      if (k.lastUsedAt < selected.lastUsedAt) selected = k;
+      if (k.lastUsedSeq < selected.lastUsedSeq) selected = k;
     }
     selected.inFlight += 1;
     selected.lastUsedAt = now;
+    selected.lastUsedSeq = ++this.seq;
     return selected.key;
   }
 
@@ -145,7 +155,7 @@ export class KeyPool {
    * - rate-limit（429）：不计入禁用计数，只打一个短冷却（避免账号级 429 打爆全池）。
    * - transient（网络错误/超时/5xx）：计入连续失败，达到阈值禁用；冷却指数退避。
    */
-  markFailure(key: string, kind: UpstreamFailureKind): void {
+  markFailure(key: string, kind: UpstreamFailureKind, resetDelayMs?: number): void {
     const k = this.keys.find((p) => p.key === key);
     if (!k) return;
     const now = this.now();
@@ -156,6 +166,17 @@ export class KeyPool {
       k.failCount = 0;
     }
     k.lastFailAt = now;
+
+    if (kind === 'quota-exhausted') {
+      // 周/月额度耗尽：按上游给的重置时间冷却（解析不出用 1 小时兜底）。
+      // 这类 key 短时间内不可能恢复，放它回池只会让每个请求都先撞一次 429
+      // 再换号 —— 既慢又白耗。加 60s 余量，避免边界抖动反复试探。
+      k.disabledUntil = now + (resetDelayMs != null && resetDelayMs > 0
+        ? resetDelayMs + 60_000
+        : QUOTA_FALLBACK_COOLDOWN_MS);
+      k.failCount = 0;
+      return;
+    }
 
     if (kind === 'auth') {
       // 凭据无效：立即禁用，超长冷却（12 × cooldownMs），之后自动恢复（可能被重新配额）。

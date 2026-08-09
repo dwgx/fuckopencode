@@ -19,7 +19,7 @@ export interface UpstreamCall {
   /** 释放并发计数（幂等），body 消费完后必须调用 */
   release: () => void;
   /** 上报失败（body 消费阶段传输错误） */
-  markFailure: (kind: UpstreamFailureKind) => void;
+  markFailure: (kind: UpstreamFailureKind, resetDelayMs?: number) => void;
   /** 上报成功 */
   markSuccess: () => void;
 }
@@ -70,7 +70,7 @@ export async function postUpstreamChat(
       response,
       key,
       release: () => pool.release(key),
-      markFailure: (kind: UpstreamFailureKind) => pool.markFailure(key, kind),
+      markFailure: (kind: UpstreamFailureKind, resetDelayMs?: number) => pool.markFailure(key, kind, resetDelayMs),
       markSuccess: () => pool.markSuccess(key),
     };
   } catch (err) {

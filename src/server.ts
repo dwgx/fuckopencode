@@ -5,6 +5,7 @@ import { KeyPool, PoolEmptyError, keyFingerprint } from './keypool.js';
 import {
   anthropicErrorToOpenAI,
   classifyUpstreamFailure,
+  resetDelayMsFromError,
   INTERNAL_SERVER_ERROR,
   rejectionError,
   stripControl,
@@ -445,6 +446,7 @@ async function handleChatCompletion(
   let upstream: UpstreamCall;
   try {
     upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal);
+    ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
     if (err instanceof PoolEmptyError) {
       sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
@@ -465,12 +467,13 @@ async function handleChatCompletion(
       // body 不是 JSON（如空/HTML）：忽略，按状态码分级。
     }
     const kind = classifyUpstreamFailure(upstream.response.status, errBody);
-    upstream.markFailure(kind);
+    upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
     if (pool.healthyCount > 0 && !res.headersSent) {
       upstream.release();
       // 换 key 重试（最多一次）。
       try {
         upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal);
+        ctx.keyFingerprint = keyFingerprint(upstream.key);
       } catch (err) {
         if (err instanceof PoolEmptyError) {
           sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
@@ -662,6 +665,7 @@ async function handleMessagesPassThrough(
       controller.signal,
       extraHeaders,
     );
+    ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
     if (err instanceof PoolEmptyError) {
       sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
@@ -682,7 +686,7 @@ async function handleMessagesPassThrough(
       /* 非 JSON，按状态码分级 */
     }
     const kind = classifyUpstreamFailure(upstream.response.status, errBody);
-    upstream.markFailure(kind);
+    upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
     const requestId = upstream.response.headers.get('request-id');
     const retryAfter = upstream.response.headers.get('retry-after');
     res.writeHead(upstream.response.status, {
