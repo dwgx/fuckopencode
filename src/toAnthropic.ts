@@ -1,4 +1,4 @@
-import { extractDsmlToolCalls } from './dsml.js';
+import { extractDsmlToolCalls, hasDsmlResidue, stripDsmlResidue } from './dsml.js';
 import type {
   AnthropicResponse,
   AnthropicResponseContentBlock,
@@ -77,6 +77,10 @@ export function openAIToAnthropicResponse(
         content.push({ type: 'tool_use', id: `dsml_${i}_${c.name}`, name: c.name, input: c.input });
       });
       recoveredToolUse = dsml.toolCalls.length > 0;
+    } else if (hasDsmlResidue(message.content)) {
+      // 残缺 DSML：抽不出 invoke，但标记不能泄漏给客户端。剥掉标记留文本。
+      const clean = stripDsmlResidue(message.content);
+      if (clean) content.push({ type: 'text', text: clean });
     } else {
       content.push({ type: 'text', text: message.content });
     }
@@ -281,6 +285,33 @@ export async function* openAIStreamToAnthropic(
           type: 'content_block_start',
           index: idx,
           content_block: { type: 'tool_use', id: `dsml_${i}_${c.name}`, name: c.name, input: c.input },
+        };
+        yield { type: 'content_block_stop', index: idx };
+      }
+    } else if (hasDsmlResidue(bufferedText)) {
+      // 残缺 DSML：抽不出 invoke，但标记不能泄漏给客户端。剥掉标记发纯文本。
+      const clean = stripDsmlResidue(bufferedText);
+      if (!clean) {
+        // 剥完空了（纯标记），不发任何 text 块。
+      } else if (openTextBlock) {
+        yield {
+          type: 'content_block_delta',
+          index: openTextBlock.index,
+          delta: { type: 'text_delta', text: clean },
+        };
+        yield { type: 'content_block_stop', index: openTextBlock.index };
+        openTextBlock = null;
+      } else {
+        const idx = nextIndex++;
+        yield {
+          type: 'content_block_start',
+          index: idx,
+          content_block: { type: 'text', text: '' },
+        };
+        yield {
+          type: 'content_block_delta',
+          index: idx,
+          delta: { type: 'text_delta', text: clean },
         };
         yield { type: 'content_block_stop', index: idx };
       }
