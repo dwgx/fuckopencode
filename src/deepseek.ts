@@ -39,11 +39,30 @@ export const ALLOWED_MODELS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * 模型名解析：命中 MODEL_MAP 用映射值，否则回落 fallback。
+ * 对外别名：给两个 DeepSeek 变体套一层 Anthropic 风格的名字。
  *
- * 只有 ALLOWED_MODELS 里的名字能直传（含 MODEL_MAP 的映射结果也要过白名单），
- * 其余全部回落 —— Claude Code 会发 claude-sonnet-4-6 这类名字，正好被这条吃掉
- * 并落到 fallback 上。`knownModels` 参数保留但不再放宽白名单。
+ * 纯展示层的玩法 —— 客户端可以用别名点，网关照样发真名给上游，响应回显
+ * 客户端用的那个名字。别名和真名都能用，互不影响。
+ *
+ * 注意这些名字**刻意不与真实 Anthropic 模型重名**（不叫 claude-opus-5 之类），
+ * 否则 Claude Code 发它自己的默认模型名时会被误当成别名，语义就乱了。
+ */
+export const MODEL_ALIASES: Readonly<Record<string, string>> = {
+  'claude-mythos-5': 'deepseek-v4-flash',
+  'claude-fable-5': 'deepseek-v4-flash-free',
+};
+
+/** 真名 → 别名（回显与 /v1/models 用）。 */
+export const MODEL_ALIAS_REVERSE: Readonly<Record<string, string>> = Object.fromEntries(
+  Object.entries(MODEL_ALIASES).map(([alias, real]) => [real, alias]),
+);
+
+/**
+ * 模型名解析：别名 → MODEL_MAP → 白名单直传 → 回落 fallback。
+ *
+ * 只有 ALLOWED_MODELS 里的名字能真正发给上游（别名与 MODEL_MAP 的结果都要过
+ * 白名单），其余全部回落 —— Claude Code 会发 claude-sonnet-4-6 这类真实
+ * Anthropic 名字，正好被这条吃掉并落到 fallback 上。
  */
 export function resolveModelName(
   model: string,
@@ -51,11 +70,15 @@ export function resolveModelName(
   fallbackModel: string,
   _knownModels?: ReadonlySet<string>,
 ): string {
+  // 1. 对外别名优先（claude-mythos-5 / claude-fable-5）。
+  const aliased = MODEL_ALIASES[model];
+  if (aliased && ALLOWED_MODELS.has(aliased)) return aliased;
+  // 2. 运维配置的 MODEL_MAP；映射结果也必须在白名单里，否则配错就能绕过限制。
   const mapped = modelMap[model];
-  // 映射结果也必须在白名单里，否则配错 MODEL_MAP 就能绕过限制。
   if (mapped && ALLOWED_MODELS.has(mapped)) return mapped;
+  // 3. 直接用真名。
   if (ALLOWED_MODELS.has(model)) return model;
-  // 白名单外（含 claude-*/gpt-* 等）一律回落；fallback 本身若不合法则强制到 flash。
+  // 4. 白名单外（含 claude-*/gpt-* 等）一律回落；fallback 非法则强制到 flash。
   return ALLOWED_MODELS.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL;
 }
 

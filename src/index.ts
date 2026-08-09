@@ -12,6 +12,8 @@ export {
   resolveModelName,
   completeStreamEvents,
   ALLOWED_MODELS,
+  MODEL_ALIASES,
+  MODEL_ALIAS_REVERSE,
   DEFAULT_FALLBACK_MODEL,
 } from './deepseek.js';
 export { KeyPool, PoolEmptyError, keyFingerprint } from './keypool.js';
