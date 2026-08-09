@@ -195,6 +195,19 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .kev .w { color: var(--fg-weaker); }
   @media (max-width: 620px) { .kev { grid-template-columns: 62px 84px 1fr; } .kev .kv-h { display: none; } }
 
+  /* 冷却策略：回答「为什么恢复时刻是这个数」。规则从真实配置算出，不是写死文案。 */
+  .kpol { margin-top: 12px; border-top: 1px solid var(--line-weak); padding-top: 8px; font-size: 12px; }
+  .kpol .hd { color: var(--fg-weaker); margin-bottom: 6px; }
+  .kpol .r { display: grid; grid-template-columns: 128px 92px 1fr; gap: 4px 10px; padding: 2px 0; }
+  .kpol .r .k { color: var(--fg-weak); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .kpol .r .v { color: var(--fg-base); white-space: nowrap; }
+  .kpol .r .d { color: var(--fg-weaker); min-width: 0; }
+  .kpol .cfg { color: var(--fg-weaker); margin-top: 6px; }
+  @media (max-width: 620px) {
+    .kpol .r { grid-template-columns: 112px 1fr; }
+    .kpol .r .d { grid-column: 1/-1; }
+  }
+
   /* ── ascii banner ───────────────────────────────── */
   /* ASCII banner：41 字符宽，11px 等宽约 270px。max-width:100% + overflow
      保证窄屏也不会把文档撑出横向滚动条。 */
@@ -230,6 +243,10 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     display: flex; flex-wrap: wrap; gap: 4px 14px;
   }
   .ent .r2 span { white-space: nowrap; }
+  /* 上游错误原文是唯一长度不可控的一项（上游文案 + 状态码，可能上百字符）。
+     其余各项都是短标签所以统一 nowrap，这项必须能折行，否则窄屏横向溢出 ——
+     实测 375px 下一条 429 文案把 scrollWidth 顶到 604px。 */
+  .ent .r2 span.s-bad { white-space: normal; overflow-wrap: anywhere; }
   .ent .r2 em { font-style: normal; color: var(--fg-weak); }
   .cut { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .ta-r { text-align: right; }
@@ -322,6 +339,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     </div>
     <div class="keys" id="keys"></div>
     <div class="kevs" id="kevs"></div>
+    <div class="kpol" id="kpol"></div>
   </section>
 
   <section class="grid cols-3" style="background:transparent;border:0;gap:28px">
@@ -379,6 +397,16 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       evDisabled: 'disabled', evRecovered: 'recovered', reqShort: 'req',
       authErr: 'invalid credential', rateErr: 'rate limited',
       quotaErr: 'quota exhausted', transientErr: 'repeated transient errors',
+      polHd: 'cooldown policy · why a key recovers when it does',
+      polUpstream: 'from upstream',
+      polFallback: 'fallback when unparsable',
+      polFirstHit: 'disabled on first occurrence',
+      polAfterN: 'disabled after {n} in a row',
+      polBackoff: 'then doubles each time, up to 16x, +/-20% jitter',
+      polQuotaNote: 'upstream reset time + 60s margin',
+      polAuthNote: '12x base cooldown',
+      polRateNote: 'kept short on purpose: 429 is account-level, so cycling keys does not help',
+      polCfg: 'base cooldown {base} · fail threshold {n} · routing: least in-flight first',
       kRequests: 'requests', kLatency: 'latency', kTokens: 'tokens', kDevices: 'devices',
       hTime: 'time', hStatus: 'status', hRequest: 'request', hMs: 'ms', hTokens: 'tokens', hClient: 'client',
       noReq: 'no requests yet', noData: 'no data', noDev: 'no devices',
@@ -409,6 +437,16 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       evDisabled: '禁用', evRecovered: '恢复', reqShort: '请求',
       authErr: '凭据无效', rateErr: '限流',
       quotaErr: '额度耗尽', transientErr: '连续瞬时错误',
+      polHd: '冷却策略 · 恢复时刻是怎么算出来的',
+      polUpstream: '按上游给的时间',
+      polFallback: '解析不出时兜底',
+      polFirstHit: '首次出现即禁用',
+      polAfterN: '连续 {n} 次后禁用',
+      polBackoff: '之后每次翻倍，最多 16 倍，带 ±20% 抖动',
+      polQuotaNote: '上游重置时间 + 60 秒余量',
+      polAuthNote: '基础冷却的 12 倍',
+      polRateNote: '刻意很短：429 是账号级状态，换 key 也解决不了',
+      polCfg: '基础冷却 {base} · 失败阈值 {n} · 选路：优先挑在飞最少的 key',
       kRequests: '请求总数', kLatency: '响应耗时', kTokens: 'Token 用量', kDevices: '活跃设备',
       hTime: '时间', hStatus: '状态', hRequest: '请求', hMs: '毫秒', hTokens: 'Token', hClient: '客户端',
       noReq: '暂无请求', noData: '暂无数据', noDev: '暂无设备',
@@ -564,17 +602,30 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
    * 注意：这段注释在 String.raw 模板里，不能出现反引号 —— 会提前闭合模板。
    */
   function keypool(pool) {
-    var keys = pool.keys || [];
-    var lifetime = pool.history;  // 别叫 hist —— 外层 hist 是 sparkline 的历史缓冲
+    var keys = (pool && pool.keys) || [];
+    // 别叫 hist —— 外层 hist 是 sparkline 的历史缓冲。
+    // 逐字段兜底而不是只判 lifetime 真假：这个函数在 apply() 里跑，apply() 在
+    // tick() 的 .then() 里，抛异常会被 .catch() 接走 —— 后果是整个 apply()
+    // 半途中止、面板所有小节永久停在上一轮的值，而且错误文案落在 #h-live
+    // （和真实上游故障同一个位置），会把渲染 bug 读成上游挂了。
+    // 服务端正常不会给出半截结构，但滚动部署/回滚期间新旧不匹配就会。
+    var lifetime = (pool && pool.history) || null;
+    var byKey = (lifetime && lifetime.byKey) || [];
     var byFp = {};
-    if (lifetime) lifetime.byKey.forEach(function (r) { byFp[r.fingerprint] = r; });
+    byKey.forEach(function (r) { byFp[r.fingerprint] = r; });
 
-    var busy = 0, inflight = 0, maxIn = 1;
+    var busy = 0, inflight = 0, maxIn = 0;
     keys.forEach(function (k) {
       if (k.inFlight > 0) busy++;
       inflight += k.inFlight;
       if (k.inFlight > maxIn) maxIn = k.inFlight;
     });
+    // 进度条的刻度。原来是 max(1, 当前最大并发) —— 纯相对刻度，于是「最忙的
+    // key」永远是满格：单个 key 上只有 1 条在飞也画成 100%，看着像打满了。
+    // 低并发是这个池子的常态（线上 2-3 个 key），误导正好落在最常见的情形上。
+    // 改成至少 4 格的固定底：1 条在飞画 25%，要真的压到 4 条以上才接近满格，
+    // 超过 4 条时刻度跟着涨，仍能看出相对负载。
+    var barScale = Math.max(4, maxIn);
     // 「几个号在扛并发分流」—— 用户明确要的那个数，直接摆在小节标题右边。
     // en: "2 carrying load of 3 · 7 req" / zh: "2 个号在扛并发 / 3 · 7 请求"
     $('n-pool').textContent = inflight
@@ -621,16 +672,19 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         '<dl>' + rows.map(function (r) {
           return '<dt>' + T(r[0]) + '</dt><dd>' + r[1] + '</dd>';
         }).join('') + '</dl>' +
-        '<span class="t"><span class="f" style="width:' + (k.inFlight / maxIn * 100).toFixed(1) + '%"></span></span>' +
+        '<span class="t"><span class="f" style="width:' + (k.inFlight / barScale * 100).toFixed(1) + '%"></span></span>' +
         '</div>';
     }).join('');
+
+    // 放在 kevs 的早退分支之前 —— 策略与有没有历史数据无关，任何情况下都该显示。
+    policy(pool.policy);
 
     if (!lifetime) {
       $('kevs').innerHTML = '<div class="kev"><span class="w" style="grid-column:1/-1">' + T('noHist') +
         (pool.historyDisabledReason ? ' · ' + esc(pool.historyDisabledReason) : '') + '</span></div>';
       return;
     }
-    var evs = lifetime.recentKeyEvents;
+    var evs = lifetime.recentKeyEvents || [];
     if (!evs.length) {
       $('kevs').innerHTML = '<div class="kev"><span class="w" style="grid-column:1/-1">' + T('noKeyEvents') + '</span></div>';
       return;
@@ -650,13 +704,69 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     }).join('');
   }
 
-  /** 每秒推进冷却倒计时，不必等下一次 2s 轮询（读秒卡住会显得像挂了）。 */
+  /**
+   * 冷却策略。回答的是「为什么这个 key 的恢复时刻是这个数」——
+   * 面板此前只给结果（剩余 3h16m），规则得回去读源码。
+   *
+   * 每条都来自服务端按真实配置算出的 policy 对象，不在前端写死时长，
+   * 所以改了 COOLDOWN_MS 这里会跟着变，不会说谎。
+   */
+  function policy(p) {
+    if (!p || !p.rules) { $('kpol').innerHTML = ''; return; }
+    // 每种失败类型的补充说明（为什么是这个时长）。
+    var NOTE = {
+      'quota-exhausted': 'polQuotaNote', 'auth': 'polAuthNote', 'rate-limit': 'polRateNote'
+    };
+    var rows = p.rules.map(function (r) {
+      var dur;
+      if (r.ms == null) {
+        dur = T('polUpstream');
+      } else {
+        dur = hms(r.ms);
+      }
+      var when = r.countsToThreshold
+        ? T('polAfterN').replace('{n}', String(p.failThreshold))
+        : T('polFirstHit');
+      var note = r.kind === 'transient'
+        ? T('polBackoff')
+        : (NOTE[r.kind] ? T(NOTE[r.kind]) : '');
+      if (r.ms == null && r.fallbackMs != null) {
+        note = note + ' · ' + T('polFallback') + ' ' + hms(r.fallbackMs);
+      }
+      return '<div class="r">' +
+        '<span class="k">' + esc(kindText(r.kind)) + '</span>' +
+        '<span class="v">' + esc(dur) + '</span>' +
+        '<span class="d">' + esc(when) + (note ? ' · ' + esc(note) : '') + '</span>' +
+        '</div>';
+    }).join('');
+    $('kpol').innerHTML =
+      '<div class="hd">' + T('polHd') + '</div>' + rows +
+      '<div class="cfg">' +
+        esc(T('polCfg').replace('{base}', hms(p.cooldownMs)).replace('{n}', String(p.failThreshold))) +
+      '</div>';
+  }
+
+  /**
+   * 每秒推进冷却倒计时，不必等下一次 2s 轮询（读秒卡住会显得像挂了）。
+   *
+   * data-rc 是渲染时算好的**客户端**恢复时刻（now + 服务端给的 recoverInMs），
+   * 所以这里只做减法，不受两端时钟差影响。
+   *
+   * 归零后钳到 0 并摘掉 data-rc：不再每秒重算一个越来越负的值，
+   * 也让「已到期但服务端还没 reap」这一小段显示成 0s 而不是负数。
+   * 真正的状态翻转由下一次轮询带来。
+   */
   function tickCountdown() {
     var now = Date.now();
     var nodes = document.querySelectorAll('[data-rc]');
     for (var i = 0; i < nodes.length; i++) {
       var left = Number(nodes[i].getAttribute('data-rc')) - now;
-      nodes[i].textContent = hms(left);
+      if (left <= 0) {
+        nodes[i].textContent = hms(0);
+        nodes[i].removeAttribute('data-rc');
+      } else {
+        nodes[i].textContent = hms(left);
+      }
     }
   }
 
@@ -776,6 +886,13 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   applyLang();
   tick(); setInterval(tick, 2000);
   setInterval(tickCountdown, 1000);  // 冷却读秒；与轮询解耦，暂停时也照走
+  // 标签页切回前台时立刻补一次：后台标签页里定时器会被浏览器节流甚至完全停摆，
+  // 回来时读秒文字可能已经陈旧（对着一个早已过期的 data-rc 显示几秒前的值）。
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) return;
+    tickCountdown();
+    if (!paused) tick();
+  });
   window.addEventListener('resize', redraw);
 })();
 </script>

@@ -101,6 +101,18 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
         for (const c of chunks) res.write(`data: ${JSON.stringify(c)}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
+      } else if (messagesJson.includes('额度耗尽测试')) {
+        // 测试钩子：模拟真实的周额度耗尽 429。文案必须带 hr/min ——
+        // errors.ts 的 parseResetDelayMs 不认裸 seconds。
+        res.writeHead(429, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              type: 'rate_limit_error',
+              message: 'Weekly usage limit reached. Resets in 6hr 17min.',
+            },
+          }),
+        );
       } else {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(
@@ -786,5 +798,31 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     // Node 20 无 node:sqlite 时不会建文件，此时只要求「没崩」。
     if (exists) expect(fs.statSync(dbCfg.usageDbPath).size).toBeGreaterThan(0);
     expect(dbCfg.usageDbPath.includes('/dist/')).toBe(false);
+  });
+
+  it('上游失败时原始错误文案落进 error 列（不再是恒 NULL，失败原因可回溯）', async () => {
+    // 额度耗尽的 429 走「上游返回但不 ok」这条路径 —— 不抛异常，
+    // 所以只靠 catch 块记 error 是记不到的，恰恰是最需要留证据的那类失败。
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: '额度耗尽测试' }] }),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+
+    if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
+    try {
+      const row = db
+        .prepare('SELECT error FROM requests WHERE error IS NOT NULL ORDER BY at DESC LIMIT 1')
+        .get() as { error: string } | undefined;
+      expect(row).toBeDefined();
+      // 上游那句原文要能在库里找到 —— 这是判断「key 到底怎么了」的直接证据。
+      expect(row!.error).toContain('Weekly usage limit reached');
+      expect(row!.error).toContain('429');
+    } finally {
+      db.close();
+    }
   });
 });

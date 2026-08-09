@@ -487,3 +487,158 @@ describe('KeyPool.snapshot（面板可观测面）', () => {
     expect(pool.snapshot()[0]!.healthy).toBe(true);
   });
 });
+
+describe('KeyPool.policy（面板要能解释「为什么恢复时刻是这个数」）', () => {
+  const KEY = 'sk-key-aaaa';
+
+  it('暴露基础冷却、失败阈值与选路算法', () => {
+    const pool = new KeyPool([KEY], OPTS);
+    const p = pool.policy();
+    expect(p.cooldownMs).toBe(OPTS.cooldownMs);
+    expect(p.failThreshold).toBe(OPTS.failThreshold);
+    expect(p.strategy).toBe('least-loaded');
+    expect(p.rules.map((r) => r.kind).sort()).toEqual(
+      ['auth', 'quota-exhausted', 'rate-limit', 'transient'],
+    );
+  });
+
+  it('跟着配置变，不是写死的常量', () => {
+    const p = new KeyPool([KEY], { cooldownMs: 10_000, failThreshold: 7 }).policy();
+    expect(p.cooldownMs).toBe(10_000);
+    expect(p.failThreshold).toBe(7);
+    expect(p.rules.find((r) => r.kind === 'auth')!.ms).toBe(120_000);
+  });
+
+  /**
+   * 最重要的一条：策略描述必须与 markFailure 的**实际行为**一致。
+   * 面板显示错的规则比不显示更糟 —— 会把排查引向错误方向。
+   */
+  it('auth 的声明时长 = 实际冷却时长', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    const declared = pool.policy().rules.find((r) => r.kind === 'auth')!.ms;
+    pool.markFailure(KEY, 'auth');
+    expect(pool.snapshot()[0]!.recoverInMs).toBe(declared);
+  });
+
+  it('rate-limit 的声明时长 = 实际冷却时长', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    const declared = pool.policy().rules.find((r) => r.kind === 'rate-limit')!.ms;
+    pool.markFailure(KEY, 'rate-limit');
+    expect(pool.snapshot()[0]!.recoverInMs).toBe(declared);
+  });
+
+  it('transient 声明「累计到阈值才禁用」，行为确实如此', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    const rule = pool.policy().rules.find((r) => r.kind === 'transient')!;
+    expect(rule.countsToThreshold).toBe(true);
+    // 差一次不该被禁用。
+    for (let i = 0; i < OPTS.failThreshold - 1; i++) pool.markFailure(KEY, 'transient');
+    expect(pool.snapshot()[0]!.healthy).toBe(true);
+    pool.markFailure(KEY, 'transient');
+    expect(pool.snapshot()[0]!.healthy).toBe(false);
+    // 首次触发的退避基数就是声明的 ms（抖动 ±20%）。
+    const actual = pool.snapshot()[0]!.recoverInMs;
+    expect(actual).toBeGreaterThanOrEqual(Math.floor(rule.ms! * 0.8));
+    expect(actual).toBeLessThanOrEqual(Math.ceil(rule.ms! * 1.2));
+  });
+
+  it('quota-exhausted 声明「时长由上游决定」+ 兜底值，行为确实如此', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    const rule = pool.policy().rules.find((r) => r.kind === 'quota-exhausted')!;
+    expect(rule.ms).toBeNull();
+    expect(rule.fallbackMs).toBe(3_600_000);
+
+    // 解析不出重置时间 -> 用兜底值。
+    pool.markFailure(KEY, 'quota-exhausted');
+    expect(pool.snapshot()[0]!.recoverInMs).toBe(rule.fallbackMs);
+
+    // 给了重置时间 -> 上游时间 + 60s 余量。
+    const p2 = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    p2.markFailure(KEY, 'quota-exhausted', 6 * 3_600_000);
+    expect(p2.snapshot()[0]!.recoverInMs).toBe(6 * 3_600_000 + 60_000);
+  });
+
+  it('声明的「首次即禁用」与实际一致（auth / rate-limit / quota 都不需累计）', () => {
+    for (const kind of ['auth', 'rate-limit', 'quota-exhausted'] as const) {
+      const clock = fakeClock();
+      const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+      expect(pool.policy().rules.find((r) => r.kind === kind)!.countsToThreshold).toBe(false);
+      pool.markFailure(KEY, kind);
+      expect(pool.snapshot()[0]!.healthy, `${kind} 应首次即禁用`).toBe(false);
+    }
+  });
+});
+
+describe('markFailure 只延长冷却，不缩短（迟到的失败上报不能冲掉长冷却）', () => {
+  const KEY = 'sk-key-aaaa';
+
+  it('额度耗尽后收到迟到的 transient：19h 冷却不被 4 分钟冲掉，原因也不改', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    // 19 小时的周额度冷却（上游给的重置时间 + 60s 余量）。
+    pool.markFailure(KEY, 'quota-exhausted', 19 * 3_600_000);
+    const long = pool.snapshot()[0]!.recoverInMs;
+    expect(long).toBeGreaterThan(18 * 3_600_000);
+
+    // 同一 key 上早于禁用就已 acquire 的流中途断掉，连续上报 transient 直到达阈值。
+    for (let i = 0; i < OPTS.failThreshold; i++) pool.markFailure(KEY, 'transient');
+
+    const s = pool.snapshot()[0]!;
+    expect(s.disabledReason).toBe('quota-exhausted');
+    expect(s.recoverInMs).toBe(long);
+  });
+
+  it('额度耗尽后收到迟到的裸 429：不被 3 秒冲掉', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    pool.markFailure(KEY, 'quota-exhausted', 19 * 3_600_000);
+    const long = pool.snapshot()[0]!.recoverInMs;
+
+    pool.markFailure(KEY, 'rate-limit');
+
+    const s = pool.snapshot()[0]!;
+    expect(s.disabledReason).toBe('quota-exhausted');
+    expect(s.recoverInMs).toBe(long);
+  });
+
+  it('auth 长冷却不被 rate-limit 短冷却冲掉', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    pool.markFailure(KEY, 'auth');
+    const long = pool.snapshot()[0]!.recoverInMs;
+    expect(long).toBe(OPTS.cooldownMs * 12);
+
+    pool.markFailure(KEY, 'rate-limit');
+    expect(pool.snapshot()[0]!.recoverInMs).toBe(long);
+    expect(pool.snapshot()[0]!.disabledReason).toBe('auth');
+  });
+
+  it('但更长的冷却仍然能延长（rate-limit 之后来了额度耗尽）', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    pool.markFailure(KEY, 'rate-limit');
+    expect(pool.snapshot()[0]!.recoverInMs).toBeLessThanOrEqual(3000);
+
+    pool.markFailure(KEY, 'quota-exhausted', 6 * 3_600_000);
+    const s = pool.snapshot()[0]!;
+    expect(s.disabledReason).toBe('quota-exhausted');
+    expect(s.recoverInMs).toBeGreaterThan(5 * 3_600_000);
+  });
+
+  it('冷却自然到期后可以重新按新原因禁用（不会被旧冷却永久挡住）', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
+    pool.markFailure(KEY, 'quota-exhausted', 1000);
+    clock.advance(999_999);
+    expect(pool.snapshot()[0]!.healthy).toBe(true);
+
+    pool.markFailure(KEY, 'auth');
+    const s = pool.snapshot()[0]!;
+    expect(s.healthy).toBe(false);
+    expect(s.disabledReason).toBe('auth');
+  });
+});
