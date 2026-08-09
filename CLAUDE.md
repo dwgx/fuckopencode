@@ -9,6 +9,15 @@
    所有提交只署名仓库作者（`dwgx`），或完全不署名。
 2. **所有 Markdown 文档禁止使用 emoji**。README、CLAUDE.md、任何 `.md` 文件一律纯文本，不用 emoji 装饰。
 
+## 工具优先级
+
+本仓库已配好工具，优先用它们，别用低配替代（全局铁律里违反最多的就是这几条）：
+
+- **查代码用 CodeGraph**：本仓库有 `.codegraph/` 索引。搞清符号、调用链、改动影响面时，先 `codegraph explore "<问题>"` 或 `codegraph_explore`，再决定要不要读文件。别一上来就 `grep`。
+- **搜文件用 `rg`，不用 `grep`**；找文件用 `fd`，不用 `find`。
+- **读文件用 Read 工具**，不用 `cat`/`head` 去读代码。
+- **跑完 `gradle` 记得 `gradle --stop`**（全局铁律，8 GB 机器扛不住常驻 daemon）。
+
 ## Git 规范
 
 - 提交信息用中文或英文，简洁、说明性，不带署名后缀。
