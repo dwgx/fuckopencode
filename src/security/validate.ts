@@ -195,8 +195,12 @@ export function validateAnthropicRequest(body: unknown, cfg: AppConfig): Validat
       return { ok: false, error: `messages[${i}] must be an object` };
     }
     const mm = m as Record<string, unknown>;
-    if (mm.role !== 'user' && mm.role !== 'assistant') {
-      return { ok: false, error: `messages[${i}].role must be user or assistant` };
+    // Anthropic 官方 API 接受 messages 里出现 system 消息（Claude Code 多轮会话会把
+    // 中途的系统提示插在 messages 中间，同时顶层还有 system 字段）。原来只放行
+    // user/assistant，导致经 kirostudio 透传的真实请求全部 400 —— 实测 1.1MB 请求体的
+    // roles 形如 ['user','system','assistant','user','system',...]。
+    if (mm.role !== 'user' && mm.role !== 'assistant' && mm.role !== 'system') {
+      return { ok: false, error: `messages[${i}].role must be user, assistant, or system` };
     }
     const content = mm.content;
     if (typeof content !== 'string' && !Array.isArray(content)) {

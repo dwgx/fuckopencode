@@ -36,6 +36,11 @@ export function anthropicToOpenAIRequest(req: AnthropicRequest): OpenAIChatReque
   for (const msg of req.messages) {
     if (msg.role === 'assistant') {
       pushAssistant(messages, msg.content);
+    } else if (msg.role === 'system') {
+      // messages 中间的 system 消息（Claude Code 多轮会话会插入）。原来会落进
+      // pushUser 被当成用户输入，语义错位；这里保持 system 角色原样传给上游。
+      const text = contentToText(msg.content);
+      if (text) messages.push({ role: 'system', content: text });
     } else {
       pushUser(messages, msg.content);
     }
@@ -69,6 +74,16 @@ export function anthropicToOpenAIRequest(req: AnthropicRequest): OpenAIChatReque
 }
 
 /** 顶层 system 可能是字符串，也可能是块数组（Claude Code 会发块数组）。 */
+/** 把内容块数组或字符串压成纯文本（用于 system 消息，OpenAI 侧 system 只收字符串）。 */
+function contentToText(content: AnthropicContentBlock[] | string): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((b): b is Extract<AnthropicContentBlock, { type: 'text' }> => b?.type === 'text')
+    .map((b) => b.text)
+    .join('\n\n');
+}
+
 function extractSystemText(system: AnthropicRequest['system']): string {
   if (system == null) return '';
   if (typeof system === 'string') return system;
