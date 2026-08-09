@@ -70,7 +70,7 @@
 
 | 变量 | 说明 |
 |---|---|
-| `OPENSEA_KEYS` | 上游 key 池，逗号分隔。当前 2 个 |
+| `OPENSEA_KEYS` | 上游 key 池，逗号分隔。当前 2 个（`****0osU` / `****ZOBb`，面板可见状态）|
 | `API_KEYS` | 客户端 key。当前 1 个 |
 | `ANTHROPIC_BASE_URL` | `https://opencode.ai/zen/go`（**订阅**端点，cost=0）|
 | `PAYG_BASE_URL` | `https://opencode.ai/zen`（按量付费，仅 `-free` 模型走这里）|
@@ -139,6 +139,27 @@ ssh nbus 'K=$(grep ^API_KEYS= /root/fuckopencode/fuckopencode.env | sed s/^API_K
 ```bash
 ssh nbus 'journalctl -u fuckopencode -n 20 --no-pager'
 ```
+
+第五条，动过 usagedb 相关代码时必须加上 —— **确认持久化真的启用了**：
+
+```bash
+ssh nbus 'journalctl -u fuckopencode --since "3 minutes ago" --no-pager | grep "usage db"'
+```
+
+必须是 `[proxy] usage db: data/usage.db (retention 30d)`，**不能是 `off (...)`**。
+2026-08-10 踩过：sqlite 加载用了裸 `require`，326 个测试全绿、构建干净、
+服务 active、健康检查过 —— 但生产 ESM 下抛 `require is not defined`，
+被降级逻辑吞成一行 warn，持久化从未启用。**只看服务状态发现不了这类失败。**
+
+同时核对落库位置与隐私口径：
+
+```bash
+ssh nbus 'ls -la /root/fuckopencode/data/'
+ssh nbus 'K=$(grep ^API_KEYS= /root/fuckopencode/fuckopencode.env | sed s/^API_KEYS=//| cut -d, -f1); curl -s http://127.0.0.1:8788/__metrics -H "x-api-key: $K" | grep -c "sk-"'
+```
+
+`data/` 里应有 `usage.db` + WAL 两个副本文件；`grep -c "sk-"` 必须是 0。
+注意服务器上**没有 `rg`**，只有 `grep`。
 
 ## 坑
 
