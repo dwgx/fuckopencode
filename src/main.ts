@@ -1,21 +1,28 @@
 #!/usr/bin/env node
 import { loadConfig } from './config.js';
 import { createApp } from './server.js';
+import { KeyPool } from './keypool.js';
 
 const cfg = loadConfig();
 
-if (!cfg.anthropicApiKey) {
-  console.warn('[proxy] ANTHROPIC_API_KEY not set — upstream /v1/messages calls will fail');
+if (cfg.upstreamKeys.length === 0) {
+  console.warn('[proxy] no upstream keys configured — set ANTHROPIC_API_KEY or OPENSEA_KEYS');
 }
 if (cfg.apiKeys.length === 0 && !cfg.allowUnauthenticated) {
   console.warn('[proxy] API_KEYS not set and ALLOW_UNAUTHENTICATED off — all requests will be rejected (fail-closed)');
 }
 
-const server = createApp(cfg);
+const pool = new KeyPool(cfg.upstreamKeys, {
+  cooldownMs: cfg.keyCooldownMs,
+  failThreshold: cfg.keyFailThreshold,
+});
+
+const server = createApp(cfg, pool);
 
 server.listen(cfg.port, cfg.host, () => {
   console.log(`[proxy] listening on http://${cfg.host}:${cfg.port}`);
   console.log(`[proxy] injection mode: ${cfg.injectionMode}`);
+  console.log(`[proxy] upstream key pool: ${pool.size} keys (${pool.healthyCount} healthy)`);
 });
 
 function shutdown(signal: string): void {

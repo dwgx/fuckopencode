@@ -1,0 +1,193 @@
+import type { IncomingMessage } from 'node:http';
+
+/**
+ * 内存指标收集：环形缓冲存最近 N 条请求，供监控面板轮询。
+ *
+ * 刻意不落盘、不引依赖：这是个单机网关，指标只用于「看现在在发生什么」，
+ * 重启清零是可接受的。上限固定，避免长跑内存无界增长。
+ */
+const MAX_EVENTS = 200;
+
+export interface DeviceInfo {
+  /** 原始 User-Agent */
+  ua: string;
+  /** 解析出的客户端名（Claude Code / curl / OpenAI SDK 等） */
+  client: string;
+  os: string;
+  /** 是否判定为移动端 */
+  mobile: boolean;
+  /** 调用方 IP（考虑反代头） */
+  ip: string;
+  /** 反代链路（x-forwarded-for 全链） */
+  forwardedFor: string;
+  /** Accept-Language 首选语言 */
+  language: string;
+  /** 是否经 cloudflared/CDN（有 cf-* 头） */
+  viaProxy: boolean;
+}
+
+export interface RequestEvent {
+  id: number;
+  /** Unix 毫秒 */
+  at: number;
+  method: string;
+  path: string;
+  /** 协议视角：客户端说的是哪种协议 */
+  protocol: 'openai' | 'anthropic' | 'other';
+  status: number;
+  /** 端到端耗时（ms） */
+  durationMs: number;
+  /** 客户端请求的模型名 */
+  model: string;
+  /** 实际发给上游的模型名 */
+  upstreamModel: string;
+  /** 命中订阅端点还是按量付费 */
+  endpoint: 'subscription' | 'payg' | '-';
+  stream: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number;
+  /** 请求体字节数 */
+  requestBytes: number;
+  device: DeviceInfo;
+  /** 上游 key 指纹（末 4 位），不含原文 */
+  keyFingerprint: string;
+  error: string | null;
+}
+
+let seq = 0;
+const events: RequestEvent[] = [];
+const startedAt = Date.now();
+
+/** 解析 UA 得到可读的客户端/系统名。刻意保持简单：只认实际会用到的几类。 */
+export function parseUserAgent(ua: string): { client: string; os: string; mobile: boolean } {
+  const s = ua || '';
+  let client = 'unknown';
+  if (/claude-cli|claude-code/i.test(s)) client = 'Claude Code';
+  else if (/anthropic-sdk|anthropic-ai/i.test(s)) client = 'Anthropic SDK';
+  else if (/openai-python|openai-node|openai\//i.test(s)) client = 'OpenAI SDK';
+  else if (/^curl/i.test(s)) client = 'curl';
+  else if (/httpie/i.test(s)) client = 'HTTPie';
+  else if (/python-requests|aiohttp|httpx/i.test(s)) client = 'Python HTTP';
+  else if (/postman/i.test(s)) client = 'Postman';
+  else if (/node-fetch|undici/i.test(s)) client = 'Node fetch';
+  else if (/Edg\//.test(s)) client = 'Edge';
+  else if (/Chrome\//.test(s)) client = 'Chrome';
+  else if (/Safari\//.test(s) && !/Chrome/.test(s)) client = 'Safari';
+  else if (/Firefox\//.test(s)) client = 'Firefox';
+  else if (s) client = s.split('/')[0]!.slice(0, 24);
+
+  let os = 'unknown';
+  if (/Mac OS X|Macintosh|darwin/i.test(s)) os = 'macOS';
+  else if (/Windows NT|win32/i.test(s)) os = 'Windows';
+  else if (/Android/i.test(s)) os = 'Android';
+  else if (/iPhone|iPad|iOS/i.test(s)) os = 'iOS';
+  else if (/Linux|linux/i.test(s)) os = 'Linux';
+
+  const mobile = /Mobile|Android|iPhone|iPad/i.test(s);
+  return { client, os, mobile };
+}
+
+/** 从请求头提取设备信息。反代场景取 x-forwarded-for 首段作为真实 IP。 */
+export function extractDevice(req: IncomingMessage): DeviceInfo {
+  const h = req.headers;
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const ua = str(h['user-agent']);
+  const xff = str(h['x-forwarded-for']);
+  const cfIp = str(h['cf-connecting-ip']);
+  const realIp = str(h['x-real-ip']);
+  const socketIp = req.socket.remoteAddress ?? '';
+  // 优先级：CDN 头 → x-real-ip → xff 首段 → socket。
+  const ip = cfIp || realIp || xff.split(',')[0]?.trim() || socketIp;
+  const { client, os, mobile } = parseUserAgent(ua);
+  return {
+    ua,
+    client,
+    os,
+    mobile,
+    ip,
+    forwardedFor: xff,
+    language: str(h['accept-language']).split(',')[0] ?? '',
+    viaProxy: Boolean(cfIp || str(h['cf-ray'])),
+  };
+}
+
+/** 记录一条请求事件（超出上限时丢最旧的）。 */
+export function recordEvent(ev: Omit<RequestEvent, 'id'>): void {
+  events.push({ ...ev, id: ++seq });
+  if (events.length > MAX_EVENTS) events.splice(0, events.length - MAX_EVENTS);
+}
+
+export interface MetricsSnapshot {
+  uptimeMs: number;
+  totalRequests: number;
+  events: RequestEvent[];
+  summary: {
+    ok: number;
+    failed: number;
+    streaming: number;
+    inputTokens: number;
+    outputTokens: number;
+    thinkingTokens: number;
+    avgDurationMs: number;
+    p95DurationMs: number;
+    byModel: Array<{ model: string; count: number; tokens: number }>;
+    byClient: Array<{ client: string; count: number }>;
+    byEndpoint: Array<{ endpoint: string; count: number }>;
+  };
+}
+
+/** 面板用快照：最近事件 + 聚合。计算很轻（上限 200 条），每次请求现算即可。 */
+export function snapshot(): MetricsSnapshot {
+  const list = [...events].reverse(); // 最新在前
+  const durations = events.map((e) => e.durationMs).sort((a, b) => a - b);
+  const sum = (f: (e: RequestEvent) => number): number => events.reduce((n, e) => n + f(e), 0);
+
+  const group = <K extends string>(key: (e: RequestEvent) => K): Map<K, RequestEvent[]> => {
+    const m = new Map<K, RequestEvent[]>();
+    for (const e of events) {
+      const k = key(e);
+      const arr = m.get(k);
+      if (arr) arr.push(e);
+      else m.set(k, [e]);
+    }
+    return m;
+  };
+
+  const byModel = [...group((e) => e.model || '-')]
+    .map(([model, list_]) => ({
+      model,
+      count: list_.length,
+      tokens: list_.reduce((n, e) => n + e.inputTokens + e.outputTokens, 0),
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8);
+
+  const byClient = [...group((e) => e.device.client)]
+    .map(([client, list_]) => ({ client, count: list_.length }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 6);
+
+  const byEndpoint = [...group((e) => e.endpoint)]
+    .map(([endpoint, list_]) => ({ endpoint, count: list_.length }))
+    .sort((a, b) => b.count - a.count);
+
+  return {
+    uptimeMs: Date.now() - startedAt,
+    totalRequests: seq,
+    events: list,
+    summary: {
+      ok: events.filter((e) => e.status >= 200 && e.status < 400).length,
+      failed: events.filter((e) => e.status >= 400).length,
+      streaming: events.filter((e) => e.stream).length,
+      inputTokens: sum((e) => e.inputTokens),
+      outputTokens: sum((e) => e.outputTokens),
+      thinkingTokens: sum((e) => e.thinkingTokens),
+      avgDurationMs: durations.length ? Math.round(sum((e) => e.durationMs) / durations.length) : 0,
+      p95DurationMs: durations.length ? durations[Math.min(durations.length - 1, Math.floor(durations.length * 0.95))]! : 0,
+      byModel,
+      byClient,
+      byEndpoint,
+    },
+  };
+}

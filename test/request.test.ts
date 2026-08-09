@@ -350,13 +350,15 @@ describe('openAIToAnthropicRequest', () => {
     expect(out.stop_sequences).toEqual(['END']);
   });
 
-  it('reasoning_effort 映射到 Anthropic 顶层字段', () => {
+  it('reasoning_effort 映射到 output_config.effort（deepseek 不认顶层字段）', () => {
     const out = openAIToAnthropicRequest({
       model: 'm',
       reasoning_effort: 'medium',
       messages: [{ role: 'user', content: 'hi' }],
     });
-    expect(out.reasoning_effort).toBe('medium');
+    expect(out.output_config).toEqual({ effort: 'medium' });
+    // 顶层 reasoning_effort 会让 deepseek 直接 400，必须不下发。
+    expect(out.reasoning_effort).toBeUndefined();
   });
 
   it('response_format 时 reasoning_effort 不映射（避免与 thinking disabled 冲突）', () => {
@@ -414,5 +416,72 @@ describe('openAIToAnthropicRequest', () => {
     expect(req(2).temperature).toBe(1);
     expect(req(-0.5).temperature).toBe(0);
     expect(req(0.5).temperature).toBe(0.5);
+  });
+
+  // 多轮工具会自动开启 thinking，而 thinking 计入 deepseek 的 max_tokens 预算；
+  // 与 /v1/messages 端点对齐，小预算必须抬到下限，否则第二轮只出 thinking 无正文。
+  const toolHistory = [
+    { role: 'user' as const, content: '天气' },
+    {
+      role: 'assistant' as const,
+      content: null,
+      tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'get_weather', arguments: '{}' } }],
+    },
+    { role: 'tool' as const, content: '晴', tool_call_id: 'call_1' },
+  ];
+
+  it('多轮工具开启 thinking 时把过小的 max_tokens 抬到 4096', () => {
+    const out = openAIToAnthropicRequest({ model: 'm', messages: toolHistory, max_tokens: 200 });
+    expect(out.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
+    expect(out.max_tokens).toBe(4096);
+  });
+
+  it('多轮工具时 max_tokens 已够大则保持不动', () => {
+    const out = openAIToAnthropicRequest({ model: 'm', messages: toolHistory, max_tokens: 8000 });
+    expect(out.max_tokens).toBe(8000);
+  });
+
+  it('无工具历史时不抬升 max_tokens（不擅自改客户端意图）', () => {
+    const out = openAIToAnthropicRequest({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 200,
+    });
+    expect(out.max_tokens).toBe(200);
+  });
+
+  it('response_format 强制 thinking disabled 时不抬升 max_tokens', () => {
+    const out = openAIToAnthropicRequest({
+      model: 'm',
+      messages: toolHistory,
+      max_tokens: 200,
+      response_format: { type: 'json_object' },
+    });
+    expect(out.thinking).toEqual({ type: 'disabled' });
+    expect(out.max_tokens).toBe(200);
+  });
+
+  it('历史 tool_use.name 与 tools 定义一样被消毒（否则上游认不出工具）', () => {
+    const out = openAIToAnthropicRequest({
+      model: 'm',
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'call_1', type: 'function', function: { name: 'my.tool:v2', arguments: '{}' } },
+          ],
+        },
+        { role: 'tool', content: 'ok', tool_call_id: 'call_1' },
+      ],
+      tools: [{ type: 'function', function: { name: 'my.tool:v2', parameters: { type: 'object' } } }],
+    });
+    const assistant = out.messages[1]!;
+    const toolUse = (assistant.content as Array<{ type: string; name?: string }>).find(
+      (b) => b.type === 'tool_use',
+    );
+    expect(toolUse?.name).toBe('my_tool_v2');
+    expect(out.tools?.[0]!.name).toBe('my_tool_v2');
   });
 });

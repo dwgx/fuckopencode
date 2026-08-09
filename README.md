@@ -18,7 +18,7 @@ OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。
 - 流式转换逐事件打磨：`reasoning_content` 增量、usage 独立尾 chunk、背压、`[DONE]`
 - 多轮工具稳定：`tool_use` / `tool_result` id 一一对应（FIFO）
 - 生产级安全：常量时间鉴权、提示词注入检测、SSRF 防护（含 IPv6）、CSRF、背压、内部错误不泄漏
-- 173 个单元/集成测试 + 真实上游端到端验证
+- 完整单元/集成测试覆盖 + 真实上游端到端验证
 
 ## 快速开始
 
@@ -90,6 +90,7 @@ claude
 | `TRUST_CLAUDE_CODE_HEADERS` | `0` | 是否透传 `x-claude-code-*` 会话头 |
 | `MAX_BODY_BYTES` | `10485760` | 请求体上限 |
 | `MAX_MESSAGE_CHARS` | `200000` | 单条消息文本上限 |
+| `STRIP_CONTROL_CHARS` | `1` | 剥离日志/转发内容里的控制符 |
 
 ## 架构
 
@@ -117,10 +118,13 @@ src/
 └── main.ts             # 服务入口
 ```
 
+维护者文档（架构决策、DeepSeek 怪癖清单、已知问题、计划）在 `.claude/docs/`，
+入口见 [.claude/docs/README.md](.claude/docs/README.md)。
+
 ## 测试
 
 ```bash
-npm test           # 173 个单测，全部本地，不碰网络
+npm test           # 单测，全部本地，不碰网络
 npm run test:live  # 真实 DeepSeek 上游端到端 probe（需服务在跑）
 ```
 

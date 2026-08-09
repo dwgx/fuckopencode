@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>fuckopencode — 让 Claude Code 跑在 DeepSeek 上</title>
+<meta name="description" content="零依赖的 OpenAI ↔ Anthropic 协议转换网关。抹平 DeepSeek 兼容层与真实 Anthropic API 的差异，让 Claude Code 和任意 OpenAI 客户端直接用 DeepSeek。">
+<style>
+  :root {
+    --bg: #08090d;
+    --bg-soft: #0d0f16;
+    --card: #12151f;
+    --card-hi: #171b28;
+    --border: #1f2432;
+    --border-hi: #2c3344;
+    --text: #e8eaf0;
+    --muted: #8d95a8;
+    --dim: #626b7e;
+    --accent: #7c5cff;
+    --accent-soft: #9d85ff;
+    --teal: #00d4aa;
+    --amber: #ffb454;
+    --red: #ff6b6b;
+    --code-bg: #0a0c11;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --radius: 14px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: var(--accent-soft); text-decoration: none; transition: color .15s; }
+  a:hover { color: #b9a6ff; }
+  code { font-family: var(--mono); font-size: .875em; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+  .grad {
+    background: linear-gradient(100deg, var(--accent-soft) 10%, var(--teal) 90%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  /* nav */
+  nav {
+    position: sticky; top: 0; z-index: 20;
+    backdrop-filter: saturate(160%) blur(12px);
+    background: rgba(8, 9, 13, .82);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 62px; gap: 16px; }
+  .logo { font-weight: 700; font-size: 17px; letter-spacing: -.02em; white-space: nowrap; }
+  .logo span { color: var(--accent); }
+  nav .links { display: flex; gap: 26px; align-items: center; font-size: 14.5px; }
+  nav .links a { color: var(--muted); }
+  nav .links a:hover { color: var(--text); }
+  @media (max-width: 720px) { nav .links a.hide-sm { display: none; } }
+
+  /* hero */
+  .hero { position: relative; padding: 104px 0 88px; text-align: center; overflow: hidden; }
+  .hero::before {
+    content: ''; position: absolute; inset: -40% 0 auto 50%;
+    width: 900px; height: 900px; transform: translateX(-50%);
+    background: radial-gradient(circle, rgba(124, 92, 255, .17) 0%, transparent 62%);
+    pointer-events: none;
+  }
+  .hero h1 {
+    position: relative;
+    font-size: clamp(34px, 6.2vw, 62px);
+    line-height: 1.14; letter-spacing: -.035em; font-weight: 800;
+  }
+  .hero .lede {
+    position: relative;
+    margin: 26px auto 0; max-width: 660px;
+    font-size: clamp(15.5px, 2.1vw, 18.5px); color: var(--muted);
+  }
+  .hero .lede b { color: var(--text); font-weight: 600; }
+  .cta { position: relative; display: flex; gap: 13px; justify-content: center; margin-top: 38px; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 24px; border-radius: 10px;
+    font-size: 15px; font-weight: 600; transition: transform .15s, box-shadow .15s, background .15s;
+  }
+  .btn.primary {
+    background: linear-gradient(180deg, var(--accent) 0%, #6847e6 100%);
+    color: #fff; box-shadow: 0 6px 22px rgba(124, 92, 255, .32);
+  }
+  .btn.primary:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(124, 92, 255, .42); color: #fff; }
+  .btn.secondary { background: var(--card-hi); color: var(--text); border: 1px solid var(--border-hi); }
+  .btn.secondary:hover { background: #1d2230; transform: translateY(-2px); color: var(--text); }
+  .badges { position: relative; display: flex; gap: 9px; justify-content: center; margin-top: 34px; flex-wrap: wrap; }
+  .badge {
+    font-family: var(--mono); font-size: 12.5px;
+    padding: 5px 11px; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--border); color: var(--muted);
+  }
+
+  /* sections */
+  section { padding: 80px 0; border-top: 1px solid var(--border); }
+  .sec-title { font-size: clamp(25px, 3.6vw, 34px); font-weight: 750; letter-spacing: -.028em; }
+  .sec-sub { color: var(--muted); margin-top: 11px; font-size: 16px; max-width: 720px; }
+  .sec-head { margin-bottom: 42px; }
+
+  /* problem → solution table */
+  .quirks { display: grid; gap: 14px; }
+  .quirk {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 18px; align-items: center;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+    transition: border-color .18s, background .18s;
+  }
+  .quirk:hover { border-color: var(--border-hi); background: var(--card-hi); }
+  .quirk .bad, .quirk .good { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .quirk .tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; font-weight: 600;
+  }
+  .quirk .bad .tag { color: var(--red); }
+  .quirk .good .tag { color: var(--teal); }
+  .quirk p { font-size: 14.5px; color: var(--muted); }
+  .quirk p code { color: var(--text); background: var(--code-bg); padding: 1.5px 6px; border-radius: 5px; }
+  .quirk .sep { color: var(--dim); font-size: 19px; }
+  @media (max-width: 780px) {
+    .quirk { grid-template-columns: 1fr; gap: 12px; }
+    .quirk .sep { display: none; }
+    .quirk .good { padding-top: 12px; border-top: 1px dashed var(--border-hi); }
+  }
+
+  /* feature grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px;
+    transition: transform .18s, border-color .18s, background .18s;
+  }
+  .card:hover { transform: translateY(-3px); border-color: var(--border-hi); background: var(--card-hi); }
+  .card h3 { font-size: 16.5px; font-weight: 650; margin-bottom: 9px; letter-spacing: -.015em; }
+  .card p { color: var(--muted); font-size: 14.5px; }
+  .card code { color: var(--accent-soft); }
+
+  /* code block */
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 22px;
+    overflow-x: auto; font-size: 13.5px; line-height: 1.75;
+  }
+  pre code { font-family: var(--mono); color: #c8cede; font-size: 13.5px; }
+  pre .c { color: var(--dim); }
+  pre .cmd { color: var(--teal); }
+  pre .s { color: var(--amber); }
+  pre .k { color: var(--accent-soft); }
+
+  /* table */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; min-width: 560px; }
+  th, td { padding: 13px 18px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: var(--bg-soft); font-weight: 600; font-size: 13px; color: var(--muted); letter-spacing: .03em; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(124, 92, 255, .045); }
+  td code { color: var(--teal); }
+
+  /* flow */
+  .flow { display: grid; gap: 10px; }
+  .flow-row {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+  }
+  .flow-label {
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    padding: 4px 10px; border-radius: 6px; white-space: nowrap;
+  }
+  .flow-row.a .flow-label { background: rgba(0, 212, 170, .13); color: var(--teal); border: 1px solid rgba(0, 212, 170, .3); }
+  .flow-row.b .flow-label { background: rgba(124, 92, 255, .14); color: var(--accent-soft); border: 1px solid rgba(124, 92, 255, .32); }
+  .step { font-family: var(--mono); font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+  .arrow { color: var(--dim); font-size: 13px; }
+  .note {
+    margin-top: 18px; padding: 16px 18px;
+    background: rgba(255, 180, 84, .06);
+    border: 1px solid rgba(255, 180, 84, .22);
+    border-left: 3px solid var(--amber);
+    border-radius: 10px; font-size: 14.5px; color: var(--muted);
+  }
+  .note b { color: var(--amber); font-weight: 600; }
+
+  footer { padding: 46px 0 56px; border-top: 1px solid var(--border); text-align: center; color: var(--dim); font-size: 14px; }
+  footer p + p { margin-top: 7px; }
+</style>
+</head>
+<body>
+<nav>
+  <div class="wrap">
+    <div class="logo">fuckopencode<span>.</span></div>
+    <div class="links">
+      <a href="#why">为什么</a>
+      <a href="#features">特性</a>
+      <a href="#quickstart">快速开始</a>
+      <a href="#endpoints" class="hide-sm">端点</a>
+      <a href="#flow" class="hide-sm">架构</a>
+      <a href="https://github.com/dwgx/fuckopencode">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>让 Claude Code<br>跑在 <span class="grad">DeepSeek</span> 上</h1>
+    <p class="lede">
+      DeepSeek 号称兼容 Anthropic Messages API，但真拿 Claude Code 打过去<b>一片 400</b>。
+      这个网关把两边的差异逐条抹平，客户端和上游都不用改。
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="#quickstart">快速开始</a>
+      <a class="btn secondary" href="https://github.com/dwgx/fuckopencode">查看源码</a>
+    </div>
+    <div class="badges">
+      <span class="badge">TypeScript strict</span>
+      <span class="badge">zero runtime deps</span>
+      <span class="badge">deepseek-v4-flash</span>
+      <span class="badge">1M context</span>
+      <span class="badge">MIT</span>
+    </div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2 class="sec-title">它到底解决了什么</h2>
+      <p class="sec-sub">
+        每一条都是真实撞过的上游报错，不是假想的兼容性问题。左边是直连 DeepSeek 会遇到的，右边是网关做的事。
+      </p>
+    </div>
+    <div class="quirks">
+      <div class="quirk">
+        <div class="bad">
+          <span class="tag">400 Bad Request</span>
+          <p>Claude Code 默认发 <code>thinking: adaptive</code>，DeepSeek 不认这个枚举</p>
+        </div>
+        <span class="sep">&rarr;</span>
+        <div class="good">
+          <span class="tag">归一化</span>
+          <p>改写成 <code>enabled</code>，同时删掉它不接受的 <code>budget_tokens</code></p>
+        </div>
+      </div>
+      <div class="quirk">
+        <div class="bad">
+          <span class="tag">间歇性 400</span>
+          <p>多轮工具调用时，DeepSeek 要求 assistant 历史回传 reasoning，而客户端不回传</p>
+        </div>
+        <span class="sep">&rarr;</span>
+        <div class="good">
+          <span class="tag">自动注入</span>
+          <p>给带 <code>tool_use</code> 的历史消息补空 thinking 块，多轮不再随机失败</p>
+        </div>
+      </div>
+      <div class="quirk">
+        <div class="bad">
+          <span class="tag">正文为空</span>
+          <p>thinking 计入 <code>max_tokens</code> 预算，小预算被思考过程吃光，回复没有正文</p>
+        </div>
+        <span class="sep">&rarr;</span>
+        <div class="good">
+          <span class="tag">下限保护</span>
+          <p>开启思考时把预算抬到可用下限，保证正文有空间</p>
+        </div>
+      </div>
+      <div class="quirk">
+        <div class="bad">
+          <span class="tag">Extra inputs are not permitted</span>
+          <p>Claude Code 带的 beta 字段（<code>context_management</code>、工具 <code>strict</code>）一律被拒</p>
+        </div>
+        <span class="sep">&rarr;</span>
+        <div class="good">
+          <span class="tag">剥离</span>
+          <p>逐个摘掉上游不认的配对字段，其余原样透传</p>
+        </div>
+      </div>
+      <div class="quirk">
+        <div class="bad">
+          <span class="tag">Tool result missing</span>
+          <p>即使请求关闭思考，DeepSeek 仍吐 thinking 事件，Claude Code 因此报错</p>
+        </div>
+        <span class="sep">&rarr;</span>
+        <div class="good">
+          <span class="tag">流内过滤</span>
+          <p>显式关闭时剥掉多余的 thinking 与 signature 事件</p>
+        </div>
+      </div>
+      <div class="quirk">
+        <div class="bad">
+          <span class="tag">401 Unauthorized</span>
+          <p><code>claude-sonnet-4-6</code> 这类模型名上游完全不认</p>
+        </div>
+        <span class="sep">&rarr;</span>
+        <div class="good">
+          <span class="tag">模型映射</span>
+          <p>按 <code>MODEL_MAP</code> 映射，未命中回落到 <code>deepseek-v4-flash</code></p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2 class="sec-title">特性</h2>
+      <p class="sec-sub">转换核心是零依赖纯函数，服务层该有的生产防护都在。</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h3>双向协议转换</h3>
+        <p>OpenAI Chat Completions 与 Anthropic Messages 互转：消息交替规整、<code>tool_use</code>/<code>tool_result</code> id FIFO 配对、system 抽取到顶层字段。</p>
+      </div>
+      <div class="card">
+        <h3>零运行时依赖</h3>
+        <p>纯 TypeScript strict 模式、零 <code>any</code>、Node 原生 <code>http</code>。核心转换逻辑是可独立复用的纯函数。</p>
+      </div>
+      <div class="card">
+        <h3>JSON mode 真实现</h3>
+        <p><code>response_format</code> 经强制工具落地，响应和流式都转回 <code>content</code>，<code>finish_reason=stop</code> 与 OpenAI 原生对齐。</p>
+      </div>
+      <div class="card">
+        <h3>流式逐事件映射</h3>
+        <p>Anthropic SSE 全事件转 OpenAI chunk：<code>reasoning_content</code> 增量、usage 独立尾 chunk、背压、收尾一定补 <code>[DONE]</code>。</p>
+      </div>
+      <div class="card">
+        <h3>安全默认 fail-closed</h3>
+        <p>常量时间鉴权；未配 key 且未显式放行时一律拒绝，放行也只在绑定回环地址时生效。</p>
+      </div>
+      <div class="card">
+        <h3>输入防护</h3>
+        <p>结构校验与长度上限、SSRF 判定（含 IPv6 与 IPv4-mapped）、注入启发式检测、内部错误不外泄。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2 class="sec-title">快速开始</h2>
+      <p class="sec-sub">一条命令起服务，OpenAI 和 Anthropic 两种客户端都能直接调。</p>
+    </div>
+    <pre><code><span class="c"># 安装并启动（把 ANTHROPIC_API_KEY 换成你的上游 key）</span>
+<span class="cmd">npm install &amp;&amp; npm run build</span>
+<span class="cmd">API_KEYS</span>=demo-key <span class="cmd">ANTHROPIC_API_KEY</span>=sk-xxx npm run serve
+
+<span class="c"># OpenAI 客户端</span>
+<span class="cmd">curl</span> http://127.0.0.1:8787/v1/chat/completions \
+  -H <span class="s">"Authorization: Bearer demo-key"</span> \
+  -H <span class="s">"Content-Type: application/json"</span> \
+  -d <span class="s">'{"model":"gpt-4o","messages":[{"role":"user","content":"1+1=?"}]}'</span>
+
+<span class="c"># Claude Code 直接指过来</span>
+<span class="cmd">ANTHROPIC_BASE_URL</span>=http://127.0.0.1:8787 \
+<span class="cmd">ANTHROPIC_AUTH_TOKEN</span>=demo-key \
+<span class="cmd">ANTHROPIC_DEFAULT_SONNET_MODEL</span>=deepseek-v4-flash \
+claude</code></pre>
+  </div>
+</section>
+
+<section id="endpoints">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2 class="sec-title">端点</h2>
+      <p class="sec-sub">同时暴露两套协议，共用一个上游。</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>路径</th><th>协议</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>POST /v1/chat/completions</code></td><td>OpenAI</td><td>协议转换 → DeepSeek，流式/非流式</td></tr>
+          <tr><td><code>POST /v1/messages</code></td><td>Anthropic</td><td>直通 + DeepSeek 归一化，流式/非流式</td></tr>
+          <tr><td><code>POST /v1/messages/count_tokens</code></td><td>Anthropic</td><td>Claude Code 记账</td></tr>
+          <tr><td><code>GET /v1/models</code></td><td>OpenAI</td><td>模型发现</td></tr>
+          <tr><td><code>GET /healthz</code></td><td>—</td><td>健康检查，无需鉴权</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="flow">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2 class="sec-title">两条路径</h2>
+      <p class="sec-sub">入口协议不同，走的代码路径也完全不同。</p>
+    </div>
+    <div class="flow">
+      <div class="flow-row a">
+        <span class="flow-label">/v1/messages</span>
+        <span class="step">校验</span><span class="arrow">&rarr;</span>
+        <span class="step">DeepSeek 归一化</span><span class="arrow">&rarr;</span>
+        <span class="step">注入扫描</span><span class="arrow">&rarr;</span>
+        <span class="step">转发</span><span class="arrow">&rarr;</span>
+        <span class="step">按需过滤 thinking 流</span>
+      </div>
+      <div class="flow-row b">
+        <span class="flow-label">/v1/chat/completions</span>
+        <span class="step">校验</span><span class="arrow">&rarr;</span>
+        <span class="step">注入扫描</span><span class="arrow">&rarr;</span>
+        <span class="step">协议转换</span><span class="arrow">&rarr;</span>
+        <span class="step">system 护栏</span><span class="arrow">&rarr;</span>
+        <span class="step">转发</span><span class="arrow">&rarr;</span>
+        <span class="step">转回 OpenAI</span>
+      </div>
+    </div>
+    <div class="note">
+      <b>直通不等于裸转发。</b>
+      <code>/v1/messages</code> 收到的已经是 Anthropic 协议，但仍要做 DeepSeek 归一化才能被上游接受，
+      响应侧则在关闭思考时剥掉多余的 thinking 事件。
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>fuckopencode &middot; MIT License</p>
+    <p><a href="https://github.com/dwgx/fuckopencode">github.com/dwgx/fuckopencode</a></p>
+  </div>
+</footer>
+</body>
+</html>

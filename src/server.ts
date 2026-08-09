@@ -1,16 +1,29 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AppConfig } from './config.js';
-import { postAnthropic } from './anthropic.js';
-import { anthropicErrorToOpenAI, INTERNAL_SERVER_ERROR, rejectionError, stripControl } from './errors.js';
+import { fetchUpstreamModels, postUpstreamChat, type UpstreamCall } from './upstream.js';
+import { KeyPool, PoolEmptyError, keyFingerprint } from './keypool.js';
+import {
+  anthropicErrorToOpenAI,
+  classifyUpstreamFailure,
+  INTERNAL_SERVER_ERROR,
+  rejectionError,
+  stripControl,
+} from './errors.js';
 import { verifyAuth } from './security/auth.js';
 import { buildSystemGuard, detectInjection, extractAllText, scanMessagesForInjection } from './security/injection.js';
 import { isJsonContentType, validateAnthropicRequest, validateChatRequest } from './security/validate.js';
-import { openAIToAnthropicRequest } from './request.js';
-import { anthropicToOpenAIResponse } from './response.js';
-import { anthropicStreamToOpenAI, openAIStreamToSSE } from './stream.js';
-import { parseAnthropicSSE } from './sse.js';
-import { filterThinkingFromStream, normalizeAnthropicRequest, resolveModelName } from './deepseek.js';
-import type { OpenAIChatRequest } from './types.js';
+import { extractDevice, recordEvent, snapshot, type RequestEvent } from './metrics.js';
+import { DASHBOARD_HTML } from './dashboard.js';
+import { anthropicToOpenAIRequest } from './toOpenAI.js';
+import { anthropicEventToSSE, openAIStreamToAnthropic, openAIToAnthropicResponse } from './toAnthropic.js';
+import { sseStringify } from './stream.js';
+import { parseOpenAISSE } from './sse.js';
+import {
+  filterThinkingFromStream,
+  normalizeAnthropicRequest,
+  resolveModelName,
+} from './deepseek.js';
+import type { OpenAIChatRequest, OpenAIChatResponse } from './types.js';
 
 /** 直通模式总是转发的头（Claude Code 依赖的 beta 标记）。 */
 const FORWARD_HEADERS = ['anthropic-beta'];
@@ -116,16 +129,99 @@ function parseJson(text: string): { ok: true; body: unknown } | { ok: false } {
   }
 }
 
-export function createApp(cfg: AppConfig) {
+/**
+ * 上游已知模型清单。启动时异步拉一次，用于判断客户端请求的模型名能否直传
+ * （上游支持 61 个模型，不该被 fallback 一律吃掉）。拉取失败保持为空集，
+ * 此时退化成老行为：只认 MODEL_MAP，其余回落 fallback。
+ */
+let upstreamModels: ReadonlySet<string> = new Set();
+
+/** 单次请求的指标上下文，由各 handler 逐步填充。 */
+type MetricsCtx = Pick<
+  RequestEvent,
+  | 'protocol' | 'model' | 'upstreamModel' | 'endpoint' | 'stream'
+  | 'inputTokens' | 'outputTokens' | 'thinkingTokens' | 'requestBytes'
+  | 'keyFingerprint' | 'error'
+>;
+
+export function createApp(cfg: AppConfig, pool?: KeyPool) {
+  // 未显式传 pool 时，用 cfg.upstreamKeys 建默认池（兼容测试直连场景）。
+  const keyPool =
+    pool ??
+    new KeyPool(cfg.upstreamKeys, {
+      cooldownMs: cfg.keyCooldownMs,
+      failThreshold: cfg.keyFailThreshold,
+    });
+
+  // 后台拉一次上游模型清单，失败不影响服务启动。
+  void fetchUpstreamModels(cfg, keyPool).then((models) => {
+    if (models?.length) {
+      upstreamModels = new Set(models);
+      console.log(`[proxy] upstream models: ${models.length}`);
+    }
+  });
+
   return createServer(async (req, res) => {
     const startTime = Date.now();
     const url = req.url ?? '/';
     const path = url.split('?')[0] ?? '/';
+    // handler 边跑边往这里填，finally 统一记一条指标事件。
+    const ctx: MetricsCtx = {
+      protocol: path === '/v1/messages' || path.startsWith('/v1/messages/') ? 'anthropic'
+        : path === '/v1/chat/completions' ? 'openai' : 'other',
+      model: '',
+      upstreamModel: '',
+      endpoint: '-',
+      stream: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      thinkingTokens: 0,
+      requestBytes: 0,
+      keyFingerprint: '',
+      error: null,
+    };
 
     try {
       // 健康检查不需要鉴权。
       if (req.method === 'GET' && path === '/healthz') {
         sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      // 监控面板。绑在 127.0.0.1 时默认放行（本机才能访问）；
+      // 非回环绑定时要求鉴权，避免把设备信息/IP 暴露到公网。
+      if (req.method === 'GET' && (path === '/__dash' || path === '/__metrics')) {
+        if (!cfg.dashboardOpen) {
+          const auth = verifyAuth(cfg, req.headers as Record<string, string | undefined>);
+          if (!auth.ok) {
+            sendJson(res, 401, { error: { message: 'unauthorized', type: 'authentication_error' } });
+            return;
+          }
+        }
+        if (path === '/__metrics') {
+          const snap = snapshot();
+          sendJson(res, 200, {
+            ...snap,
+            pool: {
+              size: keyPool.size,
+              healthy: keyPool.healthyCount,
+              disabled: keyPool.disabledFingerprints(),
+            },
+            config: {
+              subscriptionBaseUrl: cfg.anthropicBaseUrl,
+              paygBaseUrl: cfg.payAsYouGoBaseUrl,
+              fallbackModel: cfg.fallbackModel,
+              injectionMode: cfg.injectionMode,
+              upstreamModels: [...upstreamModels],
+            },
+          });
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        });
+        res.end(DASHBOARD_HTML);
         return;
       }
 
@@ -162,7 +258,7 @@ export function createApp(cfg: AppConfig) {
           sendJson(res, 415, { error: { message: 'content-type must be application/json', type: 'invalid_request_error' } });
           return;
         }
-        await handleChatCompletion(req, res, cfg, auth.keyId);
+        await handleChatCompletion(req, res, cfg, keyPool, auth.keyId, ctx);
         return;
       }
 
@@ -171,23 +267,23 @@ export function createApp(cfg: AppConfig) {
           sendJson(res, 415, { error: { message: 'content-type must be application/json', type: 'invalid_request_error' } });
           return;
         }
-        await handleMessagesPassThrough(req, res, cfg, auth.keyId);
+        await handleMessagesPassThrough(req, res, cfg, keyPool, auth.keyId, ctx);
         return;
       }
 
-      // Claude Code 记账端点：转发上游 count_tokens，回传 Anthropic 原生结果。
+      // Claude Code 记账端点：本地估算（上游无此端点）。
       if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
         if (!isJsonContentType(req.headers['content-type'])) {
           sendJson(res, 415, { error: { message: 'content-type must be application/json', type: 'invalid_request_error' } });
           return;
         }
-        await handleCountTokens(req, res, cfg);
+        handleCountTokens(req, res, cfg, ctx);
         return;
       }
 
-      // 模型发现（OpenAI 兼容）：列出 fallback 模型与 MODEL_MAP 配置的模型。
+      // 模型发现（OpenAI 兼容）：上游真实模型清单 + fallback + MODEL_MAP 的键。
       if (req.method === 'GET' && path === '/v1/models') {
-        const ids = new Set([cfg.fallbackModel, ...Object.keys(cfg.modelMap)]);
+        const ids = new Set([cfg.fallbackModel, ...upstreamModels, ...Object.keys(cfg.modelMap)]);
         sendJson(res, 200, {
           object: 'list',
           data: [...ids].map((id) => ({ id, object: 'model', owned_by: 'proxy' })),
@@ -208,6 +304,28 @@ export function createApp(cfg: AppConfig) {
     } finally {
       const elapsed = Date.now() - startTime;
       console.log(`[proxy] ${req.method ?? '?'} ${path} ${res.statusCode} ${elapsed}ms`);
+      // /healthz 与面板自身的轮询不记账，否则面板会把自己刷满。
+      if (path !== '/healthz' && !path.startsWith('/__')) {
+        recordEvent({
+          at: startTime,
+          method: req.method ?? '?',
+          path,
+          protocol: ctx.protocol,
+          status: res.statusCode,
+          durationMs: elapsed,
+          model: ctx.model,
+          upstreamModel: ctx.upstreamModel,
+          endpoint: ctx.endpoint,
+          stream: ctx.stream,
+          inputTokens: ctx.inputTokens,
+          outputTokens: ctx.outputTokens,
+          thinkingTokens: ctx.thinkingTokens,
+          requestBytes: ctx.requestBytes,
+          device: extractDevice(req),
+          keyFingerprint: ctx.keyFingerprint,
+          error: ctx.error,
+        });
+      }
     }
   });
 }
@@ -216,7 +334,9 @@ async function handleChatCompletion(
   req: IncomingMessage,
   res: ServerResponse,
   cfg: AppConfig,
+  pool: KeyPool,
   keyId: string,
+  ctx: MetricsCtx,
 ): Promise<void> {
   const read = await readBody(req, cfg.maxBodyBytes);
   if (!read.ok) {
@@ -257,34 +377,79 @@ async function handleChatCompletion(
     }
   }
 
-  // 转换 + 指令隔离护栏。模型名按 MODEL_MAP 映射，未命中回落 fallback。
-  const mapModel = (m: string): string => resolveModelName(m, cfg.modelMap, cfg.fallbackModel);
-  const anthropicReq = openAIToAnthropicRequest(body as unknown as OpenAIChatRequest, { mapModel });
-  if (anthropicReq.system != null) {
-    anthropicReq.system = buildSystemGuard(anthropicReq.system);
-  } else {
-    anthropicReq.system = buildSystemGuard('');
-  }
+  // 上游本身就是 OpenAI 协议，这条路径不再绕 Anthropic：只做模型名解析、
+  // 剥不支持的字段、加 system 护栏，然后原样转发。
+  const upstreamReq = prepareOpenAIUpstreamRequest(body as unknown as OpenAIChatRequest, cfg);
+  ctx.requestBytes = Buffer.byteLength(read.text);
+  ctx.model = typeof body.model === 'string' ? body.model : '';
+  ctx.upstreamModel = typeof upstreamReq.model === 'string' ? upstreamReq.model : '';
+  ctx.endpoint = ctx.upstreamModel.endsWith('-free') ? 'payg' : 'subscription';
+  ctx.stream = upstreamReq.stream === true;
 
   const controller = new AbortController();
   req.on('close', () => controller.abort());
 
-  const upstream = await postAnthropic(cfg, anthropicReq, controller.signal);
-  if (!upstream.ok) {
+  // 用 key 池转发。非流式在「未写出任何响应字节」时可换 key 重试一次。
+  let upstream: UpstreamCall;
+  try {
+    upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal);
+  } catch (err) {
+    if (err instanceof PoolEmptyError) {
+      sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
+      return;
+    }
+    // 池内所有 key 瞬时失败（fetch 网络错误），postAnthropic 已自动 release + 上报。
+    sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
+    return;
+  }
+
+  // 非流式：上游返回错误状态时，若尚未写响应字节，可换 key 重试一次。
+  if (!upstream.response.ok && !res.headersSent) {
+    // 读取错误体用于分级（余额不足 → rate-limit，而非 auth 长期禁用）。
     let errBody: unknown = null;
     try {
-      errBody = await upstream.json();
+      errBody = await upstream.response.json();
+    } catch {
+      // body 不是 JSON（如空/HTML）：忽略，按状态码分级。
+    }
+    const kind = classifyUpstreamFailure(upstream.response.status, errBody);
+    upstream.markFailure(kind);
+    if (pool.healthyCount > 0 && !res.headersSent) {
+      upstream.release();
+      // 换 key 重试（最多一次）。
+      try {
+        upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal);
+      } catch (err) {
+        if (err instanceof PoolEmptyError) {
+          sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
+          return;
+        }
+        sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
+        return;
+      }
+    } else {
+      upstream.release();
+    }
+  }
+
+  if (!upstream.response.ok) {
+    let errBody: unknown = null;
+    try {
+      errBody = await upstream.response.json();
     } catch {
       // ignore
     }
-    const err = anthropicErrorToOpenAI(upstream.status, errBody);
-    const retryAfter = upstream.headers.get('retry-after');
+    const err = anthropicErrorToOpenAI(upstream.response.status, errBody);
+    const retryAfter = upstream.response.headers.get('retry-after');
     if (retryAfter) res.setHeader('retry-after', retryAfter);
+    upstream.release();
     sendJson(res, err.status, err.body);
     return;
   }
 
-  const isStream = anthropicReq.stream === true;
+  const requestedModel = typeof body.model === 'string' ? body.model : undefined;
+  const isStream = upstreamReq.stream === true;
+
   if (isStream) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -292,37 +457,91 @@ async function handleChatCompletion(
       connection: 'keep-alive',
     });
     try {
-      // stream_options.include_usage → 流式转换器把 usage 放独立尾 chunk（choices:[]）。
-      const includeUsage =
-        (body as { stream_options?: { include_usage?: boolean } }).stream_options?.include_usage === true;
-      const chunks = anthropicStreamToOpenAI(parseAnthropicSSE(upstream.body), { includeUsage });
-      for await (const line of openAIStreamToSSE(chunks)) {
+      // 上游已是 OpenAI 流，逐 chunk 回显（只改写 model 名回显客户端请求的名字），
+      // 收尾补 [DONE]。上游的 `{"choices":[],"cost":...}` 记账 chunk 不转发给客户端。
+      for await (const chunk of parseOpenAISSE(upstream.response.body)) {
         if (res.writableEnded || res.destroyed) break;
-        await writeChunk(res, line);
+        if (requestedModel) chunk.model = requestedModel;
+        if (chunk.usage) {
+          ctx.inputTokens = chunk.usage.prompt_tokens ?? ctx.inputTokens;
+          ctx.outputTokens = chunk.usage.completion_tokens ?? ctx.outputTokens;
+          ctx.thinkingTokens = chunk.usage.completion_tokens_details?.reasoning_tokens ?? ctx.thinkingTokens;
+        }
+        if (!chunk.choices?.length && !chunk.usage) continue;
+        await writeChunk(res, sseStringify(chunk));
       }
+      if (!res.writableEnded && !res.destroyed) await writeChunk(res, 'data: [DONE]\n\n');
+      upstream.markSuccess();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'stream error';
       console.error(`[proxy] stream error: ${stripControl(message)}`);
+      upstream.markFailure('transient');
       if (!res.writableEnded && !res.destroyed) {
         res.write(`data: ${JSON.stringify({ error: INTERNAL_SERVER_ERROR })}\n\n`);
       }
     } finally {
+      upstream.release();
       res.end();
     }
     return;
   }
 
-  const data: unknown = await upstream.json();
-  // 回显客户端请求的模型名（映射前的 OpenAI 名），而非上游 Anthropic 名。
-  const requestedModel = typeof body.model === 'string' ? body.model : undefined;
-  sendJson(res, 200, anthropicToOpenAIResponse(data as Parameters<typeof anthropicToOpenAIResponse>[0], { model: requestedModel }));
+  const data = (await upstream.response.json().catch(() => null)) as OpenAIChatResponse | null;
+  upstream.markSuccess();
+  upstream.release();
+  if (data === null) {
+    sendJson(res, 502, { error: { message: 'upstream returned malformed body', type: 'server_error' } });
+    return;
+  }
+  // 回显客户端请求的模型名，而非上游实际模型名。
+  if (requestedModel) data.model = requestedModel;
+  ctx.inputTokens = data.usage?.prompt_tokens ?? 0;
+  ctx.outputTokens = data.usage?.completion_tokens ?? 0;
+  ctx.thinkingTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+  sendJson(res, 200, data);
+}
+
+/**
+ * OpenAI 请求 → 发给上游的 OpenAI 请求。
+ *
+ * 上游同为 OpenAI 协议，所以不做协议转换，只做三件事：
+ * 1. 模型名解析（MODEL_MAP → 上游已知模型直传 → 回落 fallback）。
+ * 2. 加 system 指令隔离护栏（把历史/工具结果声明为不可信数据）。
+ * 3. 剥掉上游不认的字段，避免 400。
+ */
+function prepareOpenAIUpstreamRequest(
+  req: OpenAIChatRequest,
+  cfg: AppConfig,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...(req as unknown as Record<string, unknown>) };
+  out.model = resolveModelName(req.model, cfg.modelMap, cfg.fallbackModel, upstreamModels);
+
+  // system 护栏：已有 system 消息就追加，没有就插一条到最前面。
+  const messages = Array.isArray(req.messages) ? [...req.messages] : [];
+  const firstSystem = messages.findIndex((m) => m?.role === 'system');
+  if (firstSystem >= 0) {
+    const m = messages[firstSystem]!;
+    const text = typeof m.content === 'string' ? m.content : '';
+    messages[firstSystem] = { ...m, content: buildSystemGuard(text) };
+  } else {
+    messages.unshift({ role: 'system', content: buildSystemGuard('') });
+  }
+  out.messages = messages;
+
+  // 上游不认的 OpenAI 扩展字段：剥掉防 400。
+  for (const k of ['logit_bias', 'logprobs', 'top_logprobs', 'n', 'seed', 'user', 'store', 'metadata']) {
+    delete out[k];
+  }
+  return out;
 }
 
 async function handleMessagesPassThrough(
   req: IncomingMessage,
   res: ServerResponse,
   cfg: AppConfig,
+  pool: KeyPool,
   keyId: string,
+  ctx: MetricsCtx,
 ): Promise<void> {
   const read = await readBody(req, cfg.maxBodyBytes);
   if (!read.ok) {
@@ -371,24 +590,59 @@ async function handleMessagesPassThrough(
   const controller = new AbortController();
   req.on('close', () => controller.abort());
 
+  // 转成 OpenAI 请求再发上游。上游的 Anthropic 兼容层工具调用是坏的
+  // （返回空 content + stop_reason:null），OpenAI 端点才可用，见 DEEPSEEK-QUIRKS.md。
+  const openAIReq = anthropicToOpenAIRequest(normalized as unknown as Parameters<typeof anthropicToOpenAIRequest>[0]);
+  ctx.requestBytes = Buffer.byteLength(read.text);
+  ctx.model = typeof body.model === 'string' ? body.model : '';
+  ctx.upstreamModel = openAIReq.model;
+  ctx.endpoint = openAIReq.model.endsWith('-free') ? 'payg' : 'subscription';
+  ctx.stream = normalized.stream === true;
+
   // 转发额外 headers（anthropic-beta、x-claude-code-*），并保留上游 request-id。
   const extraHeaders = collectForwardHeaders(req.headers, cfg);
-  const upstream = await postAnthropic(cfg, normalized, controller.signal, extraHeaders);
-  if (!upstream.ok) {
+  let upstream: UpstreamCall;
+  try {
+    upstream = await postUpstreamChat(
+      cfg,
+      pool,
+      openAIReq as unknown as Record<string, unknown>,
+      controller.signal,
+      extraHeaders,
+    );
+  } catch (err) {
+    if (err instanceof PoolEmptyError) {
+      sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
+      return;
+    }
+    sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
+    return;
+  }
+
+  if (!upstream.response.ok) {
     // Claude Code 期望 Anthropic 原生错误格式，直通透传（限长 + 剥控制符防泄漏/日志注入），
     // 保留 request-id 与 retry-after。
-    const raw = (await upstream.text()).slice(0, 64 * 1024);
-    const requestId = upstream.headers.get('request-id');
-    const retryAfter = upstream.headers.get('retry-after');
-    res.writeHead(upstream.status, {
+    const raw = (await upstream.response.text().catch(() => '')).slice(0, 64 * 1024);
+    let errBody: unknown = null;
+    try {
+      errBody = JSON.parse(raw);
+    } catch {
+      /* 非 JSON，按状态码分级 */
+    }
+    const kind = classifyUpstreamFailure(upstream.response.status, errBody);
+    upstream.markFailure(kind);
+    const requestId = upstream.response.headers.get('request-id');
+    const retryAfter = upstream.response.headers.get('retry-after');
+    res.writeHead(upstream.response.status, {
       'content-type': 'application/json; charset=utf-8',
       ...(requestId ? { 'request-id': requestId } : {}),
       ...(retryAfter ? { 'retry-after': retryAfter } : {}),
     });
+    upstream.release();
     res.end(stripControl(raw));
     return;
   }
-  const requestId = upstream.headers.get('request-id');
+  const requestId = upstream.response.headers.get('request-id');
   if (requestId) res.setHeader('request-id', requestId);
 
   const isStream = normalized.stream === true;
@@ -398,72 +652,105 @@ async function handleMessagesPassThrough(
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     });
-    // 显式 disabled 时剥掉 deepseek 仍吐的 thinking/signature 事件（多轮 400 主因）；
-    // 默认/enabled 时字节透传，保留 Claude Code 需要的 thinking+signature 原样回传。
+    // 上游是 OpenAI 流：解析 chunk → 转成 Anthropic 事件序列（自带完整骨架）。
+    // thinking 显式 disabled 时剥掉 thinking 块事件（Claude Code 会因多余 thinking 报错）。
     const keepThinking = (normalized.thinking as { type?: string } | undefined)?.type !== 'disabled';
-
-    if (keepThinking) {
-      const reader = upstream.body?.getReader();
-      if (!reader) {
-        res.end();
-        return;
-      }
-      try {
-        const decoder = new TextDecoder();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (res.writableEnded || res.destroyed) break;
-          await writeChunk(res, decoder.decode(value, { stream: true }));
-        }
-      } finally {
-        reader.releaseLock();
-        res.end();
-      }
-      return;
-    }
-
-    // thinking disabled：解析 SSE → 过滤 → 重新序列化。
-    const events = filterThinkingFromStream(parseAnthropicSSE(upstream.body), false);
+    const requestedModel = typeof body.model === 'string' ? body.model : undefined;
+    const events = filterThinkingFromStream(
+      openAIStreamToAnthropic(parseOpenAISSE(upstream.response.body), { model: requestedModel }),
+      keepThinking,
+    );
     try {
       for await (const ev of events) {
         if (res.writableEnded || res.destroyed) break;
-        await writeChunk(res, `event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+        if (ev.type === 'message_delta' && ev.usage) ctx.outputTokens = ev.usage.output_tokens;
+        await writeChunk(res, anthropicEventToSSE(ev));
       }
+      upstream.markSuccess();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'passthrough stream error';
       console.error(`[proxy] passthrough stream error: ${stripControl(message)}`);
+      upstream.markFailure('transient');
     } finally {
+      upstream.release();
       res.end();
     }
     return;
   }
 
-  const raw = await upstream.text();
-  res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-  res.end(stripControl(raw));
+  // 非流式：上游 OpenAI 响应 → Anthropic 响应。
+  const data = (await upstream.response.json().catch(() => null)) as OpenAIChatResponse | null;
+  upstream.markSuccess();
+  upstream.release();
+  if (data === null) {
+    sendJson(res, 502, { error: { message: 'upstream returned malformed body', type: 'server_error' } });
+    return;
+  }
+  // 回显客户端请求的模型名（映射前的名字），而非上游实际模型。
+  const requestedModel = typeof body.model === 'string' ? body.model : undefined;
+  const anthropicRes = openAIToAnthropicResponse(data, { model: requestedModel });
+  ctx.inputTokens = anthropicRes.usage.input_tokens;
+  ctx.outputTokens = anthropicRes.usage.output_tokens;
+  ctx.thinkingTokens = anthropicRes.usage.output_tokens_details?.thinking_tokens ?? 0;
+
+  // thinking 显式 disabled 时剥掉 thinking 块（Claude Code 会因多余 thinking 报错）。
+  if ((normalized.thinking as { type?: string } | undefined)?.type === 'disabled') {
+    anthropicRes.content = anthropicRes.content.filter((b) => b.type !== 'thinking');
+    if (anthropicRes.content.length === 0) {
+      anthropicRes.content.push({ type: 'text', text: '' });
+    }
+  }
+
+  sendJson(res, 200, anthropicRes);
 }
 
-/** Claude Code 记账：转发 /v1/messages/count_tokens，回传 Anthropic 原生结果。 */
-async function handleCountTokens(req: IncomingMessage, res: ServerResponse, cfg: AppConfig): Promise<void> {
-  const read = await readBody(req, cfg.maxBodyBytes);
-  if (!read.ok) {
-    sendJson(res, read.status, {
-      error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
-    });
-    return;
-  }
-  const parsed = parseJson(read.text);
-  if (!parsed.ok) {
-    sendJson(res, 400, { error: { message: 'invalid JSON body', type: 'invalid_request_error' } });
-    return;
-  }
+/**
+ * Claude Code 记账端点。
+ *
+ * 上游走的是 OpenAI 协议，没有 count_tokens（Anthropic 端点也只返回 404 HTML），
+ * 所以这里纯本地估算，不打上游 —— 既省一次往返，也避免烧订阅额度。
+ * 估算口径：messages/system 的文本字符数 / 4。
+ */
+function handleCountTokens(req: IncomingMessage, res: ServerResponse, cfg: AppConfig, ctx: MetricsCtx): void {
+  void readBody(req, cfg.maxBodyBytes).then((read) => {
+    if (!read.ok) {
+      sendJson(res, read.status, {
+        error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
+      });
+      return;
+    }
+    const parsed = parseJson(read.text);
+    if (!parsed.ok) {
+      sendJson(res, 400, { error: { message: 'invalid JSON body', type: 'invalid_request_error' } });
+      return;
+    }
+    const bodyObj = parsed.body as Record<string, unknown> | null;
+    if (bodyObj != null && typeof bodyObj.model === 'string') ctx.model = bodyObj.model;
+    const inputTokens = estimateInputTokens(parsed.body);
+    ctx.inputTokens = inputTokens;
+    sendJson(res, 200, { input_tokens: inputTokens });
+  });
+}
 
-  const controller = new AbortController();
-  req.on('close', () => controller.abort());
+/** 本地估算 input_tokens：messages/system 文本字符数 / 4（约 4 字符/token）。 */
+function estimateInputTokens(body: unknown): number {
+  let chars = 0;
+  const countText = (value: unknown): void => {
+    if (typeof value === 'string') {
+      chars += value.length;
+    } else if (Array.isArray(value)) {
+      for (const item of value) countText(item);
+    } else if (value != null && typeof value === 'object') {
+      for (const key of Object.keys(value)) {
+        countText((value as Record<string, unknown>)[key]);
+      }
+    }
+  };
 
-  const upstream = await postAnthropic(cfg, parsed.body, controller.signal, {}, '/v1/messages/count_tokens');
-  const raw = await upstream.text();
-  res.writeHead(upstream.status, { 'content-type': 'application/json; charset=utf-8' });
-  res.end(stripControl(raw));
+  const bodyObj = body as Record<string, unknown> | null;
+  if (bodyObj != null && typeof bodyObj === 'object') {
+    if (typeof bodyObj.system === 'string') chars += bodyObj.system.length;
+    countText(bodyObj.messages);
+  }
+  return Math.max(1, Math.ceil(chars / 4));
 }

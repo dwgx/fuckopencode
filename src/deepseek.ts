@@ -25,13 +25,39 @@ export const DEFAULT_FALLBACK_MODEL = 'deepseek-v4-flash';
  */
 export const DEEPSEEK_MIN_MAX_TOKENS = 4096;
 
-/** 模型名解析：命中 MODEL_MAP 用映射值，否则回落 fallback（opencodezen 只认 flash）。 */
+/**
+ * 模型名解析：命中 MODEL_MAP 用映射值，否则回落 fallback。
+ *
+ * 上游 `/zen/v1/models` 列了 61 个模型（claude 系、gpt 系、deepseek 系、glm 系等），
+ * 客户端请求的模型名若本身就是上游支持的，直接透传，不该被回落吃掉。
+ * `knownModels` 为空时退化成老行为（只看 MODEL_MAP）。
+ */
 export function resolveModelName(
   model: string,
   modelMap: Record<string, string>,
   fallbackModel: string,
+  knownModels?: ReadonlySet<string>,
 ): string {
-  return modelMap[model] ?? fallbackModel;
+  const mapped = modelMap[model];
+  if (mapped) return mapped;
+  // 客户端请求的就是上游认识的模型名：直传（比如显式要 claude-opus-5 或 deepseek-v4-pro）。
+  if (knownModels && knownModels.has(model)) return model;
+  return fallbackModel;
+}
+
+/**
+ * 选上游端点：`-free` 后缀的模型只在按量付费端点存在，订阅端点（/zen/go）
+ * 会 401 `Model ... is not supported`；其余模型走订阅端点（cost=0，不烧额度）。
+ *
+ * 实测依据：`deepseek-v4-flash` 在 /zen/go 200，`deepseek-v4-flash-free` 在 /zen/go 401、
+ * 在 /zen 200。所以两者都要能用，只是走不同 base URL。
+ */
+export function resolveUpstreamBaseUrl(
+  model: string,
+  subscriptionBaseUrl: string,
+  payAsYouGoBaseUrl: string,
+): string {
+  return model.endsWith('-free') ? payAsYouGoBaseUrl : subscriptionBaseUrl;
 }
 
 /**
@@ -92,21 +118,47 @@ export function normalizeAnthropicRequest(
 
   // 5. 工具上的 strict/defer_loading 也会 400，剥离。
   if (Array.isArray(body.tools)) {
-    body.tools = body.tools.map((t) => {
+    const retained: unknown[] = [];
+    for (const t of body.tools) {
       if (t != null && typeof t === 'object' && !Array.isArray(t)) {
         const tool = t as Record<string, unknown>;
         delete tool.strict;
         delete tool.defer_loading;
+        // 5.1 内置 web_search 工具（type 以 web_search 开头）deepseek 不认，剥掉；
+        //     仅 type 前缀匹配，避免误剥名字碰巧含 web_search 的自定义工具。
+        const toolType = typeof tool.type === 'string' ? tool.type : '';
+        const toolName = typeof tool.name === 'string' ? tool.name : '';
+        if (toolType.startsWith('web_search') || toolName === 'web_search') {
+          continue;
+        }
       }
-      return t;
-    });
+      retained.push(t);
+    }
+    body.tools = retained;
+
+    // 5.2 指向被剥 web_search 工具的 tool_choice 会悬空 400：两种形态都要剥
+    //     （服务端工具 `{type:"web_search_*"}` 与显式 `{type:"tool",name:"web_search"}`）。
+    const tc = body.tool_choice;
+    if (tc != null && typeof tc === 'object' && !Array.isArray(tc)) {
+      const tcObj = tc as Record<string, unknown>;
+      const tcType = typeof tcObj.type === 'string' ? tcObj.type : '';
+      const tcName = typeof tcObj.name === 'string' ? tcObj.name : '';
+      if (tcType.startsWith('web_search') || tcName === 'web_search') {
+        delete body.tool_choice;
+      }
+    }
   }
 
-  // 6. thinking enabled + 带工具的多轮：assistant 历史缺 thinking 块则注入空块，
+  // 6. content 字符串 → 内容块数组。opencode Zen 只认块数组形式，
+  //    收到 `content:"hi"` 会报 "Empty input messages"（实测直连上游确认）。
+  //    Anthropic 官方两种都支持，Claude Code 会发字符串形式，必须转换。
+  normalizeMessageContent(body);
+
+  // 7. thinking enabled + 带工具的多轮：assistant 历史缺 thinking 块则注入空块，
   //    否则 deepseek 次轮 400（reasoning_content 缺失）。
   injectMissingThinkingBlocks(body);
 
-  // 7. max_tokens 下限保护：deepseek 的 thinking 计入 max_tokens 预算，客户端小预算
+  // 8. max_tokens 下限保护：deepseek 的 thinking 计入 max_tokens 预算，客户端小预算
   //    （如 200）会被 thinking 吃光导致正文空。thinking 非 disabled 时把 < 下限的抬到
   //    下限、缺失补下限；≥ 下限保持；thinking disabled 不调（尊重客户端意图）。
   if (!thinkingDisabled) {
@@ -117,6 +169,28 @@ export function normalizeAnthropicRequest(
   }
 
   return body;
+}
+
+/**
+ * 把 `content: "文本"` 规整成 `content: [{type:'text', text:'文本'}]`。
+ *
+ * opencode Zen 只接受内容块数组，收到字符串形式会报 "Empty input messages"
+ * （实测：直连上游 `content:"hi"` 失败、`content:[{type:"text",text:"hi"}]` 成功）。
+ * Anthropic 官方两种形式都支持，Claude Code 发的是字符串，所以必须在这里转。
+ *
+ * 空字符串转成空数组会再次触发 "Empty input messages"，因此空串直接跳过
+ * （交给上游按原样判断，不制造更坏的形态）。
+ */
+function normalizeMessageContent(body: Record<string, unknown>): void {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return;
+  for (const m of messages) {
+    if (m == null || typeof m !== 'object' || Array.isArray(m)) continue;
+    const msg = m as Record<string, unknown>;
+    if (typeof msg.content === 'string' && msg.content !== '') {
+      msg.content = [{ type: 'text', text: msg.content }];
+    }
+  }
 }
 
 /**
@@ -187,4 +261,119 @@ export async function* filterThinkingFromStream(
         yield ev;
     }
   }
+}
+
+/**
+ * 补全上游缺失的 Anthropic 流式事件骨架。
+ *
+ * opencode Zen / deepseek 的流有时缺 `message_start`、`content_block_start`、
+ * `content_block_stop`、`message_stop`，Claude Code 收到后无法初始化 message
+ * 对象直接报错。这里按需补发，保证事件序列自洽：
+ * - 任何事件出现前先补 `message_start`
+ * - `content_block_delta` 前先补对应 index 的 `content_block_start`
+ * - `message_delta` 前补齐所有未 stop 的块
+ * - EOF 时补齐剩余块的 stop 与 `message_stop`
+ *
+ * 已由上游发出的事件不重复补（用 started/stopped 集合去重）。
+ */
+export async function* completeStreamEvents(
+  events: AsyncIterable<AnthropicStreamEvent>,
+): AsyncGenerator<AnthropicStreamEvent> {
+  let sentMessageStart = false;
+  let sentMessageStop = false;
+  /** 已补发过 stop 的块 index */
+  const stoppedBlocks = new Set<number>();
+  /** 已补发过 start 的块 index */
+  const startedBlocks = new Set<number>();
+
+  const maybeMessageStart = function* (): Generator<AnthropicStreamEvent> {
+    if (!sentMessageStart) {
+      sentMessageStart = true;
+      yield {
+        type: 'message_start',
+        message: {
+          id: `msg_${Date.now().toString(36)}`,
+          type: 'message',
+          role: 'assistant',
+          model: '',
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      };
+    }
+  };
+
+  const maybeBlockStart = function* (index: number): Generator<AnthropicStreamEvent> {
+    if (!startedBlocks.has(index)) {
+      startedBlocks.add(index);
+      yield { type: 'content_block_start', index, content_block: { type: 'text', text: '' } };
+    }
+  };
+
+  const maybeBlockStop = function* (index: number): Generator<AnthropicStreamEvent> {
+    if (!stoppedBlocks.has(index) && startedBlocks.has(index)) {
+      stoppedBlocks.add(index);
+      yield { type: 'content_block_stop', index };
+    }
+  };
+
+  const maybeMessageStop = function* (): Generator<AnthropicStreamEvent> {
+    if (!sentMessageStop) {
+      sentMessageStop = true;
+      yield { type: 'message_stop' };
+    }
+  };
+
+  /** 收尾：补所有未 stop 的块 + message_stop。 */
+  const closeAll = function* (): Generator<AnthropicStreamEvent> {
+    yield* maybeMessageStart();
+    for (const idx of startedBlocks) {
+      yield* maybeBlockStop(idx);
+    }
+    yield* maybeMessageStop();
+  };
+
+  for await (const ev of events) {
+    switch (ev.type) {
+      case 'message_start':
+        sentMessageStart = true;
+        yield ev;
+        break;
+      case 'content_block_start':
+        yield* maybeMessageStart();
+        startedBlocks.add(ev.index);
+        yield ev;
+        break;
+      case 'content_block_delta':
+        yield* maybeMessageStart();
+        yield* maybeBlockStart(ev.index);
+        yield ev;
+        break;
+      case 'content_block_stop':
+        stoppedBlocks.add(ev.index);
+        yield ev;
+        break;
+      case 'message_delta':
+        // 先补块 stop（上游缺），再 yield message_delta。message_stop 由 EOF 统一补发，
+        // 避免与上游自带的 message_stop 重复。
+        yield* maybeMessageStart();
+        for (const idx of startedBlocks) {
+          yield* maybeBlockStop(idx);
+        }
+        yield ev;
+        break;
+      case 'message_stop':
+        sentMessageStop = true;
+        yield ev;
+        break;
+      default:
+        yield* maybeMessageStart();
+        yield ev;
+    }
+  }
+
+  // EOF：收尾。
+  yield* closeAll();
 }

@@ -60,3 +60,43 @@ export function anthropicErrorToOpenAI(status: number, body: unknown): OpenAIApi
 export function rejectionError(message: string, type = 'invalid_request_error'): OpenAIApiError {
   return { status: 400, body: { error: { message: stripControl(message), type } } };
 }
+
+/** 从上游错误体提取 error.type（兼容 Anthropic `{error:{type}}` 与 OpenAI `{error:{type}}`）。 */
+function extractUpstreamErrorType(body: unknown): string | undefined {
+  if (body == null || typeof body !== 'object') return undefined;
+  const err = (body as { error?: unknown }).error;
+  if (err == null || typeof err !== 'object') return undefined;
+  const type = (err as { type?: unknown }).type;
+  return typeof type === 'string' ? type : undefined;
+}
+
+/**
+ * 上游失败分级，供 key 池决定禁用策略：
+ * - auth：凭据无效（401/403 + authentication_error），立即禁用 + 超长冷却。
+ * - rate-limit：限流/余额不足（429，或 billing_error/CreditsError/insufficient balance），
+ *   只打短冷却、不计阈值——余额不足是账户级临时状态，充值即恢复，不应长期禁用。
+ * - transient：其他（5xx/网络错误/超时），累计失败计数。
+ */
+export function classifyUpstreamFailure(
+  status: number,
+  body: unknown,
+): 'auth' | 'rate-limit' | 'transient' {
+  if (status === 429) return 'rate-limit';
+
+  const errorType = extractUpstreamErrorType(body);
+  // 余额不足：HTTP 可能是 401/402/400，但错误体明确指向 billing/credits。
+  if (
+    errorType === 'billing_error' ||
+    errorType === 'CreditsError' ||
+    errorType === 'insufficient_balance' ||
+    (typeof errorType === 'string' && /balance|credit|billing|quota/i.test(errorType))
+  ) {
+    return 'rate-limit';
+  }
+
+  if (status === 401 || status === 403) {
+    return errorType === 'authentication_error' ? 'auth' : 'rate-limit';
+  }
+
+  return 'transient';
+}

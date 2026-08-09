@@ -6,3 +6,9 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+
+# 线上 dist 备份（部署时生成，不入库）
+.deploy-backup/
+
+# 本地预览配置（含测试用 key，不入库）
+.claude/launch.json

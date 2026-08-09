@@ -208,6 +208,54 @@ describe('normalizeAnthropicRequest', () => {
     );
     expect('max_tokens' in out).toBe(false);
   });
+
+  // opencode Zen 只认内容块数组，收到 content 字符串会报 "Empty input messages"。
+  it('content 字符串转成内容块数组', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: 'hi' }] }]);
+  });
+
+  it('已是内容块数组时保持不变', () => {
+    const blocks = [{ type: 'text', text: 'hi' }];
+    const out = normalizeAnthropicRequest(
+      { model: 'm', max_tokens: 100, messages: [{ role: 'user', content: blocks }] },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect((out.messages as Array<{ content: unknown }>)[0]!.content).toEqual(blocks);
+  });
+
+  it('空字符串 content 不转（转成空数组会再次触发 Empty input messages）', () => {
+    const out = normalizeAnthropicRequest(
+      { model: 'm', max_tokens: 100, messages: [{ role: 'user', content: '' }] },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect((out.messages as Array<{ content: unknown }>)[0]!.content).toBe('');
+  });
+
+  it('多条消息都转，assistant 与 user 一致处理', () => {
+    const out = normalizeAnthropicRequest(
+      {
+        model: 'm',
+        max_tokens: 100,
+        messages: [
+          { role: 'user', content: 'a' },
+          { role: 'assistant', content: 'b' },
+        ],
+      },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'a' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'b' }] },
+    ]);
+  });
 });
 
 describe('filterThinkingFromStream', () => {
