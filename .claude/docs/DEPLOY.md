@@ -22,9 +22,11 @@
 |---|---|
 | 代码目录 | `/root/fuckopencode`（**不是 git 仓库**，只有 `dist/`） |
 | 服务 | `fuckopencode.service`（systemd，`Restart=always`） |
-| 监听 | `127.0.0.1:8787`，由 cloudflared 反代出去 |
-| 对外域名 | `fuckopencode.dwgx.top`（隧道**整体**代理 8787，所有路径都可达）|
-| 监控面板 | `/__dash` + `/__metrics`，**要求 API key**（`DASHBOARD_OPEN=0`）|
+| 监听 | `127.0.0.1:8788` —— **注意不再是 8787**，8787 已被盾接管（见 SHIELD.md） |
+| 盾 | `fuckopencode-shield.service`，监听 `127.0.0.1:8787`，上游指 8788 |
+| 公网链路 | `cloudflared -> 127.0.0.1:8787（盾）-> 127.0.0.1:8788（网关）` |
+| 对外域名 | `fuckopencode.dwgx.top`（路由由 Cloudflare 云端管理，本地 ingress 不生效） |
+| 监控面板 | 网关 `/__dash` + `/__metrics`（要求 API key）；盾 `/_shield/*`（仅回环） |
 | env | `/root/fuckopencode/fuckopencode.env`，权限 600 |
 | node | v22.20.0（`/usr/local/bin/node`） |
 | 依赖 | 无 `node_modules` —— 零运行时依赖，只需 `dist/` |
@@ -76,7 +78,7 @@
 | `DASHBOARD_OPEN` | `0` —— 隧道整体暴露 8787，面板含调用方 IP/UA，必须鉴权 |
 | `KEY_FAIL_THRESHOLD` | 5 |
 | `KEY_COOLDOWN_MS` | 300000 |
-| `HOST` / `PORT` | `127.0.0.1` / `8787` |
+| `HOST` / `PORT` | `127.0.0.1` / `8788`（8787 已被盾接管，见 SHIELD.md） |
 | `INJECTION_MODE` | `block` |
 
 改 env 后要 `systemctl restart`（`EnvironmentFile` 只在启动时读）。

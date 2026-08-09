@@ -1,76 +1,79 @@
 # 当前状态
 
-更新时间：2026-08-09 21:30（第二轮会话）
+更新时间：2026-08-09 22:35（第三轮会话）
 
 ## 一句话
 
-OpenAI ↔ Anthropic 协议转换网关（面向 DeepSeek），线上跑在 nbus，功能完整。
-上一轮遗留两个待办（quota 误判 + 流式兜底），本轮深挖后发现**两件事的定位都不准**，
-已重构为真实根因 + 修复，待部署。
+OpenAI ↔ Anthropic 协议转换网关（面向 DeepSeek），线上跑在 nbus。
+本轮在网关**前面**加了一层护盾（DWGX 移植自 .62 的 `kiro_shield.py`），
+上游波动先被盾吸收再交给客户端，下游会话不会因为几分钟的抖动而断开。
+**已上线并接管全部公网流量，真机验证过吸收。**
 
 ## 基线（已验证）
 
 | 项 | 状态 |
 |---|---|
-| `npx tsc --noEmit` | 干净 |
-| `npx vitest run` | 292 passed（11 files，+16 vs 上轮 276） |
-| 线上 nbus | `active`，`/healthz` ok |
-| 工作区 | 4 个文件有改动，**未提交、未部署** |
+| 上一轮代码改动（cf32666） | 已部署，线上跑着 |
+| 盾 `fuckopencode-shield.service` | `active`，常驻约 14M |
+| 网关 `fuckopencode.service` | `active`，key pool 2/2 healthy |
+| 公网四项验证 | 全 200（非流式 / adaptive / OpenAI 端点 / 流式） |
+| `test-shield.py` | 5/5 通过 |
+| 工作区 | `scripts/dwgx/` + `.claude/docs/SHIELD.md` **未提交** |
 
-## 本轮最重要的发现：待办 1 的定位是错的
+## 本轮做了什么
 
-CURRENT.md 上一轮把线上 503 归因于 errors.ts 的 `/balance|credit|billing|quota/i`
-过宽正则「把含 quota 字样的错误判成额度耗尽 → 1h 长冷却」。
+把盾装在了 nbus 上，细节见 [SHIELD.md](../docs/SHIELD.md)。三个要点：
 
-**查证后这条路径从未存在**：quota-exhausted 的判定全是严格匹配；那个宽正则只扫
-`errorType` 且返回的是 `rate-limit`（3s 短冷却），方向相反。见
-[ISSUES.md](../docs/ISSUES.md) 的 **I-8 已证伪**。
+1. **端口是互换过的**：`cloudflared -> 8787（盾）-> 8788（网关）`。
+   网关不再监听 8787。
+2. **为什么互换**：`fuckopencode.dwgx.top` 的路由由 Cloudflare **云端**管理，
+   本地 `config.yml` 的 ingress 对这条隧道不生效（实测 `Updated to new
+   configuration` 恒为 8787、`local_config_pushes` 恒为 0、盾 requests 恒为 0）。
+   走不了「改隧道指向盾」，改成让盾去占云端认定的 8787。
+3. **DWGX 加的判定**：`all upstream keys are disabled` → `cool`（整池被禁，
+   冷却自然恢复），另三条 fuckopencode 措辞 → `retry`。这条正是 20:16 那 295 个
+   503 的形态。
 
-真实情况（journal 实测）：
-- **295 个 503**（不是 5 次），20:16–20:19 `/v1/messages` 整池被禁约 3 分钟
-- 上游 429 全在 12:35–12:48，与 503 相隔 8 小时，**无因果关系**
-- **关键盲区：当时日志里没有任何禁用记录** —— 池空 → 503 的三个分支全部静默返回
+配套三个脚本（`scripts/dwgx/`）：
 
-## 本轮改了什么（已过测试，待部署）
+| 脚本 | 用途 |
+|---|---|
+| `shield-deploy.sh` | 本地跑，推盾 + 装 unit + restart，幂等 |
+| `shield-status.sh` | 只读探活：存活/内存/盾吞了什么/异常事件 |
+| `test-shield.py` | 本地假上游验证盾行为，不碰线上 |
 
-1. **key 池禁用/恢复可观测性**（I-9）：`KeyPool` 加 `onStateChange` 回调（注入式），
-   四种失败类型的禁用 + 冷却自然到期恢复都上报，只带指纹；
-   `server.ts` 打 `[keypool] disabled key=**** reason=... cooldown=...s pool=n/m`；
-   池空单独打 `[keypool] pool empty`（10s 节流 + 累计被拒数，防 295 行刷屏）。
-2. **流式脏数据兜底**（I-10）：`parseOpenAISSE` 加 `onDirty` 回调（SSE 注释行不算脏，
-   `{` 开头但 JSON 解析失败也算脏，样本截断 200 字符）。两条流式路径：
-   - chat 路径：中止且**不补 `[DONE]`**
-   - 直通路径：中止并发 `event: error`（`overloaded_error`），标记 transient
-   - 检测点在**写出之前**；直通路径循环后必须再查一次（text 块缓冲到收尾才产出）
-3. **正则收窄**（顺手）：`/balance|credit|billing|quota/i` → 精确枚举，加回归测试。
+## 吸收实测（决定性证据）
 
-## 下一步（部署）
+停掉网关 8788 共 12 秒，期间经**公网域名**发请求：客户端拿到正常 200
+（25.65s，含盾的等待窗口），**从未断开**，盾统计 `absorbed=1`。
 
-```bash
-./scripts/deploy.sh        # 本地验证→构建→推 dist→原子替换→重启→健康检查
-```
+注意测法：得**先停上游、再发请求**。反了的话请求在上游还活着时就完成了，
+盾一次过、不计吸收，会误判成盾没工作。
 
-部署后验证：
-- 启动日志有 `upstream key pool: N keys (N healthy)`
-- 真实请求 4 条（DEPLOY.md 验证清单）
-- **观察日志里的 `[keypool]` 行**：下次任何 key 禁用/恢复都会留下原因与冷却。
-  真实根因（大概率 transient 累积，`failThreshold=5`/`cooldownMs=300s`）待下次复发时定位。
+## 下一步
 
-## 文档分工
+盾已上线，无待办。可选的观察项：
 
-- [ISSUES.md](../docs/ISSUES.md)：I-8 已证伪、I-9/I-10 已修，均附完整证据
-- 其余文档（ARCHITECTURE/CONVENTIONS/DEPLOY）本轮未动，仍准确
+- 隔一段时间跑 `./scripts/dwgx/shield-status.sh`，看 `absorbed` 有没有增长 ——
+  有增长说明盾在真实波动里救回了会话。
+- 上一轮加的 `[keypool]` 日志还没等到真实复发。下次整池被禁时，
+  盾会吸收（客户端无感），同时 journal 里会留下禁用原因与冷却时长，
+  那时才能定位 295 个 503 的真实触发条件。
 
 ## 环境须知
 
 - `tsc` / `vitest` 不在 PATH，用 `npx` 或 npm script
 - 线上操作走 `ssh nbus`；kirostudio 那台是 `ssh -p 673 root@143.20.230.62`
 - 涉及凭证先读 `~/.claude/SECRETS.md`，取到的值不要输出到任何地方
+- 盾的观测面板要开隧道：`ssh -L 8787:127.0.0.1:8787 nbus`
 
 ## 不要做的事
 
+- **不要以为改 `/etc/cloudflared/config.yml` 能切换 fuckopencode 的路由** ——
+  这条隧道是云端管的，本地那段 ingress 是死的。切流靠换端口。
+- 端口互换有顺序：先停盾放开 8787，再起网关到 8788，最后起盾占 8787。
 - 不要因为「看起来多余」就删兜底逻辑 —— 基本每条都对应一个 DeepSeek 怪癖，
   删之前查 DEEPSEEK-QUIRKS.md
 - 不要只改一条路径的 deepseek 适配（chat 路径与直通路径是两套实现）
-- 不要引入运行时依赖（零依赖是刻意的）
+- 不要引入运行时依赖（网关零依赖、盾只用 python stdlib，都是刻意的）
 - commit 不带任何 Claude / Anthropic 署名，文档不用 emoji（见 CLAUDE.md 铁律）

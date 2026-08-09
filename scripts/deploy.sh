@@ -73,6 +73,11 @@ systemctl is-active fuckopencode || { echo "FATAL: 服务未起来"; exit 1; }
 EOF
 
 echo ">> 健康检查 ..."
-curl -s -m 5 "http://127.0.0.1:8787/healthz" 2>/dev/null | grep -q ok || \
-  ssh ${SSHOPTS} "${HOST}" "curl -s -m 5 http://127.0.0.1:8787/healthz"
+# 8788 是网关本体，8787 是盾（盾在网关前面，见 .claude/docs/SHIELD.md）。
+# 两处都查：网关单独 OK 才说明这次部署没问题，经盾 OK 才说明整条公网链路通。
+ssh ${SSHOPTS} "${HOST}" "curl -s -m 5 http://127.0.0.1:8788/healthz" | grep -q ok \
+  || die "网关 8788 健康检查失败"
+echo "  OK 网关 8788"
+ssh ${SSHOPTS} "${HOST}" "curl -s -m 8 http://127.0.0.1:8787/healthz" | grep -q ok \
+  || echo "  WARN 经盾 8787 未通 —— 盾可能没起来，查 systemctl status fuckopencode-shield"
 echo "  OK 部署完成"
