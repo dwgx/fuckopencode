@@ -286,14 +286,63 @@ node -e "const{DASHBOARD_HTML}=require('./dist/dashboard.js');new Function(DASHB
 - 375px 无横向溢出（`scrollWidth` 375 = `clientWidth`），桌面 1280 无溢出，无 console 报错
 - 页面不含 key 原文
 
+## 已上线（2026-08-10 07:47:09）
+
+提交 `ecffb30`，已 push 到 origin main，已跑 `./scripts/deploy.sh` 部署。
+
+| 验证项 | 结果 |
+|---|---|
+| 两服务 | active（网关 + 盾） |
+| 新进程 | 07:47:09 重启（原 04:43:47） |
+| 启动日志 | `usage db: data/usage.db (retention 30d)` —— **不是** `off (...)` |
+| dist 含新代码 | `keypool.js` 有 `policy`、`dashboard.js` 有 `kpol`、`server.js` 有 `noteUpstreamError`、`usagedb.js` 有 `historyCache` |
+| `/__metrics` 的 `policy` | 完整返回，`cooldownMs 300000` / `failThreshold 5` / `least-loaded` + 四条规则 |
+| 面板 `#kpol` | 挂载点在 |
+| key 原文泄漏 | `grep -c "sk-"` = 0 |
+| 报错 | 只有 SQLite experimental 警告（预期） |
+| 回滚 | `dist.prev` 在位，`./scripts/deploy.sh rollback` 可用 |
+
+### 上线后立刻撞上一次真实的双 key 额度耗尽 —— 顺便验证了两个修复
+
+上线几分钟后两个 key 全额度耗尽（上游账号状态，不是部署问题；池空 503
+是预期行为，盾在前面吸收）。这次意外成了真实环境的验证：
+
+**`error` 列修复确认生效** —— 这些原文在上一版任何地方都留不下（列恒 NULL、
+也没有任何 console 打它）：
+
+```
+****ZOBb 429 upstream 429 GoUsageLimitError: Weekly usage limit reached. Resets in 12min.
+****0osU 429 upstream 429 GoUsageLimitError: 5-hour usage limit reached. Resets in 1hr 33min.
+```
+
+**`disableUntil` 只延长不缩短确认生效** —— 冷却时长与上游原文完全对得上：
+
+```
+****ZOBb  quota-exhausted  cooldown 0.22h（上游说 12min + 60s 余量）  恢复于 08:01:51
+****0osU  quota-exhausted  cooldown 1.57h（上游说 1hr 33min + 余量）   恢复于 09:22:36
+```
+
+按旧代码，后续每个撞上来的 429 都会把这两个冷却覆写成 3 秒、原因改成
+`rate-limit` —— key 会被反复选中、每次先撞一次 429，而面板显示的原因是错的。
+现在两个 key 都稳定挂着 `quota-exhausted` 和正确的恢复时刻。
+
+### 排查时踩的一个坑（记下来省下次的时间）
+
+线上 env 文件是 `/root/fuckopencode/fuckopencode.env`，**不是 `.env`**。
+我第一次端到端测试取 key 取到空串，网关回 401，盾把 401 转成 503，
+看起来像部署炸了 —— 实际是我自己的命令写错。
+用 `systemctl show fuckopencode -p EnvironmentFiles --value` 确认路径。
+
 ## 下一步
 
-**代码改完但没提交、没上线** —— 等用户拍板。上线前建议：
+线上已是最新，无阻塞待办。观察项：
 
-1. `npm test`（340）+ `npm run build` 已过，可以直接 `./scripts/deploy.sh`
-2. 上线后按 DEPLOY.md 第 5 条查启动日志 `usage db:` 不是 `off (...)`
-3. 线上那两个真 key 的状态在部署重启后会清零（`totalAcquired` 是进程级），
-   但 sqlite 里的累计会保留
+- 两个 key 分别在 08:01:51 / 09:22:36 自动恢复，届时面板显示 `2/2`，
+  「最近状态变更」会各多一条 recovered
+- **保留期清理现在真的会跑了**（进程存活 10 分钟后进入窗口）。
+  `data/usage.db` 之前 114KB，留意它是否稳定
+- WAL 一直在 4.1MB 左右属正常（autocheckpoint 阈值 1000 页 × 4096 = 4MB），
+  已设 `journal_size_limit=16MB` 兜住异常膨胀
 
 ## 冷却策略上面板（2026-08-10 07:45，用户要求，已做完）
 
