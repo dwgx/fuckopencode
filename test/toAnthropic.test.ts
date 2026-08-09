@@ -431,6 +431,44 @@ describe('DSML 泄漏兜底解析', () => {
     expect(text).toBe('你好世界');
   });
 
+  it('混合形态（function_calls 带前缀、标签闭口多竖线）不残留标记', () => {
+    // 2026-08-09 第三次形态：`function_calls` 带 |DSML| 前缀，`invoke`/`parameter`
+    // 开标签无前缀，`parameter` 闭标签带前缀且**多一根竖线**（`</ | DSML | | parameter>`）。
+    // 之前两版正则分别栽在「外层包裹」和「每标签单竖线」，这里锁住不规则形态。
+    const leaked =
+      '<|DSML|function_calls\n' +
+      '<invoke name="Bash">' +
+      '<parameter name="command" string="true">echo hi</ | DSML | | parameter>' +
+      '</invoke>\n' +
+      '</|DSML|function_calls>';
+    const out = openAIToAnthropicResponse({
+      id: 'c1',
+      object: 'chat.completion',
+      created: 1,
+      model: 'm',
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: leaked },
+          finish_reason: 'stop',
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    } as never);
+    const tu = out.content.find((b) => b.type === 'tool_use');
+    expect(tu).toBeDefined();
+    expect((tu as { name: string }).name).toBe('Bash');
+    // command 必须干净，不能带 DSML/闭标签残留（否则客户端拿到脏参数）。
+    const input = (tu as { input: { command?: string } }).input;
+    expect(input.command).toBe('echo hi');
+    expect(String(input.command)).not.toMatch(/DSML|<\/|parameter/);
+    expect(out.stop_reason).toBe('tool_use');
+    // 残余文本不含 DSML 标记。
+    const textBlocks = out.content.filter((b) => b.type === 'text');
+    const text = textBlocks.map((b) => (b as { text: string }).text).join('');
+    expect(text).not.toMatch(/DSML|invoke|function_calls/);
+  });
+
   it('非流式：DSML 文本被还原成 tool_use', () => {
     const leaked =
       '<|DSML|function_calls>\n<|DSML|invoke name="Bash"><|DSML|parameter name="command">ls</|DSML|parameter></|DSML|invoke>\n</|DSML|function_calls>';
