@@ -39,7 +39,7 @@ export interface DsmlExtraction {
  * - `antml:` / `foo:`（XML 命名空间风格）
  * - 空（标准 `<invoke>`）
  */
-const NS = String.raw`(?:\s*[|｜]\s*[A-Za-z][\w-]*\s*[|｜]\s*|\s*[A-Za-z][\w-]*\s*:\s*|\s*)`;
+const NS = String.raw`(?:[\s|｜]*[A-Za-z][\w-]*[\s|｜]*|[\s|｜]*[A-Za-z][\w-]*\s*:\s*|[\s|｜]*)`;
 
 /** 开/闭标签。闭合标签允许缺失（上游被 max_tokens 截断时）。 */
 const openTag = (name: string) => String.raw`[<⟨]${NS}${name}`;
