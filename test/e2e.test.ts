@@ -27,7 +27,7 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
       res.end(
         JSON.stringify({
           object: 'list',
-          data: [{ id: 'claude-x' }, { id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-flash-free' }],
+          data: [{ id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-flash-free' }],
         }),
       );
       return;
@@ -54,7 +54,7 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
 
       if (parsed.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
-        const base = { id: 'chatcmpl-fake', object: 'chat.completion.chunk', created: 1, model: 'claude-x' };
+        const base = { id: 'chatcmpl-fake', object: 'chat.completion.chunk', created: 1, model: 'deepseek-v4-flash' };
         const chunks: unknown[] = [
           { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] },
           { ...base, choices: [{ index: 0, delta: { content: '你' }, finish_reason: null }] },
@@ -73,7 +73,7 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
             id: 'chatcmpl-fake',
             object: 'chat.completion',
             created: 1,
-            model: 'claude-x',
+            model: 'deepseek-v4-flash',
             choices: [
               { index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' },
             ],
@@ -104,7 +104,7 @@ describe('v1 代理端到端', () => {
     keyCooldownMs: 300_000,
     anthropicBaseUrl: 'http://placeholder',
     payAsYouGoBaseUrl: 'http://placeholder-payg', // 启动后覆盖
-    modelMap: { 'gpt-4o': 'claude-x' },
+    modelMap: { 'gpt-4o': 'deepseek-v4-flash' },
     fallbackModel: 'deepseek-v4-flash',
     injectionMode: 'block',
     allowUnauthenticated: false,
@@ -173,7 +173,8 @@ describe('v1 代理端到端', () => {
 
     // 上游收到的是 OpenAI 格式：system 消息保留在 messages 里并被追加护栏。
     const upstream = fake.received[fake.received.length - 1]!;
-    expect(upstream.model).toBe('claude-x'); // MODEL_MAP: gpt-4o → claude-x
+    // MODEL_MAP: gpt-4o → deepseek-v4-flash（白名单内才生效）
+    expect(upstream.model).toBe('deepseek-v4-flash');
     const sys = upstream.messages[0]!;
     expect(sys.role).toBe('system');
     expect(String(sys.content)).toContain('你是助手');
@@ -375,5 +376,85 @@ describe('未鉴权放行模式的安全加固', () => {
     expect(json.error).toEqual({ message: 'all upstream keys are disabled', type: 'server_error' });
     expect(JSON.stringify(json)).not.toContain('ANTHROPIC_API_KEY');
     expect(JSON.stringify(json)).not.toContain('OPENSEA_KEYS');
+  });
+});
+
+describe('监控面板访问控制', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  // 关键：配了 apiKeys（所以默认要鉴权）+ dashboardOpen（本机直连可免 key）。
+  const dashCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['dash-key'],
+    anthropicApiKey: 'sk-fake',
+    upstreamKeys: ['sk-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: true,
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    dashCfg.anthropicBaseUrl = fake.baseUrl;
+    proxy = createApp(dashCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  it('直连本机且无 CDN 头：免 key 放行（浏览器地址栏带不了 header）', async () => {
+    const res = await fetch(`${baseUrl}/__dash`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    expect(await res.text()).toContain('gateway');
+  });
+
+  it('带 cf-connecting-ip 时要求 key —— 防 cloudflared 隧道把面板暴露到公网', async () => {
+    const res = await fetch(`${baseUrl}/__metrics`, { headers: { 'cf-connecting-ip': '1.2.3.4' } });
+    expect(res.status).toBe(401);
+    const json = (await res.json()) as { error: { message: string } };
+    // 401 要给出可照做的指引，不是干巴巴一句 unauthorized。
+    expect(json.error.message).toContain('ssh -N -L');
+  });
+
+  it('带 x-forwarded-for 同样要求 key', async () => {
+    const res = await fetch(`${baseUrl}/__dash`, { headers: { 'x-forwarded-for': '5.6.7.8' } });
+    expect(res.status).toBe(401);
+  });
+
+  it('带 CDN 头 + 正确 key 时放行', async () => {
+    const res = await fetch(`${baseUrl}/__metrics`, {
+      headers: { 'cf-connecting-ip': '1.2.3.4', 'x-api-key': 'dash-key' },
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { pool: { size: number } };
+    expect(json.pool.size).toBe(1);
+  });
+
+  it('面板自身的轮询不计入指标（否则会把自己刷满）', async () => {
+    // metrics 是模块级状态，同文件其他 describe 已有计数，所以比较增量而非绝对值。
+    const before = (await (await fetch(`${baseUrl}/__metrics`)).json()) as { totalRequests: number };
+    await fetch(`${baseUrl}/__metrics`);
+    await fetch(`${baseUrl}/__dash`);
+    const after = (await (await fetch(`${baseUrl}/__metrics`)).json()) as { totalRequests: number };
+    expect(after.totalRequests).toBe(before.totalRequests);
   });
 });

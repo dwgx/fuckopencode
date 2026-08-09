@@ -26,23 +26,37 @@ export const DEFAULT_FALLBACK_MODEL = 'deepseek-v4-flash';
 export const DEEPSEEK_MIN_MAX_TOKENS = 4096;
 
 /**
+ * 允许对外提供的模型白名单。
+ *
+ * 上游 `/zen/v1/models` 列了 61 个模型（claude 系、gpt 系、glm 系等），但本网关
+ * 只放行 DeepSeek V4 两个变体：不带后缀的走订阅端点（cost=0），`-free` 走按量。
+ * 白名单之外的模型名一律回落到 fallback，不透传给上游 —— 公网暴露时这一层
+ * 决定了别人拿到 key 也只能用这两个模型，烧不到别的额度。
+ */
+export const ALLOWED_MODELS: ReadonlySet<string> = new Set([
+  'deepseek-v4-flash',
+  'deepseek-v4-flash-free',
+]);
+
+/**
  * 模型名解析：命中 MODEL_MAP 用映射值，否则回落 fallback。
  *
- * 上游 `/zen/v1/models` 列了 61 个模型（claude 系、gpt 系、deepseek 系、glm 系等），
- * 客户端请求的模型名若本身就是上游支持的，直接透传，不该被回落吃掉。
- * `knownModels` 为空时退化成老行为（只看 MODEL_MAP）。
+ * 只有 ALLOWED_MODELS 里的名字能直传（含 MODEL_MAP 的映射结果也要过白名单），
+ * 其余全部回落 —— Claude Code 会发 claude-sonnet-4-6 这类名字，正好被这条吃掉
+ * 并落到 fallback 上。`knownModels` 参数保留但不再放宽白名单。
  */
 export function resolveModelName(
   model: string,
   modelMap: Record<string, string>,
   fallbackModel: string,
-  knownModels?: ReadonlySet<string>,
+  _knownModels?: ReadonlySet<string>,
 ): string {
   const mapped = modelMap[model];
-  if (mapped) return mapped;
-  // 客户端请求的就是上游认识的模型名：直传（比如显式要 claude-opus-5 或 deepseek-v4-pro）。
-  if (knownModels && knownModels.has(model)) return model;
-  return fallbackModel;
+  // 映射结果也必须在白名单里，否则配错 MODEL_MAP 就能绕过限制。
+  if (mapped && ALLOWED_MODELS.has(mapped)) return mapped;
+  if (ALLOWED_MODELS.has(model)) return model;
+  // 白名单外（含 claude-*/gpt-* 等）一律回落；fallback 本身若不合法则强制到 flash。
+  return ALLOWED_MODELS.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL;
 }
 
 /**

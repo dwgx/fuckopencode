@@ -19,6 +19,7 @@ import { anthropicEventToSSE, openAIStreamToAnthropic, openAIToAnthropicResponse
 import { sseStringify } from './stream.js';
 import { parseOpenAISSE } from './sse.js';
 import {
+  ALLOWED_MODELS,
   filterThinkingFromStream,
   normalizeAnthropicRequest,
   resolveModelName,
@@ -136,6 +137,26 @@ function parseJson(text: string): { ok: true; body: unknown } | { ok: false } {
  */
 let upstreamModels: ReadonlySet<string> = new Set();
 
+/**
+ * 是否为「直连本机」的请求：socket 源地址是回环，且没有任何反代/CDN 转发头。
+ *
+ * cloudflared 反代进来的请求 socket 也是 127.0.0.1，光看源地址会误判成本机，
+ * 从而把含 IP/UA 的面板暴露到公网。所以额外要求不带 cf-* / x-forwarded-*
+ * 这类头 —— 走 SSH 隧道时不会有这些头，走隧道/CDN 时一定有。
+ */
+function isDirectLocalRequest(req: IncomingMessage): boolean {
+  const addr = req.socket.remoteAddress ?? '';
+  const loopback = addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+  if (!loopback) return false;
+  const h = req.headers;
+  return (
+    h['cf-connecting-ip'] == null &&
+    h['cf-ray'] == null &&
+    h['x-forwarded-for'] == null &&
+    h['x-real-ip'] == null
+  );
+}
+
 /** 单次请求的指标上下文，由各 handler 逐步填充。 */
 type MetricsCtx = Pick<
   RequestEvent,
@@ -188,13 +209,22 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {
         return;
       }
 
-      // 监控面板。绑在 127.0.0.1 时默认放行（本机才能访问）；
-      // 非回环绑定时要求鉴权，避免把设备信息/IP 暴露到公网。
+      // 监控面板。面板含调用方 IP/UA，所以只对「确实来自本机」的请求免鉴权：
+      // socket 源地址是回环 + 没有 CDN 转发头。经 cloudflared 反代进来的请求
+      // socket 也是回环，但会带 cf-* 头，据此区分，防止隧道把面板暴露到公网。
       if (req.method === 'GET' && (path === '/__dash' || path === '/__metrics')) {
-        if (!cfg.dashboardOpen) {
+        if (!(cfg.dashboardOpen && isDirectLocalRequest(req))) {
           const auth = verifyAuth(cfg, req.headers as Record<string, string | undefined>);
           if (!auth.ok) {
-            sendJson(res, 401, { error: { message: 'unauthorized', type: 'authentication_error' } });
+            // 浏览器地址栏没法带 header，所以给一句能照做的提示，而不是干巴巴的 401。
+            sendJson(res, 401, {
+              error: {
+                message:
+                  'dashboard requires an API key. open it over an ssh tunnel for key-free local access: ' +
+                  'ssh -N -L 8899:127.0.0.1:' + cfg.port + ' <host>  then visit http://127.0.0.1:8899' + path,
+                type: 'authentication_error',
+              },
+            });
             return;
           }
         }
@@ -212,7 +242,7 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {
               paygBaseUrl: cfg.payAsYouGoBaseUrl,
               fallbackModel: cfg.fallbackModel,
               injectionMode: cfg.injectionMode,
-              upstreamModels: [...upstreamModels],
+              upstreamModels: [...ALLOWED_MODELS],
             },
           });
           return;
@@ -281,9 +311,9 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {
         return;
       }
 
-      // 模型发现（OpenAI 兼容）：上游真实模型清单 + fallback + MODEL_MAP 的键。
+      // 模型发现（OpenAI 兼容）：只暴露白名单里的模型，与实际放行范围一致。
       if (req.method === 'GET' && path === '/v1/models') {
-        const ids = new Set([cfg.fallbackModel, ...upstreamModels, ...Object.keys(cfg.modelMap)]);
+        const ids = new Set([...ALLOWED_MODELS].filter((m) => upstreamModels.size === 0 || upstreamModels.has(m) || m.endsWith('-free')));
         sendJson(res, 200, {
           object: 'list',
           data: [...ids].map((id) => ({ id, object: 'model', owned_by: 'proxy' })),
