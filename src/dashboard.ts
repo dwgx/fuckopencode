@@ -57,10 +57,18 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     padding: 0 20px; height: 46px;
     background: var(--bg); border-bottom: 1px solid var(--line-weak);
   }
-  .brand { color: var(--fg); font-weight: 500; }
+  /* brand 可截断（min-width:0 才能让 flex item 缩到内容宽度以下），
+     状态位与按钮不换行 —— 46px 单行 topbar 里换行会把字顶出边框。 */
+  .brand {
+    color: var(--fg); font-weight: 500;
+    min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  }
   .brand span { color: var(--fg-weaker); font-weight: 400; }
   .spacer { flex: 1; }
-  .stat-inline { color: var(--fg-weak); font-size: 12px; }
+  .stat-inline { color: var(--fg-weak); font-size: 12px; white-space: nowrap; }
+  /* live 位在断流时会填入上游错误原文（[!] Failed to fetch 这类），长度不可控。
+     给它 min-width:0 + 省略号，让它替按钮吸收溢出，而不是把按钮顶出可视区。 */
+  #h-live { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .stat-inline b { color: var(--fg-base); font-weight: 400; }
   .stat-inline.ok b { color: var(--ok); }
   .stat-inline.bad b { color: var(--bad); }
@@ -68,8 +76,19 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     font: inherit; cursor: pointer; color: var(--fg-weak);
     background: transparent; border: 1px solid var(--line-weak);
     border-radius: var(--radius); padding: 3px 9px; font-size: 12px;
+    white-space: nowrap; flex: none;
   }
   button:hover { color: var(--fg); border-color: var(--line-hover); }
+  /* 窄屏降级：375px 下六个元素要 401px，会给整个文档拖出横向滚动条。
+     按信息价值从低到高丢弃：收紧间距与内边距、摘掉 brand 的 / gateway 后缀和
+     up 运行时长（时长不是判断故障的关键位）、状态位降到 11px；
+     保住 pool / live 两个状态位和两个按钮。brand 兜底截断，池子位变长时
+     溢出压在它身上，而不是把按钮顶出可视区。 */
+  @media (max-width: 560px) {
+    header { gap: 8px; padding: 0 12px; }
+    .brand span, #h-up { display: none; }
+    .stat-inline { font-size: 11px; }
+  }
 
   main { padding: 20px; max-width: 1600px; margin: 0 auto; }
 
