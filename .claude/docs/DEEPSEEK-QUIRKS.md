@@ -121,3 +121,27 @@ opencode Zen 的流有时不是标准 SSE：直接一行 `{"type":...}` 没有 `
 - 解法二：`completeStreamEvents` 按需补全缺失的事件骨架
   （[deepseek.ts](../../src/deepseek.ts)）
 - 因此直通路径**总是解析 + 重新序列化**，不做字节透传
+
+## 12. 偶发把工具调用当文本吐（DSML 泄漏）
+
+**2026-08-09 线上实测发现。** DeepSeek 偶发不吐结构化 `tool_calls`，而是把工具
+调用当普通文本吐出来。实测形态——**每个标签自己带命名空间前缀**，不是外层包一层：
+
+```
+< | DSML | function_calls
+< | DSML | invoke name="Bash">
+< | DSML | parameter name="command" string="true">echo hi</ | DSML | parameter>
+</ | DSML | invoke>
+</ | DSML | function_calls>
+```
+
+客户端（Claude Code / opencode）看到的就是一堆裸文本 `invoke`，工具不会被执行。
+且泄漏时 `finish_reason` 是 `stop`（上游不认为这是工具调用）。
+
+- 解法：文本里同时出现 `function_calls` + `<invoke` 时，兜底解析还原成
+  `tool_use` 块，并把 `stop_reason` 纠正为 `tool_use`
+- 实现：[dsml.ts](../../src/dsml.ts) `extractDsmlToolCalls`
+- 前缀形态不稳定（`|DSML|` / `antml:` / 无前缀），匹配统一走宽松模式
+- 保守原则：解析不出任何 invoke 就原样返回，不碰正常文本
+- 流式下文本缓冲到流结束再解析（增量转发无法中途判断分片），代价是文本 TTFB
+  从「首字」变「整个 text 块结束」；工具场景本就要等工具结果，取舍可接受

@@ -71,14 +71,28 @@ OpenAI 出去，`/v1/messages` 走 Anthropic → OpenAI → 上游 → Anthropic
 | `usage.ts` / `stopReason.ts` | 字段换算 |
 | `deepseek.ts` | DeepSeek 归一化，直通路径的适配层 |
 
+反向转换（OpenAI → Anthropic，直通路径用）：
+
+| 模块 | 职责 |
+|---|---|
+| `toAnthropic.ts` | OpenAI 响应/流 → Anthropic。含 DSML 兜底与流式文本缓冲 |
+| `toOpenAI.ts` | Anthropic 请求 → OpenAI（tool_result 拆成独立 tool 消息） |
+| `dsml.ts` | 上游把工具调用当文本吐时的兜底解析（怪癖 12） |
+
 服务层：
 
 | 模块 | 职责 |
 |---|---|
+| `main.ts` | 进程入口，装配 config + server |
 | `server.ts` | 路由、鉴权装配、背压写入、流式连接管理 |
-| `anthropic.ts` | 上游转发，120s 响应头超时 |
+| `upstream.ts` | 上游转发（OpenAI 协议），120s 响应头超时，key 池集成 |
+| `keypool.ts` | 多 key 公平轮转、失败分级冷却、指纹脱敏 |
 | `config.ts` | 环境变量解析，fail-closed 判定 |
-| `errors.ts` | 错误映射 + 控制符剥离 |
+| `errors.ts` | 错误映射 + 控制符剥离 + 上游失败分级 |
+| `metrics.ts` | 请求事件环形缓冲（喂面板） |
+| `dashboard.ts` | 自带的状态面板（HTML 内联，零依赖） |
+| `types.ts` | 两套协议的类型定义 |
+| `index.ts` | 库导出面（供测试与外部引用） |
 | `security/auth.ts` | 常量时间鉴权 |
 | `security/validate.ts` | 结构校验 + 长度上限 |
 | `security/injection.ts` | 注入启发式检测 + system 护栏 |
