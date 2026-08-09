@@ -94,6 +94,41 @@ function coerce(raw: string, attrs: string): unknown {
 }
 
 /**
+ * 残缺 DSML 标记。上游被 max_tokens 截断、或只吐了半截标签时，
+ * `extractDsmlToolCalls` 抽不出任何 invoke，此前那些标记就原样泄漏给客户端了
+ * （实测：客户端看到裸的 `<｜DSML｜function_calls`）。
+ *
+ * 这里单独兜一层：只剥标记本身，**保留周围的正常文本**。
+ * 覆盖开/闭标签，以及被截断成「没有 `>`」的半截标签。
+ */
+const DSML_RESIDUE = new RegExp(
+  [
+    // 完整或半截的开标签：<|DSML|function_calls> / <｜DSML｜invoke ...> / <|DSML|parameter ...>
+    `[<⟨]${NS}(?:function_calls|invoke|parameter)\\b[^>⟩]*[>⟩]?`,
+    // 闭标签
+    `[<⟨]\\s*/${NS}(?:function_calls|invoke|parameter)[^>⟩]*[>⟩]?`,
+  ].join('|'),
+  'gi',
+);
+
+/** 文本里是否残留 DSML 标记（用于判断要不要走剥离兜底）。 */
+export function hasDsmlResidue(text: string): boolean {
+  if (!text) return false;
+  DSML_RESIDUE.lastIndex = 0;
+  return DSML_RESIDUE.test(text);
+}
+
+/**
+ * 剥掉残留的 DSML 标记，保留正常文本。
+ *
+ * 与 `extractDsmlToolCalls` 的分工：那个负责「能还原成 tool_use 的」，
+ * 这个负责「还原不了、但不能让客户端看到标记的」。
+ */
+export function stripDsmlResidue(text: string): string {
+  return text.replace(DSML_RESIDUE, '').trim();
+}
+
+/**
  * 从文本里抽出 DSML 工具调用。没有可解析的调用时返回 null
  * （调用方保持原样，避免对正常文本做任何改写）。
  */

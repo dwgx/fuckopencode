@@ -141,7 +141,32 @@ opencode Zen 的流有时不是标准 SSE：直接一行 `{"type":...}` 没有 `
 - 解法：文本里同时出现 `function_calls` + `<invoke` 时，兜底解析还原成
   `tool_use` 块，并把 `stop_reason` 纠正为 `tool_use`
 - 实现：[dsml.ts](../../src/dsml.ts) `extractDsmlToolCalls`
-- 前缀形态不稳定（`|DSML|` / `antml:` / 无前缀），匹配统一走宽松模式
-- 保守原则：解析不出任何 invoke 就原样返回，不碰正常文本
+- 前缀形态不稳定（`|DSML|` / `antml:` / 全角 `｜` / 无前缀），匹配统一走宽松模式
 - 流式下文本缓冲到流结束再解析（增量转发无法中途判断分片），代价是文本 TTFB
   从「首字」变「整个 text 块结束」；工具场景本就要等工具结果，取舍可接受
+
+### 12b. 残缺 DSML 标记仍会泄漏（2026-08-09 二次实测）
+
+上面那条的「保守原则」原本是**解析不出任何 invoke 就原样返回**。这条原则在
+「上游只吐了半截标签」时会把标记直接泄漏给客户端 —— 用户实测看到裸的：
+
+```
+现在绝对还有<｜DSML｜function_calls
+```
+
+这类形态抽不出任何 `invoke`（上游被 `max_tokens` 截断，或只吐了开头/闭合标记），
+所以 `extractDsmlToolCalls` 返回 null，走 else 分支把原文完整透出。
+
+解法分两层，别混在一起：
+
+| 情况 | 处理 | 函数 |
+|---|---|---|
+| 能抽出 invoke | 还原成 `tool_use` + 纠正 `stop_reason` | `extractDsmlToolCalls` |
+| 抽不出但带 DSML 标记 | **只剥标记，保留周围正常文本** | `stripDsmlResidue` |
+| 不带 DSML 标记 | 原样返回，绝不改写 | — |
+
+- 实现：[dsml.ts](../../src/dsml.ts) `hasDsmlResidue` / `stripDsmlResidue`
+- 接线：[toAnthropic.ts](../../src/toAnthropic.ts) 非流式与流式各一处，**两处都要接**
+- 剥离覆盖开/闭标签，以及被截断成「没有 `>`」的半截标签
+- 关键边界：正常提到 `function_calls` 这个词的对话**不能被改写**。判据是标记形态
+  （`[<⟨]` + 命名空间 + 标签名），不是关键词命中，有回归测试守住

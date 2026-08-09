@@ -496,3 +496,66 @@ describe('DSML 泄漏兜底解析', () => {
     expect(out.stop_reason).toBe('tool_use');
   });
 });
+
+describe('DSML 残缺标记剥离（抽不出 invoke 时不能泄漏标记）', () => {
+  // 2026-08-09 用户实测：客户端看到裸的 `<｜DSML｜function_calls`。
+  // 这类形态抽不出任何 invoke（上游被 max_tokens 截断，或只吐了半截标签），
+  // 此前走 else 分支把原文完整透出 —— 标记就泄漏了。
+  const nonStream = (content: string) =>
+    openAIToAnthropicResponse({
+      id: 'c1',
+      object: 'chat.completion',
+      created: 1,
+      model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+    } as never);
+
+  it.each([
+    ['半截开标签（全角，用户报的形态）', '现在绝对还有<｜DSML｜function_calls', '现在绝对还有'],
+    ['半截开标签（半角）', 'text before <|DSML|function_calls', 'text before'],
+    ['只有闭合标记', '好的</｜DSML｜function_calls>', '好的'],
+    ['invoke 名字为空', '<｜DSML｜function_calls>\n<｜DSML｜invoke>\n</｜DSML｜invoke>', ''],
+    ['纯标记无正文', '<｜DSML｜function_calls', ''],
+  ])('非流式：%s', (_label, leaked, expectedText) => {
+    const out = nonStream(leaked);
+    const text = out.content
+      .filter((b) => b.type === 'text')
+      .map((b) => (b as { text: string }).text)
+      .join('');
+    expect(text).not.toContain('DSML');
+    expect(text).not.toContain('function_calls');
+    expect(text.trim()).toBe(expectedText);
+  });
+
+  it('非流式：正常提到 function_calls 的文本不被改写', () => {
+    const normal = '我们来讨论一下 function_calls 这个概念吧';
+    const out = nonStream(normal);
+    const text = out.content
+      .filter((b) => b.type === 'text')
+      .map((b) => (b as { text: string }).text)
+      .join('');
+    expect(text).toBe(normal);
+  });
+
+  it('流式：残缺 DSML 标记同样被剥掉', async () => {
+    const chunks = [
+      { choices: [{ index: 0, delta: { content: '好的，' }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: { content: '<｜DSML｜function_calls' }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+    ];
+    async function* src() {
+      for (const c of chunks) {
+        yield { id: 'c', object: 'chat.completion.chunk', created: 1, model: 'm', ...c } as never;
+      }
+    }
+    const events: unknown[] = [];
+    for await (const e of openAIStreamToAnthropic(src(), { model: 'm' })) events.push(e);
+    const text = events
+      .filter((e) => (e as { type: string }).type === 'content_block_delta')
+      .map((e) => (e as { delta?: { text?: string } }).delta?.text ?? '')
+      .join('');
+    expect(text).not.toContain('DSML');
+    expect(text).not.toContain('function_calls');
+    expect(text.trim()).toBe('好的，');
+  });
+});
