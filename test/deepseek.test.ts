@@ -4,6 +4,7 @@ import {
   resolveModelName,
   filterThinkingFromStream,
   DEFAULT_FALLBACK_MODEL,
+  ALLOWED_MODELS,
 } from '../src/deepseek.js';
 import type { AnthropicStreamEvent } from '../src/types.js';
 
@@ -17,6 +18,39 @@ function iter<T>(arr: T[]): AsyncIterable<T> {
     },
   };
 }
+
+describe('模型白名单（只放行 DeepSeek V4 两个变体）', () => {
+  it('白名单就是这两个', () => {
+    expect([...ALLOWED_MODELS].sort()).toEqual(['deepseek-v4-flash', 'deepseek-v4-flash-free']);
+  });
+
+  it('两个允许的模型直传', () => {
+    for (const m of ['deepseek-v4-flash', 'deepseek-v4-flash-free']) {
+      expect(resolveModelName(m, {}, 'deepseek-v4-flash')).toBe(m);
+    }
+  });
+
+  it('Claude Code 发的 claude-* 被回落，不透传给上游', () => {
+    for (const m of ['claude-sonnet-4-6', 'claude-opus-5', 'claude-haiku-4-5']) {
+      expect(resolveModelName(m, {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    }
+  });
+
+  it('其他上游模型（gpt/glm/kimi）也被拦下回落', () => {
+    for (const m of ['gpt-5.5', 'glm-5.2', 'kimi-k3', 'deepseek-v4-pro']) {
+      expect(resolveModelName(m, {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    }
+  });
+
+  it('MODEL_MAP 映射到白名单外的值同样被拦（防配错绕过）', () => {
+    expect(resolveModelName('x', { x: 'claude-opus-5' }, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    expect(resolveModelName('x', { x: 'deepseek-v4-flash-free' }, 'deepseek-v4-flash')).toBe('deepseek-v4-flash-free');
+  });
+
+  it('fallback 本身非法时强制回到 flash', () => {
+    expect(resolveModelName('zzz', {}, 'claude-opus-5')).toBe('deepseek-v4-flash');
+  });
+});
 
 describe('resolveModelName', () => {
   it('命中映射返回映射值', () => {
