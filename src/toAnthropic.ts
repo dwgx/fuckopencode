@@ -1,3 +1,4 @@
+import { extractDsmlToolCalls } from './dsml.js';
 import type {
   AnthropicResponse,
   AnthropicResponseContentBlock,
@@ -63,7 +64,17 @@ export function openAIToAnthropicResponse(
     content.push({ type: 'thinking', thinking: message.reasoning_content, signature: '' });
   }
   if (typeof message?.content === 'string' && message.content) {
-    content.push({ type: 'text', text: message.content });
+    // 上游偶发把工具调用当文本吐（DSML 包裹）。能解析就还原成 tool_use，
+    // 否则保持文本原样。解析出的工具 id 用确定性派生，避免重试不幂等。
+    const dsml = extractDsmlToolCalls(message.content);
+    if (dsml) {
+      if (dsml.text) content.push({ type: 'text', text: dsml.text });
+      for (const c of dsml.toolCalls) {
+        content.push({ type: 'tool_use', id: `dsml_${c.name}`, name: c.name, input: c.input });
+      }
+    } else {
+      content.push({ type: 'text', text: message.content });
+    }
   }
   for (const tc of message?.tool_calls ?? []) {
     let input: Record<string, unknown> = {};
@@ -123,6 +134,14 @@ export async function* openAIStreamToAnthropic(
   let usage: OpenAIChatResponse['usage'] | undefined;
   let messageId = options.id;
   let model = options.model;
+  /**
+   * 流式文本缓冲。上游偶发把工具调用当文本吐（DSML 包裹），流式下边收边吐
+   * 无法中途判断，所以**缓冲整个 text 块**到流结束，收尾时统一解析——
+   * 解析出 DSML 就还原成 tool_use 块，否则原样补发 text。
+   * 代价：流式文本的 TTFB 从「首字」变成「整个 text 块结束」。工具调用场景
+   * 本来就要等工具结果，牺牲可接受；纯长文对话会有感知延迟。
+   */
+  let bufferedText = '';
 
   const ensureStart = function* (): Generator<AnthropicStreamEvent> {
     if (started) return;
@@ -180,23 +199,16 @@ export async function* openAIStreamToAnthropic(
       };
     }
 
-    // 2. content → text 块
+    // 2. content → text 块：缓冲到流结束，收尾统一解析 DSML（见收尾段）。
     if (typeof delta.content === 'string' && delta.content) {
       yield* ensureStart();
-      if (openTextBlock?.kind !== 'text') {
-        yield* closeTextBlock();
-        openTextBlock = { index: nextIndex++, kind: 'text' };
-        yield {
-          type: 'content_block_start',
-          index: openTextBlock.index,
-          content_block: { type: 'text', text: '' },
-        };
+      // 首次收到文本时关掉 thinking 块，让收尾能新开独立的 text 块
+      // （否则缓冲的文本会被误并入还在开着的 thinking 块）。
+      if (openTextBlock && openTextBlock.kind !== 'text') {
+        yield { type: 'content_block_stop', index: openTextBlock.index };
+        openTextBlock = null;
       }
-      yield {
-        type: 'content_block_delta',
-        index: openTextBlock.index,
-        delta: { type: 'text_delta', text: delta.content },
-      };
+      bufferedText += delta.content;
     }
 
     // 3. tool_calls → tool_use 块（每个 OpenAI index 一个独立块）
@@ -232,7 +244,68 @@ export async function* openAIStreamToAnthropic(
 
   // 收尾：补齐骨架，保证 Claude Code 能闭合 message。
   yield* ensureStart();
-  yield* closeTextBlock();
+
+  // 解析缓冲的文本：DSML → tool_use 块；普通文本 → 补发 text 块。
+  if (bufferedText) {
+    const dsml = extractDsmlToolCalls(bufferedText);
+    if (dsml) {
+      // DSML 解析成功：残余文本先发 text 块，再逐个发 tool_use 块。
+      if (dsml.text) {
+        openTextBlock = { index: nextIndex++, kind: 'text' };
+        yield {
+          type: 'content_block_start',
+          index: openTextBlock.index,
+          content_block: { type: 'text', text: '' },
+        };
+        yield {
+          type: 'content_block_delta',
+          index: openTextBlock.index,
+          delta: { type: 'text_delta', text: dsml.text },
+        };
+        yield { type: 'content_block_stop', index: openTextBlock.index };
+        openTextBlock = null;
+      }
+      // 每个解析出的调用一个 tool_use 块
+      for (const c of dsml.toolCalls) {
+        const idx = nextIndex++;
+        yield {
+          type: 'content_block_start',
+          index: idx,
+          content_block: { type: 'tool_use', id: `dsml_${c.name}`, name: c.name, input: c.input },
+        };
+        yield { type: 'content_block_stop', index: idx };
+      }
+    } else if (openTextBlock) {
+      // 普通文本：补发已缓冲的内容
+      yield {
+        type: 'content_block_delta',
+        index: openTextBlock.index,
+        delta: { type: 'text_delta', text: bufferedText },
+      };
+      yield { type: 'content_block_stop', index: openTextBlock.index };
+      openTextBlock = null;
+    } else {
+      // 没有 text 块但缓冲了内容：单独开一个 text 块
+      const idx = nextIndex++;
+      yield {
+        type: 'content_block_start',
+        index: idx,
+        content_block: { type: 'text', text: '' },
+      };
+      yield {
+        type: 'content_block_delta',
+        index: idx,
+        delta: { type: 'text_delta', text: bufferedText },
+      };
+      yield { type: 'content_block_stop', index: idx };
+    }
+  }
+  // 若有残留的 openTextBlock（无内容），关掉
+  if (openTextBlock) {
+    yield { type: 'content_block_stop', index: openTextBlock.index };
+    openTextBlock = null;
+  }
+
   for (const block of toolBlocks.values()) {
     yield { type: 'content_block_stop', index: block.index };
   }
