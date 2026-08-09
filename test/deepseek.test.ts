@@ -5,6 +5,9 @@ import {
   filterThinkingFromStream,
   DEFAULT_FALLBACK_MODEL,
   ALLOWED_MODELS,
+  MODEL_ALIASES,
+  MODEL_ALIAS_REVERSE,
+  resolveUpstreamBaseUrl,
 } from '../src/deepseek.js';
 import type { AnthropicStreamEvent } from '../src/types.js';
 
@@ -321,5 +324,39 @@ describe('filterThinkingFromStream', () => {
   it('keepThinking=true：原样透传', async () => {
     const events = await collect(true);
     expect(events).toHaveLength(7);
+  });
+});
+
+describe('对外模型别名', () => {
+  it('别名映射到对应的真实模型', () => {
+    expect(resolveModelName('claude-mythos-5', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    expect(resolveModelName('claude-fable-5', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash-free');
+  });
+
+  it('真名照样可用，别名不影响', () => {
+    expect(resolveModelName('deepseek-v4-flash', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    expect(resolveModelName('deepseek-v4-flash-free', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash-free');
+  });
+
+  it('别名不与真实 Anthropic 模型重名 —— 否则 Claude Code 的默认模型会被误判', () => {
+    const real = ['claude-opus-5', 'claude-sonnet-5', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-8'];
+    for (const r of real) {
+      expect(Object.keys(MODEL_ALIASES)).not.toContain(r);
+      // 这些真名应走回落，而不是被当成别名解析。
+      expect(resolveModelName(r, {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    }
+  });
+
+  it('反向表可由真名查回别名', () => {
+    expect(MODEL_ALIAS_REVERSE['deepseek-v4-flash']).toBe('claude-mythos-5');
+    expect(MODEL_ALIAS_REVERSE['deepseek-v4-flash-free']).toBe('claude-fable-5');
+  });
+
+  it('别名走的端点与真名一致（free 别名走按量）', () => {
+    const SUB = 'https://opencode.ai/zen/go', PAYG = 'https://opencode.ai/zen';
+    const mythos = resolveModelName('claude-mythos-5', {}, 'deepseek-v4-flash');
+    const fable = resolveModelName('claude-fable-5', {}, 'deepseek-v4-flash');
+    expect(resolveUpstreamBaseUrl(mythos, SUB, PAYG)).toBe(SUB);
+    expect(resolveUpstreamBaseUrl(fable, SUB, PAYG)).toBe(PAYG);
   });
 });

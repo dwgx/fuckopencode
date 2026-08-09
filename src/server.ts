@@ -20,6 +20,7 @@ import { sseStringify } from './stream.js';
 import { parseOpenAISSE } from './sse.js';
 import {
   ALLOWED_MODELS,
+  MODEL_ALIASES,
   filterThinkingFromStream,
   normalizeAnthropicRequest,
   resolveModelName,
@@ -242,7 +243,8 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {
               paygBaseUrl: cfg.payAsYouGoBaseUrl,
               fallbackModel: cfg.fallbackModel,
               injectionMode: cfg.injectionMode,
-              upstreamModels: [...ALLOWED_MODELS],
+              upstreamModels: [...Object.keys(MODEL_ALIASES), ...ALLOWED_MODELS],
+              aliases: MODEL_ALIASES,
             },
           });
           return;
@@ -313,7 +315,8 @@ export function createApp(cfg: AppConfig, pool?: KeyPool) {
 
       // 模型发现（OpenAI 兼容）：只暴露白名单里的模型，与实际放行范围一致。
       if (req.method === 'GET' && path === '/v1/models') {
-        const ids = new Set([...ALLOWED_MODELS].filter((m) => upstreamModels.size === 0 || upstreamModels.has(m) || m.endsWith('-free')));
+        // 别名排前面（更像 Anthropic 命名），真名跟后，两种都可用。
+        const ids = new Set([...Object.keys(MODEL_ALIASES), ...ALLOWED_MODELS]);
         sendJson(res, 200, {
           object: 'list',
           data: [...ids].map((id) => ({ id, object: 'model', owned_by: 'proxy' })),
