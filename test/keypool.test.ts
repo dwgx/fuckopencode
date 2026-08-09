@@ -187,13 +187,92 @@ describe('classifyUpstreamFailure', () => {
   });
 
   it('余额不足类错误 → rate-limit，不按 auth 长期禁用', () => {
-    for (const type of ['billing_error', 'CreditsError', 'insufficient_balance', 'quota_exceeded']) {
+    // 余额不足是「充值即恢复」的账户状态，短冷却即可。
+    for (const type of ['billing_error', 'CreditsError', 'insufficient_balance']) {
       expect(classifyUpstreamFailure(400, { error: { type } })).toBe('rate-limit');
     }
+  });
+
+  it('配额/额度耗尽类错误 → quota-exhausted，按重置时间长冷却', () => {
+    // 与余额不足不同：配额按周/月重置，短冷却只会让请求反复撞同一个已耗尽的 key。
+    for (const type of ['quota_exceeded', 'GoUsageLimitError']) {
+      expect(classifyUpstreamFailure(400, { error: { type } })).toBe('quota-exhausted');
+    }
+    // 实测的真实上游形态
+    expect(
+      classifyUpstreamFailure(429, {
+        type: 'GoUsageLimitError',
+        message: 'Weekly usage limit reached. Resets in 19hr 22min.',
+      }),
+    ).toBe('quota-exhausted');
+  });
+
+  it('普通并发 429 仍是 rate-limit（短冷却，快速回池）', () => {
+    expect(
+      classifyUpstreamFailure(429, { error: { type: 'rate_limit_error', message: 'too many requests' } }),
+    ).toBe('rate-limit');
   });
 
   it('5xx / 非 JSON → transient', () => {
     expect(classifyUpstreamFailure(500, null)).toBe('transient');
     expect(classifyUpstreamFailure(502, 'html')).toBe('transient');
+  });
+});
+
+describe('多 key 公平分担（RPM 均摊）', () => {
+  it('串行请求在 N 个 key 上精确等分', () => {
+    // 回归：原来用 lastUsedAt（毫秒）做轮转依据，串行请求同毫秒完成时时间戳
+    // 相同、`<` 不成立，永远选数组第一个 —— 实测 3 key 12 请求分布 10/1/1。
+    for (const n of [2, 3, 5]) {
+      const keys = Array.from({ length: n }, (_, i) => `k${i + 1}`);
+      const pool = new KeyPool(keys, { ...OPTS });
+      const counts = new Map<string, number>();
+      for (let i = 0; i < n * 4; i++) {
+        const k = pool.acquire();
+        counts.set(k, (counts.get(k) ?? 0) + 1);
+        pool.release(k);
+      }
+      expect(counts.size).toBe(n);
+      for (const c of counts.values()) expect(c).toBe(4);
+    }
+  });
+
+  it('并发请求优先选最闲的 key', () => {
+    const pool = new KeyPool(['a', 'b', 'c'], { ...OPTS });
+    // 不释放：a/b/c 各占 1 个并发
+    const held = [pool.acquire(), pool.acquire(), pool.acquire()];
+    expect(new Set(held).size).toBe(3);
+    // 释放 b 后，下一个必须选 b（inFlight 最低）
+    pool.release(held[1]!);
+    expect(pool.acquire()).toBe(held[1]);
+  });
+
+  it('某个 key 被禁用后，流量只在剩余 key 间均分', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a', 'b', 'c'], { ...OPTS, now: clock.now });
+    pool.markFailure('b', 'auth');
+    const counts = new Map<string, number>();
+    for (let i = 0; i < 8; i++) {
+      const k = pool.acquire();
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+      pool.release(k);
+    }
+    expect(counts.get('b')).toBeUndefined();
+    expect(counts.get('a')).toBe(4);
+    expect(counts.get('c')).toBe(4);
+  });
+
+  it('额度耗尽的 key 按重置时间长冷却，不反复回池撞墙', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
+    // 上游实测形态：Resets in 19hr 22min → 应冷却约 19 小时，而非 3 秒
+    pool.markFailure('a', 'quota-exhausted', 19 * 3_600_000);
+    expect(pool.healthyCount).toBe(1);
+    clock.advance(3_600_000); // 1 小时后仍不该恢复
+    expect(pool.healthyCount).toBe(1);
+    clock.advance(19 * 3_600_000); // 过了重置点才恢复
+    expect(pool.healthyCount).toBe(2);
+    // 冷却期内所有流量都走 b
+    expect(pool.acquire()).toBeTruthy();
   });
 });

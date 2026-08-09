@@ -56,9 +56,65 @@ export function anthropicErrorToOpenAI(status: number, body: unknown): OpenAIApi
   };
 }
 
+/** 从上游错误体提取重置延迟（毫秒）。 */
+export function resetDelayFrom(body: unknown): number | null {
+  const msg = extractUpstreamErrorMessage(body);
+  if (!msg) return null;
+  // 实测上游形态："Weekly usage limit reached. Resets in 19hr 22min."
+  const m = /Resets? in\s+(\d+)\s*(hr|hour|min|minute)s?/i.exec(msg);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const unit = m[2]!.toLowerCase();
+  return unit.startsWith('h') ? n * 3_600_000 : n * 60_000;
+}
+
+/**
+ * 从上游错误体直接提取重置延迟（毫秒）。
+ *
+ * 便于调用方手上只有解析后的错误体时使用；内部复用 [`parseResetDelayMs`]。
+ */
+export function resetDelayMsFromError(body: unknown): number | null {
+  return parseResetDelayMs(extractUpstreamErrorMessage(body));
+}
+
 /** 本地安全拦截返回的 4xx 错误。 */
 export function rejectionError(message: string, type = 'invalid_request_error'): OpenAIApiError {
   return { status: 400, body: { error: { message: stripControl(message), type } } };
+}
+
+/** 从上游错误体提取 message（兼容 `{error:{message}}` 与顶层 `{message}`）。 */
+function extractUpstreamErrorMessage(body: unknown): string {
+  if (body == null || typeof body !== 'object') return '';
+  const err = (body as { error?: unknown }).error;
+  if (err != null && typeof err === 'object') {
+    const m = (err as { message?: unknown }).message;
+    if (typeof m === 'string') return m;
+  }
+  const top = (body as { message?: unknown }).message;
+  return typeof top === 'string' ? top : '';
+}
+
+/**
+ * 从额度耗尽的错误文案里解析「多久后重置」，返回毫秒。
+ *
+ * 上游原文形如 `Weekly usage limit reached. Resets in 19hr 22min.`
+ * 解析不出来返回 null，由调用方用默认冷却。
+ */
+export function parseResetDelayMs(message: string): number | null {
+  if (!message) return null;
+  const m = /resets?\s+in\s+([^.]+)/i.exec(message);
+  if (!m) return null;
+  const span = m[1]!;
+  let ms = 0;
+  let hit = false;
+  const h = /(\d+)\s*(?:hr|hour)/i.exec(span);
+  if (h) { ms += Number(h[1]) * 3_600_000; hit = true; }
+  const min = /(\d+)\s*min/i.exec(span);
+  if (min) { ms += Number(min[1]) * 60_000; hit = true; }
+  const d = /(\d+)\s*day/i.exec(span);
+  if (d) { ms += Number(d[1]) * 86_400_000; hit = true; }
+  return hit ? ms : null;
 }
 
 /** 从上游错误体提取 error.type（兼容 Anthropic `{error:{type}}` 与 OpenAI `{error:{type}}`）。 */
@@ -80,10 +136,21 @@ function extractUpstreamErrorType(body: unknown): string | undefined {
 export function classifyUpstreamFailure(
   status: number,
   body: unknown,
-): 'auth' | 'rate-limit' | 'transient' {
-  if (status === 429) return 'rate-limit';
-
+): 'auth' | 'rate-limit' | 'quota-exhausted' | 'transient' {
   const errorType = extractUpstreamErrorType(body);
+  const errorMessage = extractUpstreamErrorMessage(body);
+
+  // 额度耗尽 ≠ 并发限流。前者按小时/天计（周额度、月配额），短冷却只会让请求
+  // 反复去撞同一个已耗尽的 key；后者几秒就恢复。必须分开，否则要么白等、
+  // 要么白撞。实测上游形态：429 + {"type":"GoUsageLimitError",
+  // "message":"Weekly usage limit reached. Resets in 19hr 22min."}
+  const quotaSignals =
+    errorType === 'GoUsageLimitError' ||
+    /usage[_ ]?limit|quota[_ ]?exceeded|out[_ ]of[_ ]credits/i.test(errorType ?? '') ||
+    /usage limit reached|quota exceeded|insufficient (?:balance|credit)/i.test(errorMessage);
+  if (quotaSignals) return 'quota-exhausted';
+
+  if (status === 429) return 'rate-limit';
   // 余额不足：HTTP 可能是 401/402/400，但错误体明确指向 billing/credits。
   if (
     errorType === 'billing_error' ||
