@@ -151,7 +151,9 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     margin-bottom: 16px; max-width: 100%; overflow-x: auto;
   }
   .ascii b { color: var(--accent); font-weight: 400; }
-  @media (max-width: 560px) { .ascii { font-size: 8px; } }
+  @media (max-width: 700px) { .ascii { font-size: 7px; } }
+  @media (max-width: 460px) { .ascii { display: none; } }
+  .tagline { color: var(--fg-weaker); font-size: 12px; margin: -6px 0 18px; }
 
   /* ── request log（放弃 15 列宽表，改成两行式条目：不挤不叠）──── */
   .log { border: 1px solid var(--line-weak); }
@@ -207,43 +209,46 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   <div class="stat-inline" id="h-pool">pool —</div>
   <div class="stat-inline" id="h-up">up —</div>
   <div class="stat-inline ok" id="h-live">[*] live</div>
+  <button id="btn-lang">中文</button>
   <button id="btn">pause</button>
 </header>
 
 <main>
-  <div class="ascii" aria-hidden="true"><b>█▀▀▀  █▀▀█  ▀█▀▀  █▀▀▀  █__█  █▀▀█  █__█</b>
-<b>█_^█  █^^█  _█__  █^^^  █^^█  █^^█  ▀██▀</b>
-<b>▀▀▀▀  ▀~~▀  _▀__  ▀▀▀▀  ▀▀▀▀  ▀~~▀  _▀▀_</b>
-openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
+  <div class="ascii" aria-hidden="true"><b>████ █  █  ███ █  █ ████ ████ ████ █  █  ███ ████ ███  ████
+█    █  █ █    █ █  █  █ █  █ █    ██ █ █    █  █ █  █ █
+███  █  █ █    ██   █  █ ████ ███  █ ██ █    █  █ █  █ ███
+█    █  █ █    █ █  █  █ █    █    █  █ █    █  █ █  █ █
+█    ████  ███ █  █ ████ █    ████ █  █  ███ ████ ███  ████</b></div>
+  <div class="tagline" id="t-tagline"></div>
 
   <section>
     <div class="sec-hd">
-      <h2>Overview</h2><span class="fig">Fig 1.</span>
+      <h2 data-i18n="overview">Overview</h2><span class="fig">Fig 1.</span>
       <span class="note" id="n-window">window 200</span>
     </div>
     <div class="grid cols-4">
       <div class="cell">
-        <div class="k">requests</div>
+        <div class="k" data-i18n="kRequests">requests</div>
         <div class="v" id="m-total">0</div>
-        <div class="d"><b class="s-ok" id="m-ok">0</b> ok · <b class="s-bad" id="m-fail">0</b> fail · <b id="m-stream">0</b> stream</div>
+        <div class="d" id="d-req"></div>
         <svg class="spark" id="sp-req" preserveAspectRatio="none"></svg>
       </div>
       <div class="cell">
-        <div class="k">latency</div>
+        <div class="k" data-i18n="kLatency">latency</div>
         <div class="v" id="m-avg">0<i>ms</i></div>
-        <div class="d">p95 <b id="m-p95">0</b>ms · last <b id="m-last">0</b>ms</div>
+        <div class="d" id="d-lat"></div>
         <svg class="spark" id="sp-lat" preserveAspectRatio="none"></svg>
       </div>
       <div class="cell">
-        <div class="k">tokens</div>
+        <div class="k" data-i18n="kTokens">tokens</div>
         <div class="v" id="m-tok">0</div>
-        <div class="d">in <b id="m-in">0</b> · out <b id="m-out">0</b> · think <b id="m-think">0</b></div>
+        <div class="d" id="d-tok"></div>
         <svg class="spark" id="sp-tok" preserveAspectRatio="none"></svg>
       </div>
       <div class="cell">
-        <div class="k">devices</div>
+        <div class="k" data-i18n="kDevices">devices</div>
         <div class="v" id="m-dev">0</div>
-        <div class="d"><b id="m-clients">0</b> clients · <b id="m-models">0</b> models</div>
+        <div class="d" id="d-dev"></div>
         <svg class="spark" id="sp-dev" preserveAspectRatio="none"></svg>
       </div>
     </div>
@@ -251,7 +256,7 @@ openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
 
   <section>
     <div class="sec-hd">
-      <h2>Pipeline</h2><span class="fig">Fig 2.</span>
+      <h2 data-i18n="pipeline">Pipeline</h2><span class="fig">Fig 2.</span>
       <span class="note" id="n-pipe">idle</span>
     </div>
     <div class="pipe" id="pipe"></div>
@@ -259,30 +264,30 @@ openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
 
   <section class="grid cols-3" style="background:transparent;border:0;gap:28px">
     <div style="grid-column:span 1">
-      <div class="sec-hd"><h2>Models</h2><span class="fig">Fig 3.</span></div>
+      <div class="sec-hd"><h2 data-i18n="models">Models</h2><span class="fig">Fig 3.</span></div>
       <div class="bars" id="b-model"></div>
     </div>
     <div style="grid-column:span 1">
-      <div class="sec-hd"><h2>Clients</h2><span class="fig">Fig 4.</span></div>
+      <div class="sec-hd"><h2 data-i18n="clients">Clients</h2><span class="fig">Fig 4.</span></div>
       <div class="bars" id="b-client"></div>
     </div>
     <div style="grid-column:span 1">
-      <div class="sec-hd"><h2>Devices</h2><span class="fig">Fig 5.</span></div>
+      <div class="sec-hd"><h2 data-i18n="devices">Devices</h2><span class="fig">Fig 5.</span></div>
       <div class="devs" id="devs"></div>
     </div>
   </section>
 
   <section>
     <div class="sec-hd">
-      <h2>Requests</h2><span class="fig">Fig 6.</span>
-      <span class="note">most recent first</span>
+      <h2 data-i18n="requests">Requests</h2><span class="fig">Fig 6.</span>
+      <span class="note" data-i18n="recentFirst">most recent first</span>
     </div>
     <div class="log">
       <div class="log-hd">
-        <span>time</span><span>status</span><span>request</span>
-        <span class="ta-r">ms</span><span class="ta-r">tokens</span><span>client</span>
+        <span data-i18n="hTime">time</span><span data-i18n="hStatus">status</span><span data-i18n="hRequest">request</span>
+        <span class="ta-r" data-i18n="hMs">ms</span><span class="ta-r" data-i18n="hTokens">tokens</span><span data-i18n="hClient">client</span>
       </div>
-      <div id="rows"><div class="empty">no requests yet</div></div>
+      <div id="rows"><div class="empty" data-i18n="noReq">no requests yet</div></div>
     </div>
   </section>
 
@@ -292,6 +297,71 @@ openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
 <script>
 (function () {
   var paused = false, topId = 0;
+
+  /**
+   * 中英文词条。默认跟随浏览器语言（zh 开头用中文），可手动切换并存 localStorage。
+   * 只译界面文案；模型名、路径、协议名这类标识符不译。
+   */
+  var I18N = {
+    en: {
+      tagline: 'openai <-> anthropic protocol gateway · deepseek via opencode zen',
+      overview: 'Overview', pipeline: 'Pipeline', models: 'Models',
+      clients: 'Clients', devices: 'Devices', requests: 'Requests',
+      recentFirst: 'most recent first',
+      kRequests: 'requests', kLatency: 'latency', kTokens: 'tokens', kDevices: 'devices',
+      hTime: 'time', hStatus: 'status', hRequest: 'request', hMs: 'ms', hTokens: 'tokens', hClient: 'client',
+      noReq: 'no requests yet', noData: 'no data', noDev: 'no devices',
+      ok: 'ok', fail: 'fail', stream: 'stream', last: 'last',
+      inTok: 'in', outTok: 'out', thinkTok: 'think',
+      nClients: 'clients', nModels: 'models',
+      pause: 'pause', resume: 'resume', live: 'live',
+      pool: 'pool', up: 'up', inWindow: 'in window',
+      idle: 'idle', active: 'active',
+      pClient: 'client', pIngress: 'ingress', pConvert: 'convert', pUpstream: 'upstream', pEgress: 'egress',
+      passthrough: 'passthrough', sub: 'subscription', payg: 'pay-as-you-go',
+      sse: 'sse stream', single: 'single body',
+      fallback: 'fallback', upModels: 'upstream models', injection: 'injection',
+      poll: 'poll 2s · in-memory', mobile: 'mobile', langBtn: '中文'
+    },
+    zh: {
+      tagline: 'OpenAI 与 Anthropic 协议转换网关 · 经 opencode zen 使用 DeepSeek',
+      overview: '总览', pipeline: '数据流动', models: '模型分布',
+      clients: '客户端', devices: '设备', requests: '请求明细',
+      recentFirst: '最新在前',
+      kRequests: '请求总数', kLatency: '响应耗时', kTokens: 'Token 用量', kDevices: '活跃设备',
+      hTime: '时间', hStatus: '状态', hRequest: '请求', hMs: '毫秒', hTokens: 'Token', hClient: '客户端',
+      noReq: '暂无请求', noData: '暂无数据', noDev: '暂无设备',
+      ok: '成功', fail: '失败', stream: '流式', last: '最近',
+      inTok: '入', outTok: '出', thinkTok: '思考',
+      nClients: '种客户端', nModels: '个模型',
+      pause: '暂停', resume: '继续', live: '实时',
+      pool: 'Key 池', up: '运行', inWindow: '在窗口内',
+      idle: '空闲', active: '进行中',
+      pClient: '客户端', pIngress: '入口协议', pConvert: '协议转换', pUpstream: '上游', pEgress: '回传',
+      passthrough: '直通', sub: '订阅端点', payg: '按量付费',
+      sse: 'SSE 流式', single: '整包返回',
+      fallback: '兜底模型', upModels: '个可用模型', injection: '注入检测',
+      poll: '每 2 秒轮询 · 内存存储', mobile: '移动端',
+      langBtn: 'EN'
+    }
+  };
+  var lang = (function () {
+    try { var v = localStorage.getItem('fc-lang'); if (v === 'zh' || v === 'en') return v; } catch (e) {}
+    return /^zh/i.test(navigator.language || '') ? 'zh' : 'en';
+  })();
+  var T = function (k) { return (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k; };
+
+  /** 把所有 data-i18n 节点刷成当前语言。 */
+  function applyLang() {
+    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+    var nodes = document.querySelectorAll('[data-i18n]');
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].textContent = T(nodes[i].getAttribute('data-i18n'));
+    }
+    document.getElementById('t-tagline').textContent = T('tagline');
+    document.getElementById('btn-lang').textContent = T('langBtn');
+    document.getElementById('btn').textContent = paused ? T('resume') : T('pause');
+  }
   var hist = { req: [], lat: [], tok: [], dev: [] };
   var $ = function (id) { return document.getElementById(id); };
   var esc = function (s) {
@@ -345,23 +415,23 @@ openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
   function pipeline(e) {
     var on = e && (Date.now() - e.at) < 4000;
     var steps = [
-      ['client', e ? e.device.client : '—'],
-      ['ingress', e ? e.protocol : '—'],
-      ['convert', e ? (e.protocol === 'anthropic' ? 'anthropic -> openai' : 'passthrough') : '—'],
-      ['upstream', e ? (e.endpoint === 'payg' ? 'pay-as-you-go' : e.endpoint === 'subscription' ? 'subscription' : '—') : '—'],
-      ['egress', e ? (e.stream ? 'sse stream' : 'single body') : '—']
+      [T('pClient'), e ? e.device.client : '—'],
+      [T('pIngress'), e ? e.protocol : '—'],
+      [T('pConvert'), e ? (e.protocol === 'anthropic' ? 'anthropic -> openai' : T('passthrough')) : '—'],
+      [T('pUpstream'), e ? (e.endpoint === 'payg' ? T('payg') : e.endpoint === 'subscription' ? T('sub') : '—') : '—'],
+      [T('pEgress'), e ? (e.stream ? T('sse') : T('single')) : '—']
     ];
     $('pipe').innerHTML = steps.map(function (s) {
       return '<div class="st' + (on ? ' on' : '') + '"><div class="n">' + s[0] + '</div><div class="b">' + esc(s[1]) + '</div></div>';
     }).join('');
     $('n-pipe').textContent = e
       ? (e.model || '-') + ' -> ' + (e.upstreamModel || '-') + ' · ' + e.durationMs + 'ms · ' +
-        fmt(e.inputTokens) + '/' + fmt(e.outputTokens) + ' tok' + (on ? ' · active' : '')
-      : 'idle';
+        fmt(e.inputTokens) + '/' + fmt(e.outputTokens) + ' tok' + (on ? ' · ' + T('active') : '')
+      : T('idle');
   }
 
   function bars(el, items, name, count) {
-    if (!items.length) { el.innerHTML = '<div class="w" style="padding:7px 0">no data</div>'; return; }
+    if (!items.length) { el.innerHTML = '<div class="w" style="padding:7px 0">' + T('noData') + '</div>'; return; }
     var max = Math.max.apply(null, items.map(count));
     el.innerHTML = items.map(function (it) {
       return '<div class="bar"><span class="n">' + esc(name(it)) + '</span><span class="c">' + fmt(count(it)) + '</span>' +
@@ -375,10 +445,10 @@ openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
       var k = ev[i].device.ip + '|' + ev[i].device.ua;
       if (seen[k]) continue; seen[k] = 1; out.push(ev[i]);
     }
-    if (!out.length) { $('devs').innerHTML = '<div class="w" style="padding:7px 0">no devices</div>'; return; }
+    if (!out.length) { $('devs').innerHTML = '<div class="w" style="padding:7px 0">' + T('noDev') + '</div>'; return; }
     $('devs').innerHTML = out.map(function (e) {
       var d = e.device;
-      return '<div class="dev"><div class="hd">' + esc(d.client) + ' <em>' + esc(d.os) + (d.mobile ? ' · mobile' : '') + '</em></div>' +
+      return '<div class="dev"><div class="hd">' + esc(d.client) + ' <em>' + esc(d.os) + (d.mobile ? ' · ' + T('mobile') : '') + '</em></div>' +
         '<dl><dt>ip</dt><dd>' + esc(d.ip || '-') + (d.viaProxy ? ' <span class="s-acc">[cdn]</span>' : '') + '</dd>' +
         (d.forwardedFor ? '<dt>xff</dt><dd>' + esc(d.forwardedFor) + '</dd>' : '') +
         (d.language ? '<dt>lang</dt><dd>' + esc(d.language) + '</dd>' : '') +
@@ -426,36 +496,43 @@ openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
 
   function apply(m) {
     var s = m.summary, ev = m.events;
+    var b = function (v, cls) { return '<b' + (cls ? ' class="' + cls + '"' : '') + '>' + v + '</b>'; };
+
     $('m-total').textContent = fmt(m.totalRequests);
-    $('m-ok').textContent = fmt(s.ok);
-    $('m-fail').textContent = fmt(s.failed);
-    $('m-stream').textContent = fmt(s.streaming);
+    $('d-req').innerHTML =
+      b(fmt(s.ok), 's-ok') + ' ' + T('ok') + ' · ' +
+      b(fmt(s.failed), 's-bad') + ' ' + T('fail') + ' · ' +
+      b(fmt(s.streaming)) + ' ' + T('stream');
+
     $('m-avg').innerHTML = fmt(s.avgDurationMs) + '<i>ms</i>';
-    $('m-p95').textContent = fmt(s.p95DurationMs);
-    $('m-last').textContent = ev.length ? ev[0].durationMs : 0;
+    $('d-lat').innerHTML =
+      'p95 ' + b(fmt(s.p95DurationMs)) + 'ms · ' +
+      T('last') + ' ' + b(ev.length ? ev[0].durationMs : 0) + 'ms';
+
     $('m-tok').textContent = fmt(s.inputTokens + s.outputTokens);
-    $('m-in').textContent = fmt(s.inputTokens);
-    $('m-out').textContent = fmt(s.outputTokens);
-    $('m-think').textContent = fmt(s.thinkingTokens);
+    $('d-tok').innerHTML =
+      T('inTok') + ' ' + b(fmt(s.inputTokens)) + ' · ' +
+      T('outTok') + ' ' + b(fmt(s.outputTokens)) + ' · ' +
+      T('thinkTok') + ' ' + b(fmt(s.thinkingTokens));
 
     var dv = {}; ev.forEach(function (e) { dv[e.device.ip + '|' + e.device.ua] = 1; });
     var nDev = Object.keys(dv).length;
     $('m-dev').textContent = fmt(nDev);
-    $('m-clients').textContent = s.byClient.length;
-    $('m-models').textContent = s.byModel.length;
+    $('d-dev').innerHTML =
+      b(s.byClient.length) + ' ' + T('nClients') + ' · ' + b(s.byModel.length) + ' ' + T('nModels');
 
     var p = $('h-pool');
-    p.textContent = 'pool ' + m.pool.healthy + '/' + m.pool.size;
+    p.textContent = T('pool') + ' ' + m.pool.healthy + '/' + m.pool.size;
     p.className = 'stat-inline ' + (m.pool.size === 0 || m.pool.healthy === 0 ? 'bad' : m.pool.healthy < m.pool.size ? '' : 'ok');
-    $('h-up').textContent = 'up ' + upt(m.uptimeMs);
-    $('n-window').textContent = ev.length + ' / 200 in window';
+    $('h-up').textContent = T('up') + ' ' + upt(m.uptimeMs);
+    $('n-window').textContent = ev.length + ' / 200 ' + T('inWindow');
     $('foot').innerHTML = [
       'subscription <em style="font-style:normal;color:var(--fg-weak)">' + esc(m.config.subscriptionBaseUrl) + '</em>',
       'pay-as-you-go <em style="font-style:normal;color:var(--fg-weak)">' + esc(m.config.paygBaseUrl) + '</em>',
-      'fallback <em style="font-style:normal;color:var(--fg-weak)">' + esc(m.config.fallbackModel) + '</em>',
-      m.config.upstreamModels.length + ' upstream models',
-      'injection ' + esc(m.config.injectionMode),
-      'poll 2s · in-memory'
+      T('fallback') + ' <em style="font-style:normal;color:var(--fg-weak)">' + esc(m.config.fallbackModel) + '</em>',
+      m.config.upstreamModels.length + ' ' + T('upModels'),
+      T('injection') + ' ' + esc(m.config.injectionMode),
+      T('poll')
     ].map(function (s) { return '<span>' + s + '</span>'; }).join('');
 
     push('req', m.totalRequests); push('lat', s.avgDurationMs);
@@ -472,15 +549,25 @@ openai &lt;-&gt; anthropic protocol gateway · deepseek via opencode zen</div>
     if (paused) return;
     fetch('/__metrics', { headers: { accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error(String(r.status))); })
-      .then(function (m) { $('h-live').className = 'stat-inline ok'; $('h-live').textContent = '[*] live'; apply(m); })
+      .then(function (m) { $('h-live').className = 'stat-inline ok'; $('h-live').textContent = '[*] ' + T('live'); apply(m); })
       .catch(function (e) { $('h-live').className = 'stat-inline bad'; $('h-live').textContent = '[!] ' + e.message; });
   }
 
   $('btn').addEventListener('click', function () {
     paused = !paused;
-    this.textContent = paused ? 'resume' : 'pause';
+    this.textContent = paused ? T('resume') : T('pause');
     if (!paused) tick();
   });
+
+  $('btn-lang').addEventListener('click', function () {
+    lang = lang === 'zh' ? 'en' : 'zh';
+    try { localStorage.setItem('fc-lang', lang); } catch (e) {}
+    applyLang();
+    // 立刻拉一次，让动态区（流水线/空态/明细）也跟着换语言。
+    if (!paused) tick();
+  });
+
+  applyLang();
   tick(); setInterval(tick, 2000);
   window.addEventListener('resize', redraw);
 })();

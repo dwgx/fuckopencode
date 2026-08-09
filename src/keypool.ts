@@ -165,8 +165,14 @@ export class KeyPool {
     }
 
     if (kind === 'rate-limit') {
-      // 429 不累计禁用计数：只给该 key 一个短冷却，让其他 key 顶上。
-      k.disabledUntil = now + Math.max(1000, Math.floor(this.opts.cooldownMs / 6));
+      // 429 / 余额不足：只打**很短**的冷却，不累计禁用计数。
+      //
+      // 冷却必须短：429 与余额不足通常是**账号级**状态，换 key 也解决不了，
+      // 而 key 数量往往很少（线上 2 个）。用 cooldownMs/6（默认 50s）会让
+      // 连续两次 429 就把整池打光、之后 50 秒全部 503 —— Claude Code 遇 503
+      // 直接报错中断，表现为「用一会儿就挂」。所以这里固定 3 秒上限，
+      // 让请求快速重回池子，把重试节奏交给客户端而不是拖死整池。
+      k.disabledUntil = now + Math.min(3000, Math.max(500, Math.floor(this.opts.cooldownMs / 100)));
       return;
     }
 

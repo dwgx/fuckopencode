@@ -41,6 +41,13 @@ export interface AppConfig {
    * 等设备信息，绑非回环时必须带 key 才能看。
    */
   dashboardOpen: boolean;
+  /**
+   * 面板是否完全公开（含公网）。默认关。
+   *
+   * 打开后任何人都能看到全部调用方的 IP、完整 UA、转发链 —— 这是刻意的取舍，
+   * 用于「把面板当展示页」的场景。不需要展示时设 0，退回本机免 key 的行为。
+   */
+  dashboardPublic: boolean;
 }
 
 function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
@@ -119,12 +126,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     fallbackModel: env.DEFAULT_MODEL || 'deepseek-v4-flash',
     injectionMode,
     allowUnauthenticated: boolFromEnv(env.ALLOW_UNAUTHENTICATED, false) && hostnameIsSafe(host),
-    maxBodyBytes: intFromEnv(env.MAX_BODY_BYTES, 10 * 1024 * 1024),
-    maxMessageChars: intFromEnv(env.MAX_MESSAGE_CHARS, 200_000),
+    // DeepSeek V4 是 1M token 上下文（约 400 万字符）。默认值必须留足余量，
+    // 否则 Claude Code 读个大文件就被网关自己拒掉（曾因 200_000 导致线上 400）。
+    // 两者都支持 0 = 不限制。
+    maxBodyBytes: intFromEnv(env.MAX_BODY_BYTES, 64 * 1024 * 1024),
+    maxMessageChars: intFromEnv(env.MAX_MESSAGE_CHARS, 8_000_000),
     stripControlChars: boolFromEnv(env.STRIP_CONTROL_CHARS, true),
     trustClaudeCodeHeaders: boolFromEnv(env.TRUST_CLAUDE_CODE_HEADERS, false),
     // 面板含设备信息，只在本机绑定时免鉴权。
     dashboardOpen: boolFromEnv(env.DASHBOARD_OPEN, true) && hostnameIsSafe(host),
+    // 完全公开需显式开启，避免「不知不觉把 IP 记录挂到公网」。
+    dashboardPublic: boolFromEnv(env.DASHBOARD_PUBLIC, false),
   };
 }
 

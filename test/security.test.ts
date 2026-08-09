@@ -29,6 +29,7 @@ const cfg: AppConfig = {
   stripControlChars: true,
   trustClaudeCodeHeaders: false,
   dashboardOpen: false,
+  dashboardPublic: false,
 };
 
 describe('detectInjection', () => {
@@ -391,7 +392,8 @@ describe('loadConfig', () => {
   });
 
   it('MAX_MESSAGE_CHARS 空字符串走 fallback', () => {
-    expect(loadConfig({ MAX_MESSAGE_CHARS: '' }).maxMessageChars).toBe(200_000);
+    // 默认值按 DeepSeek V4 的 1M token 上下文留余量（约 400 万字符 × 2）。
+    expect(loadConfig({ MAX_MESSAGE_CHARS: '' }).maxMessageChars).toBe(8_000_000);
   });
 });
 
@@ -405,5 +407,52 @@ describe('isJsonContentType', () => {
     expect(isJsonContentType('text/plain')).toBe(false);
     expect(isJsonContentType(undefined)).toBe(false);
     expect(isJsonContentType(['text/plain', 'application/json'])).toBe(false);
+  });
+});
+
+describe('大上下文不被网关自己拒掉（DeepSeek V4 是 1M token）', () => {
+  // 回归测试：曾因 maxMessageChars 默认 200_000，Claude Code 读大文件就 400。
+  const bigCfg: AppConfig = { ...cfg, maxMessageChars: 8_000_000, maxBodyBytes: 64 * 1024 * 1024 };
+
+  it('30 万字符的单条消息放行（旧默认值会拒）', () => {
+    const r = validateAnthropicRequest(
+      { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(300_000) }] }] },
+      bigCfg,
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('400 万字符（约 1M token）放行', () => {
+    const r = validateAnthropicRequest(
+      { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'x'.repeat(4_000_000) }] },
+      bigCfg,
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('maxMessageChars=0 表示完全不限制', () => {
+    const unlimited: AppConfig = { ...cfg, maxMessageChars: 0 };
+    const r = validateAnthropicRequest(
+      { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'x'.repeat(20_000_000) }] },
+      unlimited,
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('非 0 时仍然生效（防 DoS 能力没丢）', () => {
+    const small: AppConfig = { ...cfg, maxMessageChars: 100 };
+    const r = validateAnthropicRequest(
+      { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'x'.repeat(101) }] },
+      small,
+    );
+    expect(r.ok).toBe(false);
+  });
+
+  it('chat 端点同样放行大上下文', () => {
+    const r = validateChatRequest(
+      { model: 'm', messages: [{ role: 'user', content: 'x'.repeat(300_000) }] },
+      bigCfg,
+    );
+    expect(r.ok).toBe(true);
   });
 });

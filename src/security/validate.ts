@@ -42,7 +42,7 @@ export function validateChatRequest(body: unknown, cfg: AppConfig): ValidationRe
     if (typeof req.system !== 'string') {
       return { ok: false, error: 'system must be a string' };
     }
-    if (req.system.length > cfg.maxMessageChars) {
+    if (cfg.maxMessageChars > 0 && req.system.length > cfg.maxMessageChars) {
       return { ok: false, error: `system exceeds ${cfg.maxMessageChars} chars` };
     }
   }
@@ -74,7 +74,7 @@ export function validateChatRequest(body: unknown, cfg: AppConfig): ValidationRe
     }
 
     if (typeof m.content === 'string') {
-      if (m.content.length > cfg.maxMessageChars) {
+      if (cfg.maxMessageChars > 0 && m.content.length > cfg.maxMessageChars) {
         return { ok: false, error: `messages[${i}].content exceeds ${cfg.maxMessageChars} chars` };
       }
     } else if (Array.isArray(m.content)) {
@@ -92,7 +92,7 @@ export function validateChatRequest(body: unknown, cfg: AppConfig): ValidationRe
           if (typeof p.text !== 'string') {
             return { ok: false, error: `messages[${i}].content[${j}].text must be a string` };
           }
-          if (p.text.length > cfg.maxMessageChars) {
+          if (cfg.maxMessageChars > 0 && p.text.length > cfg.maxMessageChars) {
             return { ok: false, error: `messages[${i}].content[${j}] exceeds ${cfg.maxMessageChars} chars` };
           }
         }
@@ -202,7 +202,7 @@ export function validateAnthropicRequest(body: unknown, cfg: AppConfig): Validat
     if (typeof content !== 'string' && !Array.isArray(content)) {
       return { ok: false, error: `messages[${i}].content must be a string or array` };
     }
-    if (contentCharCount(content) > cfg.maxMessageChars) {
+    if (cfg.maxMessageChars > 0 && contentCharCount(content) > cfg.maxMessageChars) {
       return { ok: false, error: `messages[${i}].content exceeds ${cfg.maxMessageChars} chars` };
     }
     if (Array.isArray(content)) {
