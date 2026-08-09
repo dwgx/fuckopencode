@@ -6,7 +6,7 @@ import type {
   RequestConvertOptions,
 } from './types.js';
 import { extractSystem, normalizeMessages } from './normalize.js';
-import { injectMissingThinkingBlocks } from './deepseek.js';
+import { DEEPSEEK_MIN_MAX_TOKENS, injectMissingThinkingBlocks } from './deepseek.js';
 import {
   openAIToolChoiceToAnthropic,
   openAIToolsToAnthropic,
@@ -56,7 +56,7 @@ function jsonModeTool(responseFormat: OpenAIChatRequest['response_format']): Ant
  * - `response_format` → 注入 json_mode 工具并强制 tool_choice。
  * - `parallel_tool_calls:false` → 仅 tool_choice 为 auto 时合并
  *   disable_parallel_tool_use（tool/any/none 时该字段无效，忽略）。
- * - `reasoning_effort` → Anthropic 顶层 `reasoning_effort`（response_format 时跳过）。
+ * - `reasoning_effort` → `output_config.effort`（deepseek 形态；response_format 时跳过）。
  * - `stop` → `stop_sequences`（剔纯空白项）。
  * - Anthropic 不支持的字段（frequency_penalty / presence_penalty / n /
  *   logit_bias / seed / user / logprobs）静默丢弃。
@@ -93,10 +93,11 @@ export function openAIToAnthropicRequest(
     out.temperature = Math.min(1, Math.max(0, req.temperature));
   }
   if (req.top_p != null) out.top_p = req.top_p;
-  // reasoning_effort：OpenAI → Anthropic 顶层字段（deepseek 原生支持）。
-  // response_format 已强制 thinking disabled，与其冲突则不映射。
+  // reasoning_effort → output_config.effort。deepseek 不认顶层 reasoning_effort
+  // （见 deepseek.ts 的坑位清单），必须转成 output_config.effort 才不会 400。
+  // response_format 已强制 thinking disabled，与 effort 冲突则不映射。
   if (req.response_format == null && typeof req.reasoning_effort === 'string') {
-    out.reasoning_effort = req.reasoning_effort;
+    out.output_config = { effort: req.reasoning_effort };
   }
   if (req.stop != null) {
     const stops = (typeof req.stop === 'string' ? [req.stop] : req.stop).filter((s) => s.trim() !== '');
@@ -146,6 +147,12 @@ export function openAIToAnthropicRequest(
       out.thinking = { type: 'enabled', budget_tokens: 1024 };
     }
     injectMissingThinkingBlocks(out as unknown as Record<string, unknown>);
+    // 与 /v1/messages 端点对齐：thinking 计入 deepseek 的 max_tokens 预算，
+    // 客户端小预算会被 thinking 吃光导致正文为空。这里刚开启 thinking，
+    // 必须同样抬到下限，否则多轮工具的第二轮只出 thinking 不出 text。
+    if (out.max_tokens < DEEPSEEK_MIN_MAX_TOKENS) {
+      out.max_tokens = DEEPSEEK_MIN_MAX_TOKENS;
+    }
   }
 
   return out;

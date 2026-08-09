@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { AnthropicContentBlock, AnthropicMessage, OpenAIMessage } from './types.js';
 import { openAIImageToAnthropic } from './image.js';
+import { sanitizeToolName } from './tool.js';
 
 /**
  * 提取所有 system 消息，拼接为 Anthropic 顶层 system 字符串。
@@ -82,7 +83,9 @@ function toPending(msg: OpenAIMessage, state: NormalizeState): PendingMessage {
         id = genToolId();
         state.toolUseIdQueue.push(id);
       }
-      blocks.push({ type: 'tool_use', id, name: tc.function.name, input });
+      // 名字必须与 tools 定义里的消毒结果一致（openAIToolsToAnthropic 同样消毒），
+      // 否则历史 tool_use.name 与工具定义不匹配，上游认不出这个工具。
+      blocks.push({ type: 'tool_use', id, name: sanitizeToolName(tc.function.name), input });
     }
     return { role: 'assistant', blocks, hasToolResult: false };
   }

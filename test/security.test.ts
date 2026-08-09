@@ -15,7 +15,11 @@ const cfg: AppConfig = {
   port: 0,
   apiKeys: ['secret-key'],
   anthropicApiKey: 'sk-ant-fake',
+  upstreamKeys: ['sk-ant-fake'],
+  keyFailThreshold: 5,
+  keyCooldownMs: 300_000,
   anthropicBaseUrl: 'https://api.anthropic.com',
+  payAsYouGoBaseUrl: 'http://placeholder-payg',
   modelMap: {},
   fallbackModel: 'deepseek-v4-flash',
   injectionMode: 'block',
@@ -24,6 +28,7 @@ const cfg: AppConfig = {
   maxMessageChars: 200_000,
   stripControlChars: true,
   trustClaudeCodeHeaders: false,
+  dashboardOpen: false,
 };
 
 describe('detectInjection', () => {

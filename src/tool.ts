@@ -6,14 +6,41 @@ import type {
 } from './types.js';
 
 /**
- * 递归清洗 JSON Schema，去掉 Anthropic 不认/会 400 的关键字
- * （$ref、$schema、format），避免结构化输出时上游拒绝。
+ * 递归清洗 JSON Schema，去掉 Anthropic/deepseek 不认或会 400 的关键字，
+ * 避免结构化输出时上游拒绝。
+ *
+ * 白名单外关键字（anyOf/oneOf/allOf/$ref/$schema/format 等）一律剥离。
+ * $ref 在单 schema 上下文无法解析 → 降级为宽松 `{type:'object'}`，防透传被拒。
  */
 export function sanitizeInputSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  // $ref 无法在单 schema 上下文解析 → 降级宽松 object，避免把引用原样透传给上游被拒。
+  if ('$ref' in schema) {
+    return { type: 'object' };
+  }
+
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (key === '$ref' || key === '$schema' || key === 'format') continue;
-    if (value != null && typeof value === 'object' && !Array.isArray(value)) {
+    // 白名单剥离：只保留 type/properties/required/items/additionalProperties/description/enum，
+    // 其余（anyOf/oneOf/allOf/$ref/$schema/format/pattern 等）全部丢弃。
+    if (!SCHEMA_KEEP_KEYS.has(key)) continue;
+
+    if (key === 'properties') {
+      // properties 的值是「属性名 → 子 schema」映射：键（属性名）必须保留，
+      // 只递归清洗每个子 schema，不能把整个 properties 当 schema 剥键。
+      if (value != null && typeof value === 'object' && !Array.isArray(value)) {
+        const props: Record<string, unknown> = {};
+        for (const [propName, propSchema] of Object.entries(value as Record<string, unknown>)) {
+          if (propSchema != null && typeof propSchema === 'object' && !Array.isArray(propSchema)) {
+            props[propName] = sanitizeInputSchema(propSchema as Record<string, unknown>);
+          } else {
+            props[propName] = propSchema;
+          }
+        }
+        out[key] = props;
+      } else {
+        out[key] = value;
+      }
+    } else if (value != null && typeof value === 'object' && !Array.isArray(value)) {
       out[key] = sanitizeInputSchema(value as Record<string, unknown>);
     } else if (Array.isArray(value)) {
       out[key] = value.map((item) =>
@@ -27,6 +54,17 @@ export function sanitizeInputSchema(schema: Record<string, unknown>): Record<str
   }
   return out;
 }
+
+/** sanitizeInputSchema 白名单键（对齐 KiroStudio converter 的七键白名单）。 */
+const SCHEMA_KEEP_KEYS = new Set([
+  'type',
+  'properties',
+  'required',
+  'items',
+  'additionalProperties',
+  'description',
+  'enum',
+]);
 
 /** 工具名消毒：只留 [a-zA-Z0-9_-]，超长截断，防注入/非法名。 */
 export function sanitizeToolName(name: string): string {

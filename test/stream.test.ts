@@ -66,9 +66,26 @@ describe('anthropicStreamToOpenAI', () => {
     const chunks = await collect(
       anthropicStreamToOpenAI(iter([{ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'x' } }])),
     );
-    expect(chunks).toHaveLength(1);
+    // 内容 chunk + 补发的收尾 chunk（上游没给 message_delta/message_stop 也要有 finish_reason）。
+    expect(chunks).toHaveLength(2);
     expect(chunks[0]!.model).toBe('');
     expect(typeof chunks[0]!.id).toBe('string');
+    expect(chunks[1]!.choices[0]!.finish_reason).toBe('stop');
+  });
+
+  it('上游只发 message_stop（漏 message_delta）时补发 finish_reason', async () => {
+    const chunks = await collect(
+      anthropicStreamToOpenAI(
+        iter([
+          { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    const last = chunks.at(-1)!;
+    expect(last.choices[0]!.finish_reason).toBe('stop');
+    // 只补一个收尾 chunk，不重复发。
+    expect(chunks.filter((c) => c.choices[0]?.finish_reason != null)).toHaveLength(1);
   });
 
   it('includeUsage=true：usage 拆到独立尾 chunk（choices:[]），finish chunk 不带 usage', async () => {

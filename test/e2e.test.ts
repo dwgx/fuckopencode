@@ -2,31 +2,37 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { createApp } from '../src/server.js';
 import type { AppConfig } from '../src/config.js';
-import type { AnthropicRequest } from '../src/types.js';
+import type { OpenAIChatRequest } from '../src/types.js';
 
-interface FakeAnthropic {
+interface FakeUpstream {
   server: Server;
   baseUrl: string;
-  received: AnthropicRequest[];
+  /** 上游收到的 OpenAI 请求体（网关现在统一走 OpenAI 协议出去）。 */
+  received: OpenAIChatRequest[];
   receivedHeaders: Array<Record<string, string>>;
 }
 
-/** 起一个 fake Anthropic /v1/messages 服务，记录收到的请求与关键头，按 stream 返回。 */
-async function startFakeAnthropic(): Promise<FakeAnthropic> {
-  const received: AnthropicRequest[] = [];
+/**
+ * 起一个 fake **OpenAI** /v1/chat/completions 服务。
+ *
+ * 网关对上游统一说 OpenAI（opencode Zen 的 Anthropic 兼容层工具调用是坏的），
+ * 所以假上游也必须是 OpenAI 协议。同时提供 /v1/models 供启动时拉清单。
+ */
+async function startFakeUpstream(): Promise<FakeUpstream> {
+  const received: OpenAIChatRequest[] = [];
   const receivedHeaders: Array<Record<string, string>> = [];
   const server = createServer((req, res) => {
-    // count_tokens 记账端点。
-    if (req.method === 'POST' && req.url === '/v1/messages/count_tokens') {
-      let buf = '';
-      req.on('data', (c) => (buf += c));
-      req.on('end', () => {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ input_tokens: 42 }));
-      });
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          object: 'list',
+          data: [{ id: 'claude-x' }, { id: 'deepseek-v4-flash' }, { id: 'deepseek-v4-flash-free' }],
+        }),
+      );
       return;
     }
-    if (req.method !== 'POST' || req.url !== '/v1/messages') {
+    if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
       res.writeHead(404);
       res.end();
       return;
@@ -34,51 +40,44 @@ async function startFakeAnthropic(): Promise<FakeAnthropic> {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
-      const parsed = JSON.parse(body) as AnthropicRequest;
+      const parsed = JSON.parse(body) as OpenAIChatRequest;
       received.push(parsed);
       receivedHeaders.push({
-        'anthropic-beta': typeof req.headers['anthropic-beta'] === 'string' ? req.headers['anthropic-beta'] : '',
-        'x-claude-code-session-id': typeof req.headers['x-claude-code-session-id'] === 'string' ? req.headers['x-claude-code-session-id'] : '',
+        'anthropic-beta':
+          typeof req.headers['anthropic-beta'] === 'string' ? req.headers['anthropic-beta'] : '',
+        'x-claude-code-session-id':
+          typeof req.headers['x-claude-code-session-id'] === 'string'
+            ? req.headers['x-claude-code-session-id']
+            : '',
+        authorization: typeof req.headers.authorization === 'string' ? req.headers.authorization : '',
       });
+
       if (parsed.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
-        const events = [
-          {
-            type: 'message_start',
-            message: {
-              id: 'msg_fake',
-              type: 'message',
-              role: 'assistant',
-              model: 'claude-x',
-              content: [],
-              stop_reason: null,
-              stop_sequence: null,
-              usage: { input_tokens: 5, output_tokens: 0 },
-            },
-          },
-          { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
-          { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '你' } },
-          { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '好' } },
-          { type: 'content_block_stop', index: 0 },
-          { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 2 } },
-          { type: 'message_stop' },
+        const base = { id: 'chatcmpl-fake', object: 'chat.completion.chunk', created: 1, model: 'claude-x' };
+        const chunks: unknown[] = [
+          { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: { content: '你' }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: { content: '好' }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+          // 上游收尾的记账 chunk（带 usage）。
+          { ...base, choices: [], usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } },
         ];
-        for (const ev of events) {
-          res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
-        }
+        for (const c of chunks) res.write(`data: ${JSON.stringify(c)}\n\n`);
+        res.write('data: [DONE]\n\n');
         res.end();
       } else {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(
           JSON.stringify({
-            id: 'msg_fake',
-            type: 'message',
-            role: 'assistant',
+            id: 'chatcmpl-fake',
+            object: 'chat.completion',
+            created: 1,
             model: 'claude-x',
-            content: [{ type: 'text', text: '你好' }],
-            stop_reason: 'end_turn',
-            stop_sequence: null,
-            usage: { input_tokens: 5, output_tokens: 2 },
+            choices: [
+              { index: 0, message: { role: 'assistant', content: '你好' }, finish_reason: 'stop' },
+            ],
+            usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
           }),
         );
       }
@@ -91,7 +90,7 @@ async function startFakeAnthropic(): Promise<FakeAnthropic> {
 }
 
 describe('v1 代理端到端', () => {
-  let fake: FakeAnthropic;
+  let fake: FakeUpstream;
   let proxy: Server;
   let baseUrl: string;
 
@@ -100,7 +99,11 @@ describe('v1 代理端到端', () => {
     port: 0,
     apiKeys: ['test-key'],
     anthropicApiKey: 'sk-ant-fake',
-    anthropicBaseUrl: 'http://placeholder', // 启动后覆盖
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg', // 启动后覆盖
     modelMap: { 'gpt-4o': 'claude-x' },
     fallbackModel: 'deepseek-v4-flash',
     injectionMode: 'block',
@@ -109,10 +112,11 @@ describe('v1 代理端到端', () => {
     maxMessageChars: 200_000,
     stripControlChars: true,
     trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
   };
 
   beforeAll(async () => {
-    fake = await startFakeAnthropic();
+    fake = await startFakeUpstream();
     cfg.anthropicBaseUrl = fake.baseUrl;
     proxy = createApp(cfg);
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
@@ -147,7 +151,7 @@ describe('v1 代理端到端', () => {
     expect(res.status).toBe(401);
   });
 
-  it('非流式：OpenAI 请求转 Anthropic 转发，响应转回 OpenAI', async () => {
+  it('非流式：OpenAI 请求原样转发上游（同协议），响应回显请求的模型名', async () => {
     const res = await call(
       {
         model: 'gpt-4o',
@@ -167,14 +171,13 @@ describe('v1 代理端到端', () => {
     expect(json.choices[0]!.finish_reason).toBe('stop');
     expect(json.usage).toEqual({ prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 });
 
-    // 上游收到的必须是 Anthropic 格式：system 提取 + 护栏 + max_tokens 默认 8192。
+    // 上游收到的是 OpenAI 格式：system 消息保留在 messages 里并被追加护栏。
     const upstream = fake.received[fake.received.length - 1]!;
-    expect(upstream.system).toBeDefined();
-    expect(upstream.system).toContain('你是助手');
-    expect(upstream.system).toContain('不可信数据');
-    expect(upstream.max_tokens).toBe(8192);
     expect(upstream.model).toBe('claude-x'); // MODEL_MAP: gpt-4o → claude-x
-    expect(upstream.messages[0]!.role).toBe('user');
+    const sys = upstream.messages[0]!;
+    expect(sys.role).toBe('system');
+    expect(String(sys.content)).toContain('你是助手');
+    expect(String(sys.content)).toContain('不可信数据');
   });
 
   it('流式：返回 OpenAI chunk SSE，结尾 [DONE]', async () => {
@@ -217,7 +220,7 @@ describe('v1 代理端到端', () => {
     expect(res.status).toBe(200);
   });
 
-  it('/v1/messages 直通：thinking 归一化 + 模型映射 + beta 头转发', async () => {
+  it('/v1/messages：转成 OpenAI 发上游 + 模型映射 + beta 头转发', async () => {
     const res = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
@@ -238,9 +241,14 @@ describe('v1 代理端到端', () => {
     expect(res.status).toBe(200);
 
     const idx = fake.received.length - 1;
-    expect(fake.received[idx]!.model).toBe('deepseek-v4-flash'); // fallback
-    expect(fake.received[idx]!.thinking).toEqual({ type: 'enabled' }); // adaptive→enabled
-    expect(fake.received[idx]!.output_config).toEqual({ effort: 'high' });
+    const sent = fake.received[idx]!;
+    // claude-opus-4-6 不在假上游清单里 → 回落 fallback。
+    expect(sent.model).toBe('deepseek-v4-flash');
+    // 已转成 OpenAI：reasoning_effort 透传，Anthropic 的 thinking/output_config 不再出现。
+    expect(sent.reasoning_effort).toBe('high');
+    expect('thinking' in sent).toBe(false);
+    expect('output_config' in sent).toBe(false);
+    expect(sent.messages.at(-1)!.role).toBe('user');
 
     const hdr = fake.receivedHeaders[idx]!;
     expect(hdr['anthropic-beta']).toBe('prompt-caching-2024-07-31');
@@ -248,14 +256,20 @@ describe('v1 代理端到端', () => {
     expect(hdr['x-claude-code-session-id']).toBe('');
   });
 
-  it('count_tokens 转发上游并回传结果', async () => {
+  it('count_tokens 本地估算，不打上游（上游 OpenAI 端点没有这个接口）', async () => {
+    const before = fake.received.length;
     const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
-      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }),
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hello world' }] }),
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ input_tokens: 42 });
+    const json = (await res.json()) as { input_tokens: number };
+    // 递归统计 messages 里所有字符串（含 role 字段），ceil(总字符/4)。
+    expect(json.input_tokens).toBeGreaterThan(0);
+    expect(json.input_tokens).toBeLessThan(10);
+    // 没有额外的上游请求。
+    expect(fake.received.length).toBe(before);
   });
 
   it('/v1/models 返回 fallback 模型', async () => {
@@ -266,7 +280,7 @@ describe('v1 代理端到端', () => {
     expect(json.data.map((m) => m.id)).toContain('deepseek-v4-flash');
   });
 
-  it('stream_options.include_usage 时流式最后是独立 usage chunk（choices:[]）', async () => {
+  it('流式：上游的 usage 记账 chunk（choices:[]）被透传到客户端', async () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
@@ -290,7 +304,7 @@ describe('v1 代理端到端', () => {
 });
 
 describe('未鉴权放行模式的安全加固', () => {
-  let fake: FakeAnthropic;
+  let fake: FakeUpstream;
   let proxy: Server;
   let baseUrl: string;
 
@@ -299,7 +313,12 @@ describe('未鉴权放行模式的安全加固', () => {
     port: 0,
     apiKeys: [],
     anthropicApiKey: null,
+    // 上游 key 缺失：池为空，请求应得 503 而非泄露配置细节。
+    upstreamKeys: [],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
     anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
     modelMap: {},
     fallbackModel: 'deepseek-v4-flash',
     injectionMode: 'block',
@@ -308,10 +327,11 @@ describe('未鉴权放行模式的安全加固', () => {
     maxMessageChars: 200_000,
     stripControlChars: true,
     trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
   };
 
   beforeAll(async () => {
-    fake = await startFakeAnthropic();
+    fake = await startFakeUpstream();
     unauthenticatedCfg.anthropicBaseUrl = fake.baseUrl;
     proxy = createApp(unauthenticatedCfg);
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
@@ -343,15 +363,17 @@ describe('未鉴权放行模式的安全加固', () => {
     expect(res.status).toBe(415);
   });
 
-  it('上游配置缺失时返回固定文案，不泄露配置细节', async () => {
+  it('上游 key 池为空时返回 503，不泄露配置细节', async () => {
     const res = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] }),
     });
-    expect(res.status).toBe(500);
+    // 池空是可预期的运维状态（全部 key 被禁用/未配置），用 503 而非 500。
+    expect(res.status).toBe(503);
     const json = (await res.json()) as { error: { message: string; type: string } };
-    expect(json.error).toEqual({ message: 'internal server error', type: 'server_error' });
+    expect(json.error).toEqual({ message: 'all upstream keys are disabled', type: 'server_error' });
     expect(JSON.stringify(json)).not.toContain('ANTHROPIC_API_KEY');
+    expect(JSON.stringify(json)).not.toContain('OPENSEA_KEYS');
   });
 });

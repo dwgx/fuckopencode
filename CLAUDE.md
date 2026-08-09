@@ -20,12 +20,35 @@
 
 OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。暴露 OpenAI `/v1/chat/completions` 与 Anthropic `/v1/messages` 端点，把 DeepSeek 模型包装成 Anthropic 兼容协议。
 
+## 文档区
+
+**动代码前先读 `.claude/docs/`。** 那里是维护者文档，规划见 [.claude/docs/README.md](.claude/docs/README.md)。
+
+| 文件 | 什么时候读 |
+|---|---|
+| [.claude/state/CURRENT.md](.claude/state/CURRENT.md) | 会话开始必读，交代当前进度；会话结束前更新它 |
+| [.claude/docs/DEEPSEEK-QUIRKS.md](.claude/docs/DEEPSEEK-QUIRKS.md) | 改任何 deepseek 适配逻辑前必读 |
+| [.claude/docs/ARCHITECTURE.md](.claude/docs/ARCHITECTURE.md) | 搞清两条端点路径的差异 |
+| [.claude/docs/ISSUES.md](.claude/docs/ISSUES.md) | 已知问题，别重复排查 |
+| [.claude/docs/DEPLOY.md](.claude/docs/DEPLOY.md) | 部署或改线上前必读（nbus） |
+| [.claude/docs/PLAN.md](.claude/docs/PLAN.md) | 接下来做什么 |
+| [.claude/docs/CONVENTIONS.md](.claude/docs/CONVENTIONS.md) | 写代码/提交前对一遍风格 |
+
+文档分工：`README.md` 给使用者，`.claude/docs/` 给维护者，`docs/site/` 是对外宣传页（独立产物，不是文档）。
+
+两条硬约束：
+
+- 那些「看起来多余」的兜底逻辑基本都对应一个 DeepSeek 怪癖，删之前先查 DEEPSEEK-QUIRKS.md。
+- deepseek 适配在 chat 路径和直通路径是**两套实现**，改一处要检查另一处。
+
 ## 常用命令
+
+`tsc` 和 `vitest` 不在 PATH，用 `npx` 或 npm script。
 
 ```bash
 npm run build      # tsc 构建到 dist/
 npm run typecheck  # tsc --noEmit
-npm test           # vitest 单测（173 个）
+npm test           # vitest 单测
 npm run serve      # 构建并启动服务
-npm run test:live  # 真实上游端到端 probe
+npm run test:live  # 真实上游端到端 probe（需服务在跑 + 真 key）
 ```

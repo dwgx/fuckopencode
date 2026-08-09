@@ -5,10 +5,21 @@ export interface AppConfig {
   port: number;
   /** 允许的调用方 API keys（明文，逗号分隔） */
   apiKeys: string[];
-  /** 上游 Anthropic API key */
+  /** 上游 Anthropic API key（单 key 兼容；多 key 用 upstreamKeys） */
   anthropicApiKey: string | null;
-  /** 上游 Anthropic base URL，末尾不带斜杠 */
+  /** 上游 key 池：OPENSEA_KEYS 逗号分隔，兼容 ANTHROPIC_API_KEY 单 key 合并 */
+  upstreamKeys: string[];
+  /** key 池：连续失败多少次禁用 */
+  keyFailThreshold: number;
+  /** key 池：冷却期（ms） */
+  keyCooldownMs: number;
+  /** 上游 base URL，末尾不带斜杠。订阅端点（opencode Zen 的 /zen/go）。 */
   anthropicBaseUrl: string;
+  /**
+   * 按量付费端点 base URL，末尾不带斜杠。
+   * `-free` 模型只存在于这里，订阅端点不认（401 ModelError）。
+   */
+  payAsYouGoBaseUrl: string;
   /** 模型名映射表（OpenAI 名 → 上游 Anthropic 名） */
   modelMap: Record<string, string>;
   /** 未命中映射时的兜底模型名（opencodezen 只认 deepseek-v4-flash） */
@@ -25,6 +36,11 @@ export interface AppConfig {
   stripControlChars: boolean;
   /** 是否透传客户端 x-claude-code-* 会话标记头（默认不透传，防共享部署冒充会话） */
   trustClaudeCodeHeaders: boolean;
+  /**
+   * 监控面板是否免鉴权。仅在绑定回环地址时为 true —— 面板会展示调用方 IP/UA
+   * 等设备信息，绑非回环时必须带 key 才能看。
+   */
+  dashboardOpen: boolean;
 }
 
 function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
@@ -49,6 +65,23 @@ function parseModelMap(raw: string | undefined): Record<string, string> {
   return map;
 }
 
+/** 解析 `OPENSEA_KEYS="k1,k2,k3"`（逗号分隔，去空，去重）。单 key 优先排在最前。 */
+function parseUpstreamKeys(raw: string | undefined, singleKey: string | null): string[] {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  if (singleKey) {
+    seen.add(singleKey);
+    keys.push(singleKey);
+  }
+  for (const rawKey of (raw ?? '').split(',')) {
+    const key = rawKey.trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    keys.push(key);
+  }
+  return keys;
+}
+
 function isLoopbackHost(host: string): boolean {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '0.0.0.0';
 }
@@ -69,12 +102,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     .map((k) => k.trim())
     .filter(Boolean);
 
+  const anthropicApiKey = env.ANTHROPIC_API_KEY || null;
+  const upstreamKeys = parseUpstreamKeys(env.OPENSEA_KEYS, anthropicApiKey);
+
   return {
     host,
     port: intFromEnv(env.PORT, 8787, 1),
     apiKeys,
-    anthropicApiKey: env.ANTHROPIC_API_KEY || null,
-    anthropicBaseUrl: (env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, ''),
+    anthropicApiKey,
+    upstreamKeys,
+    keyFailThreshold: intFromEnv(env.KEY_FAIL_THRESHOLD, 5, 1),
+    keyCooldownMs: intFromEnv(env.KEY_COOLDOWN_MS, 300_000, 1_000),
+    anthropicBaseUrl: (env.ANTHROPIC_BASE_URL || 'https://opencode.ai/zen/go').replace(/\/+$/, ''),
+    payAsYouGoBaseUrl: (env.PAYG_BASE_URL || 'https://opencode.ai/zen').replace(/\/+$/, ''),
     modelMap: parseModelMap(env.MODEL_MAP),
     fallbackModel: env.DEFAULT_MODEL || 'deepseek-v4-flash',
     injectionMode,
@@ -83,6 +123,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxMessageChars: intFromEnv(env.MAX_MESSAGE_CHARS, 200_000),
     stripControlChars: boolFromEnv(env.STRIP_CONTROL_CHARS, true),
     trustClaudeCodeHeaders: boolFromEnv(env.TRUST_CLAUDE_CODE_HEADERS, false),
+    // 面板含设备信息，只在本机绑定时免鉴权。
+    dashboardOpen: boolFromEnv(env.DASHBOARD_OPEN, true) && hostnameIsSafe(host),
   };
 }
 

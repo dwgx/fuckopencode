@@ -23,6 +23,8 @@ interface StreamState {
   jsonModeArgs: Map<number, string>;
   /** 流里出现过 json_mode 工具（收尾 finish_reason 用 stop 而非 tool_calls） */
   emittedJsonMode: boolean;
+  /** 是否已发出带 finish_reason 的收尾 chunk（防漏发/重复发） */
+  emittedFinish: boolean;
 }
 
 export interface StreamToOpenAIOptions extends StreamConvertOptions {
@@ -61,6 +63,7 @@ export async function* anthropicStreamToOpenAI(
     jsonModeBlocks: new Set(),
     jsonModeArgs: new Map(),
     emittedJsonMode: false,
+    emittedFinish: false,
   };
 
   for await (const ev of events) {
@@ -111,10 +114,12 @@ export async function* anthropicStreamToOpenAI(
           if (state.jsonModeBlocks.has(ev.index)) {
             // JSON mode：累积参数，不产出 tool_calls delta。
             state.jsonModeArgs.set(ev.index, (state.jsonModeArgs.get(ev.index) ?? '') + ev.delta.partial_json);
+            state.textChars += ev.delta.partial_json.length;
             break;
           }
           const toolIndex = state.toolBlockIndex.get(ev.index);
           if (toolIndex != null) {
+            state.textChars += ev.delta.partial_json.length;
             yield makeChunk(state, {
               delta: {
                 tool_calls: [
@@ -180,6 +185,7 @@ export async function* anthropicStreamToOpenAI(
             usage,
           );
         }
+        state.emittedFinish = true;
         break;
       }
 
@@ -189,12 +195,24 @@ export async function* anthropicStreamToOpenAI(
       case 'error': {
         console.warn(`[anthropicStreamToOpenAI] stream error: ${stripControl(ev.error.message)}`);
         yield makeChunk(state, { delta: {}, finish_reason: 'stop' });
+        state.emittedFinish = true;
         return;
       }
 
       case 'message_stop':
+        // 上游漏发 message_delta 时（只有 message_stop）也必须补一个带 finish_reason
+        // 的收尾 chunk，否则 OpenAI 客户端拿不到 finish_reason 会一直等或报错。
+        if (!state.emittedFinish) {
+          yield makeChunk(state, { delta: {}, finish_reason: 'stop' });
+          state.emittedFinish = true;
+        }
         return;
     }
+  }
+
+  // 流被上游直接掐断（既无 message_delta 也无 message_stop）：同样补收尾。
+  if (!state.emittedFinish) {
+    yield makeChunk(state, { delta: {}, finish_reason: 'stop' });
   }
 }
 
