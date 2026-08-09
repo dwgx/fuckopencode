@@ -84,7 +84,8 @@ export type AnthropicContentBlock =
   | { type: 'thinking'; thinking: string; signature?: string };
 
 export interface AnthropicMessage {
-  role: 'user' | 'assistant';
+  /** Anthropic 官方接受 messages 里出现 system（Claude Code 多轮会插入）。 */
+  role: 'user' | 'assistant' | 'system';
   content: string | AnthropicContentBlock[];
 }
 

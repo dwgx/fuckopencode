@@ -456,3 +456,35 @@ describe('大上下文不被网关自己拒掉（DeepSeek V4 是 1M token）', (
     expect(r.ok).toBe(true);
   });
 });
+
+describe('messages 里的 system 消息（Claude Code 多轮真实形态）', () => {
+  // 回归：原来只放行 user/assistant，经 kirostudio 透传的真实请求全部 400。
+  // 实测 1.1MB 请求体的 roles 形如 ['user','system','assistant','user','system',...]，
+  // 且顶层同时还有 system 字段。
+  it('system 消息被放行', () => {
+    const r = validateAnthropicRequest(
+      {
+        model: 'm',
+        max_tokens: 64,
+        system: '顶层 system',
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'system', content: '中途插入的系统提示' },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: 'go' },
+        ],
+      },
+      cfg,
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('未知 role 仍然被拒', () => {
+    const r = validateAnthropicRequest(
+      { model: 'm', max_tokens: 64, messages: [{ role: 'root', content: 'x' }] },
+      cfg,
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('role must be');
+  });
+});

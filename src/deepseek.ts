@@ -253,9 +253,14 @@ export function injectMissingThinkingBlocks(body: Record<string, unknown>): void
     const hasThinking = content.some(
       (b) => b != null && typeof b === 'object' && (b as { type?: unknown }).type === 'thinking',
     );
-    if (hasToolUse && !hasThinking) {
+    // 上游要求 thinking 模式下**每条** assistant 历史都带回 reasoning 内容，
+    // 不只是带 tool_use 的那些。实测纯多轮对话（无工具）也会被拒：
+    // "The `reasoning_content` in the thinking mode must be passed back to the API."
+    // 所以只要该 assistant 消息缺 thinking 块就注入一个空块。
+    if (!hasThinking && content.length > 0) {
       content.unshift({ type: 'thinking', thinking: '', signature: '' });
     }
+    void hasToolUse;
   }
 }
 

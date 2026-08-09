@@ -290,7 +290,15 @@ describe('normalizeAnthropicRequest', () => {
     );
     expect(out.messages).toEqual([
       { role: 'user', content: [{ type: 'text', text: 'a' }] },
-      { role: 'assistant', content: [{ type: 'text', text: 'b' }] },
+      // 上游要求 thinking 模式下每条 assistant 历史都带 reasoning（纯多轮无工具也会拒），
+      // 所以纯文本 assistant 也会被注入空 thinking 块。
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: '' },
+          { type: 'text', text: 'b' },
+        ],
+      },
     ]);
   });
 });
