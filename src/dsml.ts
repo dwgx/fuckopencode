@@ -103,10 +103,13 @@ function coerce(raw: string, attrs: string): unknown {
  */
 const DSML_RESIDUE = new RegExp(
   [
-    // 完整或半截的开标签：<|DSML|function_calls> / <｜DSML｜invoke ...> / <|DSML|parameter ...>
-    `[<⟨]${NS}(?:function_calls|invoke|parameter)\\b[^>⟩]*[>⟩]?`,
-    // 闭标签
-    `[<⟨]\\s*/${NS}(?:function_calls|invoke|parameter)[^>⟩]*[>⟩]?`,
+    // 完整开标签：<|DSML|function_calls> / <｜DSML｜invoke ...>，属性段不含 > 也不跨行。
+    `[<⟨]${NS}(?:function_calls|invoke|parameter)\\b[^>⟩\\n]*[>⟩]`,
+    // 完整闭标签。
+    `[<⟨]\\s*/${NS}(?:function_calls|invoke|parameter)[^>⟩\\n]*[>⟩]`,
+    // 半截标签（被截断，没有 `>` 收尾）：只吃到行尾。
+    // 不能用 `[^>⟩]*` —— 那会跨行贪婪吞掉后面所有正常文本（实测把整段回答吃空）。
+    `[<⟨]\\s*/?${NS}(?:function_calls|invoke|parameter)\\b[^>⟩\\n]*`,
   ].join('|'),
   'gi',
 );

@@ -537,6 +537,51 @@ describe('DSML 残缺标记剥离（抽不出 invoke 时不能泄漏标记）', 
     expect(text).toBe(normal);
   });
 
+  // 2026-08-09 二次实测：这些是用户贴的真实形态。半截标签**后面还有正常文本**，
+  // 此前 `DSML_RESIDUE` 的 `[^>⟩]*` 会跨行贪婪吃到字符串末尾，把标记**和后面的
+  // 整段回答一起吞掉**，客户端从「看到裸标记」变成「看到空白回答」。
+  it.each([
+    // 半截 function_calls + 换行 + 正常文本
+    [
+      '半截 function_calls 后换行接正常文本',
+      '<｜DSML｜function_calls\n阅读\nbinary_patch_19.py\n我理解了 ReleaseVR 的模式。',
+      '阅读\nbinary_patch_19.py\n我理解了 ReleaseVR 的模式。',
+    ],
+    // 双重半截标记
+    [
+      '双重半截 function_calls',
+      '<｜DSML｜function_calls\n<｜DSML｜function_calls\nFound header for GetMaxDesktopBitrate',
+      'Found header for GetMaxDesktopBitrate',
+    ],
+    // 半截标记 + 工具结果文本（真实上下文里最常见的形态）
+    [
+      '半截 function_calls + 工具结果',
+      '<｜DSML｜function_calls\n已运行 2 命令\nworkflow 超级大并发 开始 剩下的都做完',
+      '已运行 2 命令\nworkflow 超级大并发 开始 剩下的都做完',
+    ],
+    // 完整开标签（同一行）后紧跟正常文本
+    [
+      '完整开标签后紧跟文本',
+      '<｜DSML｜function_calls>Found header\n后续正常内容',
+      'Found header\n后续正常内容',
+    ],
+    // 半截 parameter 标签 + 换行 + 正常文本
+    [
+      '半截 parameter 标签 + 正常文本',
+      '<｜DSML｜parameter name="command" string="true">echo hi\n这是正常回答',
+      'echo hi\n这是正常回答',
+    ],
+  ])('非流式：%s（标记不吞后面文本）', (_label, leaked, expectedText) => {
+    const out = nonStream(leaked);
+    const text = out.content
+      .filter((b) => b.type === 'text')
+      .map((b) => (b as { text: string }).text)
+      .join('');
+    expect(text).not.toContain('DSML');
+    expect(text).not.toContain('function_calls');
+    expect(text.trim()).toBe(expectedText);
+  });
+
   it('流式：残缺 DSML 标记同样被剥掉', async () => {
     const chunks = [
       { choices: [{ index: 0, delta: { content: '好的，' }, finish_reason: null }] },
