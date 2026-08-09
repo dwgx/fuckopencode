@@ -160,8 +160,10 @@ function pushUser(messages: OpenAIMessage[], content: AnthropicContentBlock[] | 
     } else if (block.type === 'text') {
       if (block.text) parts.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
-      const url = imageBlockToDataUrl(block.source);
-      if (url) parts.push({ type: 'image_url', image_url: { url } });
+      // 上游 opencode Zen 不支持图片块（实测 2.5MB 图片请求报
+      // "unknown variant `image_url`, expected `text`"）。降级成文本占位，
+      // 不让图片请求把整条会话打成 400。
+      parts.push({ type: 'text', text: '[图片内容暂不支持，已省略]' });
     }
   }
 
