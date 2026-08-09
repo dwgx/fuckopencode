@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AppConfig } from './config.js';
 import { fetchUpstreamModels, postUpstreamChat, type UpstreamCall } from './upstream.js';
-import { KeyPool, PoolEmptyError, keyFingerprint } from './keypool.js';
+import { KeyPool, PoolEmptyError, keyFingerprint, type KeyStateEvent } from './keypool.js';
 import {
   anthropicErrorToOpenAI,
   classifyUpstreamFailure,
@@ -184,13 +184,53 @@ type MetricsCtx = Pick<
   | 'keyFingerprint' | 'error'
 >;
 
-export function createApp(cfg: AppConfig, pool?: KeyPool) {
-  // 未显式传 pool 时，用 cfg.upstreamKeys 建默认池（兼容测试直连场景）。
+/**
+ * key 池状态变更日志。禁用/恢复都记一行，带指纹、原因、冷却时长与池健康度。
+ *
+ * 为什么必须有：2026-08-09 线上出过 295 个 503（`/v1/messages` 整池被禁约 3 分钟），
+ * 但当时日志里只有 access 行，禁用原因完全没有记录 —— 事后无法区分是 transient
+ * 累积、auth 还是额度耗尽。池健康度打在同一行，能直接看出何时跌到 0。
+ */
+export function logKeyStateChange(ev: KeyStateEvent): void {
+  const health = `pool=${ev.healthyCount}/${ev.poolSize}`;
+  if (ev.type === 'recovered') {
+    console.warn(`[keypool] recovered key=${ev.fingerprint} ${health}`);
+    return;
+  }
+  const cooldown = ev.cooldownMs != null ? `${Math.round(ev.cooldownMs / 1000)}s` : '?';
+  console.warn(`[keypool] disabled key=${ev.fingerprint} reason=${ev.kind ?? '?'} cooldown=${cooldown} ${health}`);
+}
+
+/** 池空日志的节流窗口：整池被禁时请求会连续撞上来，不必每条都记。 */
+const POOL_EMPTY_LOG_INTERVAL_MS = 10_000;
+let lastPoolEmptyLogAt = 0;
+let suppressedPoolEmptyCount = 0;
+
+/**
+ * 记录一次「整池被禁」。这是此前唯一完全静默的 503 路径 —— 2026-08-09 那 295 个
+ * 503 就是从这里出去的，日志里却只有 access 行。
+ *
+ * 节流到 10s 一行，被压掉的次数累加在下一行里，避免刷屏又不丢量级信息。
+ */
+function logPoolEmpty(pool: KeyPool): void {
+  suppressedPoolEmptyCount += 1;
+  const now = Date.now();
+  if (now - lastPoolEmptyLogAt < POOL_EMPTY_LOG_INTERVAL_MS) return;
+  lastPoolEmptyLogAt = now;
+  const disabled = pool.disabledFingerprints().join(',') || 'none';
+  console.error(
+    `[keypool] pool empty — all ${pool.size} keys disabled (requests rejected: ${suppressedPoolEmptyCount}, disabled: ${disabled})`,
+  );
+  suppressedPoolEmptyCount = 0;
+}
+
+export function createApp(cfg: AppConfig, pool?: KeyPool) {  // 未显式传 pool 时，用 cfg.upstreamKeys 建默认池（兼容测试直连场景）。
   const keyPool =
     pool ??
     new KeyPool(cfg.upstreamKeys, {
       cooldownMs: cfg.keyCooldownMs,
       failThreshold: cfg.keyFailThreshold,
+      onStateChange: logKeyStateChange,
     });
 
   // 后台拉一次上游模型清单，失败不影响服务启动。
@@ -449,6 +489,7 @@ async function handleChatCompletion(
     ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
     if (err instanceof PoolEmptyError) {
+      logPoolEmpty(pool);
       sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
       return;
     }
@@ -476,6 +517,7 @@ async function handleChatCompletion(
         ctx.keyFingerprint = keyFingerprint(upstream.key);
       } catch (err) {
         if (err instanceof PoolEmptyError) {
+          logPoolEmpty(pool);
           sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
           return;
         }
@@ -514,7 +556,12 @@ async function handleChatCompletion(
     try {
       // 上游已是 OpenAI 流，逐 chunk 回显（只改写 model 名回显客户端请求的名字），
       // 收尾补 [DONE]。上游的 `{"choices":[],"cost":...}` 记账 chunk 不转发给客户端。
-      for await (const chunk of parseOpenAISSE(upstream.response.body)) {
+      // 脏数据（非 SSE 行）由 parseOpenAISSE 丢弃并回调：收到即中止流并发错误事件，
+      // 避免客户端看到断流后报通用 Failed to parse JSON。
+      let dirtySample: string | null = null;
+      for await (const chunk of parseOpenAISSE(upstream.response.body, (d) => {
+        if (dirtySample === null) dirtySample = d.sample;
+      })) {
         if (res.writableEnded || res.destroyed) break;
         if (requestedModel) chunk.model = requestedModel;
         if (chunk.usage) {
@@ -522,11 +569,19 @@ async function handleChatCompletion(
           ctx.outputTokens = chunk.usage.completion_tokens ?? ctx.outputTokens;
           ctx.thinkingTokens = chunk.usage.completion_tokens_details?.reasoning_tokens ?? ctx.thinkingTokens;
         }
+        // 脏行检测放在写出**之前**：onDirty 在 parseOpenAISSE 产出下一个 chunk 的
+        // 途中触发，此时该 chunk 已越过脏数据边界，不能再写给客户端。
+        if (dirtySample !== null) {
+          console.error(`[proxy] chat stream aborted on dirty line: ${stripControl(dirtySample)}`);
+          break;
+        }
         if (!chunk.choices?.length && !chunk.usage) continue;
         await writeChunk(res, sseStringify(chunk));
       }
-      if (!res.writableEnded && !res.destroyed) await writeChunk(res, 'data: [DONE]\n\n');
-      upstream.markSuccess();
+      if (dirtySample === null && !res.writableEnded && !res.destroyed) {
+        await writeChunk(res, 'data: [DONE]\n\n');
+      }
+      if (dirtySample === null) upstream.markSuccess();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'stream error';
       console.error(`[proxy] stream error: ${stripControl(message)}`);
@@ -668,6 +723,7 @@ async function handleMessagesPassThrough(
     ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
     if (err instanceof PoolEmptyError) {
+      logPoolEmpty(pool);
       sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
       return;
     }
@@ -712,17 +768,44 @@ async function handleMessagesPassThrough(
     // thinking 显式 disabled 时剥掉 thinking 块事件（Claude Code 会因多余 thinking 报错）。
     const keepThinking = (normalized.thinking as { type?: string } | undefined)?.type !== 'disabled';
     const requestedModel = typeof body.model === 'string' ? body.model : undefined;
+    // 上游在流中途插入脏数据（非 SSE 行/坏 JSON）时：中止流并发明确 error 事件，
+    // 否则客户端只会看到一个「断流」的响应，报出通用的 Failed to parse JSON。
+    // 行本身仍被 parseOpenAISSE 丢弃（不透传），这里只是让「断流」可解释。
+    let dirtySample: string | null = null;
     const events = filterThinkingFromStream(
-      openAIStreamToAnthropic(parseOpenAISSE(upstream.response.body), { model: requestedModel }),
+      openAIStreamToAnthropic(
+        parseOpenAISSE(upstream.response.body, (d) => {
+          if (dirtySample === null) dirtySample = d.sample;
+        }),
+        { model: requestedModel },
+      ),
       keepThinking,
     );
+    /** 发一个 Anthropic error 事件，告知客户端流被上游打断。 */
+    const emitStreamError = (sample: string): void => {
+      console.error(`[proxy] passthrough stream aborted on dirty line: ${stripControl(sample)}`);
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'upstream interrupted the stream' } })}\n\n`,
+        );
+      }
+    };
     try {
       for await (const ev of events) {
         if (res.writableEnded || res.destroyed) break;
+        // 脏行检测放在写出**之前**：收到脏行时不再写给客户端后续事件。
+        if (dirtySample !== null) break;
         if (ev.type === 'message_delta' && ev.usage) ctx.outputTokens = ev.usage.output_tokens;
         await writeChunk(res, anthropicEventToSSE(ev));
       }
-      upstream.markSuccess();
+      // 循环结束后再查一次：openAIStreamToAnthropic 会缓冲整个 text 块到流末尾
+      // 收尾统一产出，脏行可能在最后一次迭代之后才被上报。
+      if (dirtySample !== null) {
+        emitStreamError(dirtySample);
+        upstream.markFailure('transient');
+      } else {
+        upstream.markSuccess();
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'passthrough stream error';
       console.error(`[proxy] passthrough stream error: ${stripControl(message)}`);

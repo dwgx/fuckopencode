@@ -1,13 +1,33 @@
 import type { AnthropicStreamEvent, OpenAIStreamChunk } from './types.js';
 
 /**
+ * 上游发来的非 SSE 脏数据。
+ *
+ * 为什么要单独暴露：`parseOpenAISSE` 一直**静默丢弃**非 JSON 行。丢弃本身是对的
+ * （不能把脏字节透给客户端），但完全静默意味着客户端只看到一个「中途没了」的流，
+ * 报错是通用的 `Failed to parse JSON`，无从定位是哪一层坏的。
+ * 上报之后由 server 层决定发一个明确的 error 事件。
+ */
+export interface DirtyStreamLine {
+  /** 脏数据原文（截断，仅用于日志/诊断） */
+  sample: string;
+}
+
+/** 脏数据样本上限：只为诊断，不留大块上游内容在内存/日志里。 */
+const DIRTY_SAMPLE_MAX_CHARS = 200;
+
+/**
  * 解析 **OpenAI** Chat Completions 流（`data: {...}` 行 + `[DONE]`）为 chunk 序列。
  *
  * 上游 opencode Zen 的 OpenAI 端点收尾会发 `{"choices":[],"cost":"0"}` 记账 chunk，
  * 保留（usage 可能在里面）；`[DONE]` 与非 JSON 行跳过。
+ *
+ * `onDirty` 在遇到非 SSE 脏行时回调（行被丢弃的行为不变）。实测触发场景：上游
+ * 或中间层在流中途插入非 SSE 的错误体（如 kiro2cc 限流时的 502 JSON 文本）。
  */
 export async function* parseOpenAISSE(
   body: ReadableStream<Uint8Array> | null,
+  onDirty?: (line: DirtyStreamLine) => void,
 ): AsyncGenerator<OpenAIStreamChunk> {
   if (!body) return;
   const reader = body.getReader();
@@ -18,13 +38,20 @@ export async function* parseOpenAISSE(
     let payload = line;
     if (payload.startsWith('data:')) payload = payload.slice(5).replace(/^ /, '');
     if (!payload || payload === '[DONE]') return null;
-    if (!payload.startsWith('{')) return null;
+    if (!payload.startsWith('{')) {
+      // 非 JSON 行：可能是 SSE 注释/心跳（`:` 开头，无害），也可能是上游插进来的
+      // 裸错误文本（有害，客户端会因此看到断流）。只上报后者。
+      if (!payload.startsWith(':')) onDirty?.({ sample: payload.slice(0, DIRTY_SAMPLE_MAX_CHARS) });
+      return null;
+    }
     try {
       const parsed = JSON.parse(payload) as OpenAIStreamChunk;
       // 上游收尾会发 `{"choices":[],"cost":"0"}` 这类无 choices 的记账 chunk；
       // 保留它（usage 可能在里面），由转换器判断。
       return parsed != null && typeof parsed === 'object' ? parsed : null;
     } catch {
+      // `{` 开头但 JSON 解析失败：截断/损坏的 chunk，属于脏数据。
+      onDirty?.({ sample: payload.slice(0, DIRTY_SAMPLE_MAX_CHARS) });
       return null;
     }
   };

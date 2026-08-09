@@ -1,8 +1,64 @@
 # 已知问题
 
 状态：`确认` 有复现路径 / `可疑` 只是读代码推断 / `已修` 本轮修掉 / `设计取舍` 不是 bug
+/ `已证伪` 曾被记为缺陷，但查证后不存在
 
-最后核对：2026-08-09，基线 `npm test` 186 passed、`tsc --noEmit` 干净。
+最后核对：2026-08-09，基线 `npm test` 292 passed、`tsc --noEmit` 干净。
+
+## 已证伪（2026-08-09 第二轮核查）
+
+### I-8 「quota 正则过宽导致 key 被误判额度耗尽」— 不存在
+
+CURRENT.md 曾把线上 503 归因于 [errors.ts](../../src/errors.ts) 的
+`/balance|credit|billing|quota/i` 过宽，说它把含 quota 字样的错误判成
+`quota-exhausted` → 1 小时长冷却。**查证后这条路径从未存在**：
+
+- `quota-exhausted` 的三条判定信号都是严格匹配（`GoUsageLimitError` 类型、
+  `usage[_ ]?limit|quota[_ ]?exceeded` 之类的词边界正则、message 里的确定短语）
+- 那个宽正则只扫 `errorType` 字段，且优先级在后，命中后返回的是
+  **`rate-limit`（3 秒短冷却）**，不是 quota-exhausted —— 方向刚好相反
+- `git log -L` 确认自 `6f4d910` 引入起就是这个形态，没有中间版本
+
+已顺手把宽正则收窄成精确枚举（`billing_error` / `CreditsError` /
+`insufficient_balance`），并加了两条回归测试固化「含 quota 字样的非额度错误不长冷却」。
+
+## 确认（2026-08-09 第二轮，已修）
+
+### I-9 整池被禁时无任何日志 — 已修
+
+线上 journal 实测：2026-08-09 20:16–20:19 有 **295 个 503**（不是先前记的 5 次），
+`/v1/messages` 整池被禁约 3 分钟，窗口内只有 3 个 200。但**日志里只有 access 行**，
+没有任何禁用记录，事后无法区分是 transient 累积、auth 还是额度耗尽。
+
+反证上游 429：429 全部发生在 **12:35–12:48**，与 503 窗口相隔 8 小时，
+不存在因果关系。所以 503 不是配额/限流触发的禁用。
+
+- 根因：`PoolEmptyError` → 503 的三个分支（[server.ts](../../src/server.ts) 两条路径）
+  全部静默返回，`markFailure` 里的禁用决策也没有任何输出
+- 修法：
+  - `KeyPool` 加 `onStateChange` 回调（注入式，保持纯逻辑可测），
+    四种失败类型的禁用 + 冷却自然到期的恢复都上报，只带 key 指纹
+  - `server.ts` 的 `logKeyStateChange` 打 `[keypool] disabled key=**** reason=... cooldown=...s pool=n/m`
+  - 池空单独打 `[keypool] pool empty`，10s 节流并累计被拒次数，避免 295 行刷屏
+- 待观察：真实根因仍未定（大概率是 transient 累积，`failThreshold=5`、
+  `cooldownMs=300s`）。下次复发时日志会直接给出 reason 与 cooldown。
+
+### I-10 流式脏数据被静默丢弃，客户端只看到断流 — 已修
+
+`parseOpenAISSE` 一直静默丢弃非 JSON 行（自 `6f4d910` 起）。丢弃本身是对的
+（不能把脏字节透给客户端），但**完全静默**：客户端拿到一个内容缺失却正常收尾的流，
+报出的是通用 `Failed to parse JSON`，无从定位哪一层坏的。
+
+注意 CURRENT.md 原先记的是「脏数据透传给客户端」，这个描述不准 —— 脏行从未透传。
+
+- 修法：`parseOpenAISSE` 加 `onDirty` 回调（SSE 注释行 `:` 开头不算脏，
+  `{` 开头但 JSON 解析失败也算脏，样本截断 200 字符）
+- 两条流式路径都接上，**检测点在写出之前**（onDirty 在产出下一个 chunk 途中触发，
+  那个 chunk 已越过脏数据边界，不能再写）：
+  - chat 路径：中止且**不补 `[DONE]`**
+  - 直通路径：中止并发 `event: error`（`overloaded_error`），标记 `transient` 失败
+- 直通路径循环后**必须再查一次**：`openAIStreamToAnthropic` 缓冲整个 text 块到
+  收尾统一产出，脏行在流末尾时最后一次迭代之后才触发 onDirty
 
 ## 已修（2026-08-09 部署轮）
 

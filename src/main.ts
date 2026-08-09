@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { loadConfig } from './config.js';
-import { createApp } from './server.js';
+import { createApp, logKeyStateChange } from './server.js';
 import { KeyPool } from './keypool.js';
 
 const cfg = loadConfig();
@@ -15,6 +15,7 @@ if (cfg.apiKeys.length === 0 && !cfg.allowUnauthenticated) {
 const pool = new KeyPool(cfg.upstreamKeys, {
   cooldownMs: cfg.keyCooldownMs,
   failThreshold: cfg.keyFailThreshold,
+  onStateChange: logKeyStateChange,
 });
 
 const server = createApp(cfg, pool);

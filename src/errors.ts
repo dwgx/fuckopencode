@@ -146,17 +146,19 @@ export function classifyUpstreamFailure(
   // "message":"Weekly usage limit reached. Resets in 19hr 22min."}
   const quotaSignals =
     errorType === 'GoUsageLimitError' ||
-    /usage[_ ]?limit|quota[_ ]?exceeded|out[_ ]of[_ ]credits/i.test(errorType ?? '') ||
+    /usage[_ ]?limit|quota[_ ]?exceeded|quota[_ ]?reached|out[_ ]of[_ ]credits/i.test(errorType ?? '') ||
     /usage limit reached|quota exceeded|insufficient (?:balance|credit)/i.test(errorMessage);
   if (quotaSignals) return 'quota-exhausted';
 
   if (status === 429) return 'rate-limit';
   // 余额不足：HTTP 可能是 401/402/400，但错误体明确指向 billing/credits。
+  // 注意这里只匹配 errorType 的**精确枚举**，不做子串模糊匹配 —— 2026-08-09
+  // 排查过「含 quota 字样的非额度错误被判成额度耗尽」的假设，代码里从未有这条
+  // 路径；宽正则只会把含 quota 的 type 误归 rate-limit（短冷却，无长冷却风险）。
   if (
     errorType === 'billing_error' ||
     errorType === 'CreditsError' ||
-    errorType === 'insufficient_balance' ||
-    (typeof errorType === 'string' && /balance|credit|billing|quota/i.test(errorType))
+    errorType === 'insufficient_balance'
   ) {
     return 'rate-limit';
   }

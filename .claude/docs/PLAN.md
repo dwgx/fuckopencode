@@ -20,7 +20,7 @@
 
 ## 优先级 3：补测试缺口
 
-当前 186 个测试，缺的是：
+当前 292 个测试，缺的是：
 
 - `config.ts` 的环境变量解析（`MODEL_MAP` 畸形输入、数字解析失败回落、
   `ALLOW_UNAUTHENTICATED` + 非回环 host 的组合）
@@ -28,6 +28,7 @@
 - `upstream.ts` 的超时与 signal 组合行为
 - 流式路径的客户端提前断开（`res.destroyed` 分支）
 - `sse.ts` 的跨包半行、`\r\n`、多行 data 拼接
+  （脏行检测已覆盖，见 `test/stream.test.ts` 的 `parseOpenAISSE 脏行检测`）
 
 ## 优先级 4：小修
 
