@@ -40,6 +40,7 @@ OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。暴露 OpenAI `/v1/c
 | [.claude/docs/ARCHITECTURE.md](.claude/docs/ARCHITECTURE.md) | 搞清两条端点路径的差异 |
 | [.claude/docs/ISSUES.md](.claude/docs/ISSUES.md) | 已知问题，别重复排查 |
 | [.claude/docs/DEPLOY.md](.claude/docs/DEPLOY.md) | 部署或改线上前必读（nbus） |
+| [.claude/docs/SHIELD.md](.claude/docs/SHIELD.md) | 动端口、隧道、或排查上游波动前必读（盾在网关前面） |
 | [.claude/docs/PLAN.md](.claude/docs/PLAN.md) | 接下来做什么 |
 | [.claude/docs/CONVENTIONS.md](.claude/docs/CONVENTIONS.md) | 写代码/提交前对一遍风格 |
 
