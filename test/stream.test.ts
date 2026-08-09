@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { anthropicStreamToOpenAI, openAIStreamToSSE, sseStringify } from '../src/stream.js';
-import { parseAnthropicSSE } from '../src/sse.js';
+import { parseAnthropicSSE, parseOpenAISSE } from '../src/sse.js';
 import type { AnthropicStreamEvent, OpenAIStreamChunk } from '../src/types.js';
 import { iter, textStreamEvents, toolStreamEvents } from './fixtures.js';
 
@@ -250,6 +250,59 @@ describe('parseAnthropicSSE', () => {
   it('空 data（data: 无内容）不崩', async () => {
     const events = await parse('event: ping\ndata: \n\n');
     expect(events).toHaveLength(0);
+  });
+});
+
+describe('parseOpenAISSE 脏行检测', () => {
+  function sseBody(raw: string): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(raw));
+        controller.close();
+      },
+    });
+  }
+
+  const okChunk =
+    'data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}\n\n';
+
+  async function dirty(raw: string): Promise<{ chunks: OpenAIStreamChunk[]; samples: string[] }> {
+    const chunks: OpenAIStreamChunk[] = [];
+    const samples: string[] = [];
+    for await (const c of parseOpenAISSE(sseBody(raw), (d) => samples.push(d.sample))) chunks.push(c);
+    return { chunks, samples };
+  }
+
+  it('SSE 注释行（: 开头）不上报，[DONE] 不上报', async () => {
+    const { chunks, samples } = await dirty(': keepalive\n\n' + okChunk + 'data: [DONE]\n\n');
+    expect(chunks.length).toBe(1);
+    expect(samples).toHaveLength(0);
+  });
+
+  it('非 JSON 脏行上报样本，行仍被丢弃', async () => {
+    const { chunks, samples } = await dirty(okChunk + 'data: <html>502 bad gateway</html>\n\n' + okChunk);
+    expect(chunks.length).toBe(2); // 脏行被丢，前后 chunk 都在
+    expect(samples).toEqual(['<html>502 bad gateway</html>']);
+  });
+
+  it('JSON 解析失败（截断 chunk）上报样本', async () => {
+    const { chunks, samples } = await dirty(okChunk + 'data: {"id":"x","choices":\n\n');
+    expect(chunks.length).toBe(1);
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toContain('"id":"x"');
+  });
+
+  it('脏样本截断到 200 字符，不把大块内容留在内存', async () => {
+    const big = 'B'.repeat(500);
+    const { samples } = await dirty(okChunk + `data: ${big}\n\n`);
+    expect(samples).toHaveLength(1);
+    expect(samples[0]!.length).toBe(200);
+  });
+
+  it('未传 onDirty 时脏行静默丢弃（兼容旧行为）', async () => {
+    const chunks: OpenAIStreamChunk[] = [];
+    for await (const c of parseOpenAISSE(sseBody(okChunk + 'data: garbage\n\n'))) chunks.push(c);
+    expect(chunks.length).toBe(1);
   });
 });
 

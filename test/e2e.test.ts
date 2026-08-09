@@ -52,7 +52,39 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
         authorization: typeof req.headers.authorization === 'string' ? req.headers.authorization : '',
       });
 
-      if (parsed.stream) {
+      // 测试钩子：流式响应插入非 SSE 脏行，模拟上游/中间层坏流
+      // （实测形态：kiro2cc 限流时把 502 的 HTML/裸文本插进 SSE 流）。
+      // `-流尾` 变体必须先判，否则会被「中途」分支的子串匹配吃掉。
+      const messagesJson = JSON.stringify(parsed.messages ?? '');
+      const wantsDirtyTail = parsed.stream === true && messagesJson.includes('脏数据测试-流尾');
+      const wantsDirtyStream =
+        parsed.stream === true && !wantsDirtyTail && messagesJson.includes('脏数据测试');
+
+      if (wantsDirtyStream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const base = { id: 'chatcmpl-dirty', object: 'chat.completion.chunk', created: 1, model: 'deepseek-v4-flash' };
+        res.write(
+          `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: '你' }, finish_reason: null }] })}\n\n`,
+        );
+        // 非 JSON 裸文本：这才是会让客户端 Failed to parse JSON 的脏数据。
+        res.write('data: <html><body>502 Bad Gateway</body></html>\n\n');
+        res.write(
+          `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: '好' }, finish_reason: 'stop' }] })}\n\n`,
+        );
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } else if (parsed.stream === true && JSON.stringify(parsed.messages ?? '').includes('脏数据测试-流尾')) {
+        // 测试钩子：脏行出现在流**末尾**（最后一条合法 chunk 之后）——
+        // 覆盖「脏行在循环耗尽后才被上报」的分支。
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const base = { id: 'chatcmpl-dirtytail', object: 'chat.completion.chunk', created: 1, model: 'deepseek-v4-flash' };
+        res.write(
+          `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: '你' }, finish_reason: 'stop' }] })}\n\n`,
+        );
+        res.write('data: trailing garbage\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } else if (parsed.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         const base = { id: 'chatcmpl-fake', object: 'chat.completion.chunk', created: 1, model: 'deepseek-v4-flash' };
         const chunks: unknown[] = [
@@ -302,6 +334,70 @@ describe('v1 代理端到端', () => {
     const last = chunks[chunks.length - 1]!;
     expect(last.usage).toBeDefined();
     expect(last.choices).toEqual([]);
+  });
+
+  it('流式：上游流中途插入脏数据时中止，不再发 [DONE]', async () => {
+    // 回归：脏行过去被 parseOpenAISSE 静默丢弃、但 [DONE] 照发，客户端只会看到
+    // 一个「内容缺失但正常结束」的响应。现在收到脏行立即中止（不补 [DONE]），
+    // 让客户端明确知道流坏了。
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        stream: true,
+        messages: [{ role: 'user', content: '脏数据测试' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    // 脏行后没有 [DONE]（收到脏行 → 立即 break，不补收尾）。
+    expect(text).not.toContain('[DONE]');
+    // 脏行前的正常 chunk 还在。
+    expect(text).toContain('你');
+    // 脏行的裸文本没有被透传。
+    expect(text).not.toContain('Bad Gateway');
+    // 脏行之后的 chunk（'好'）也不该出现（流已中止）。
+    expect(text).not.toContain('好');
+  });
+
+  it('流式：/v1/messages 直通路径收到脏数据时中止并发 error 事件', async () => {
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key', 'anthropic-beta': 'messages-2023-12-01' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        stream: true,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: '脏数据测试' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    // 直通路径：脏行 → 中止 + event: error，让 Claude Code 拿到可读报错。
+    expect(text).toContain('event: error');
+    expect(text).toContain('upstream interrupted the stream');
+    // 中止后不再有 message_stop / [DONE] 之类收尾。
+    expect(text).not.toContain('message_stop');
+  });
+
+  it('流式：脏数据出现在流末尾时，直通路径仍中止并发 error 事件', async () => {
+    // 覆盖「脏行在循环耗尽后才被上报」的分支：openAIStreamToAnthropic 缓冲整个
+    // text 块到收尾统一产出，脏行在末尾时最后一次迭代之后才触发 onDirty。
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key', 'anthropic-beta': 'messages-2023-12-01' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        stream: true,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: '脏数据测试-流尾' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('event: error');
+    expect(text).not.toContain('message_stop');
   });
 });
 

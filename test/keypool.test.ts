@@ -173,6 +173,87 @@ describe('KeyPool 失败分级与禁用', () => {
   });
 });
 
+describe('KeyPool 状态变更回调（禁用/恢复可观测性）', () => {
+  const events: string[] = [];
+
+  function makePool(rawKeys: string[], extra: Partial<ConstructorParameters<typeof KeyPool>[1]> = {}) {
+    events.length = 0;
+    return new KeyPool(rawKeys, {
+      ...OPTS,
+      now: clock.now,
+      onStateChange: (e) => events.push(JSON.stringify(e)),
+      ...extra,
+    });
+  }
+
+  // 与 fakeClock 同款的可控时钟，供本 describe 使用。
+  const clock = fakeClock();
+
+  it('禁用上报：auth 带指纹/原因/冷却/池健康度', () => {
+    const pool = makePool(['a', 'b']);
+    pool.markFailure('a', 'auth');
+    expect(events).toHaveLength(1);
+    const ev = JSON.parse(events[0]!) as { type: string; fingerprint: string; kind: string; cooldownMs: number; healthyCount: number; poolSize: number };
+    expect(ev.type).toBe('disabled');
+    // 单字符 key 长度 ≤4，keyFingerprint 整体打码，不暴露原文。
+    expect(ev.fingerprint).toBe('****');
+    expect(ev.kind).toBe('auth');
+    expect(ev.cooldownMs).toBe(OPTS.cooldownMs * 12);
+    expect(ev.healthyCount).toBe(1);
+    expect(ev.poolSize).toBe(2);
+  });
+
+  it('禁用上报：transient 达到阈值也上报，且不泄露原文', () => {
+    const pool = makePool(['sk-secret-tail1234', 'b']);
+    pool.markFailure('sk-secret-tail1234', 'transient');
+    pool.markFailure('sk-secret-tail1234', 'transient');
+    pool.markFailure('sk-secret-tail1234', 'transient');
+    expect(events).toHaveLength(1);
+    expect(events[0]).toContain('****1234');
+    expect(events[0]).not.toContain('secret');
+  });
+
+  it('禁用上报：quota-exhausted 带真实重置冷却', () => {
+    const pool = makePool(['a']);
+    pool.markFailure('a', 'quota-exhausted', 19 * 3_600_000);
+    const ev = JSON.parse(events[0]!) as { cooldownMs: number };
+    expect(ev.cooldownMs).toBe(19 * 3_600_000 + 60_000);
+  });
+
+  it('恢复上报：冷却到期 + acquire 时只报一次', () => {
+    const pool = makePool(['a']);
+    pool.markFailure('a', 'auth');
+    expect(events).toHaveLength(1); // 只报了禁用
+    clock.advance(OPTS.cooldownMs * 12);
+    pool.acquire();
+    expect(events).toHaveLength(2);
+    const ev = JSON.parse(events[1]!) as { type: string; fingerprint: string; healthyCount: number };
+    expect(ev.type).toBe('recovered');
+    expect(ev.fingerprint).toBe('****');
+    expect(ev.healthyCount).toBe(1);
+    // 二次 acquire 不再重复报恢复
+    pool.release('a');
+    pool.acquire();
+    expect(events).toHaveLength(2);
+  });
+
+  it('reset 显式恢复不触发 recovered 事件（绕过冷却，非自然到期）', () => {
+    const pool = makePool(['a']);
+    pool.markFailure('a', 'auth');
+    pool.reset('a');
+    expect(events).toHaveLength(1); // 只有禁用
+  });
+
+  it('未配置回调时所有上报静默（兼容旧行为）', () => {
+    const pool = new KeyPool(['a'], { ...OPTS, now: clock.now });
+    expect(() => {
+      pool.markFailure('a', 'auth');
+      pool.markFailure('a', 'rate-limit');
+    }).not.toThrow();
+    expect(pool.healthyCount).toBe(0);
+  });
+});
+
 describe('classifyUpstreamFailure', () => {
   it('429 → rate-limit', () => {
     expect(classifyUpstreamFailure(429, null)).toBe('rate-limit');
@@ -211,6 +292,20 @@ describe('classifyUpstreamFailure', () => {
     expect(
       classifyUpstreamFailure(429, { error: { type: 'rate_limit_error', message: 'too many requests' } }),
     ).toBe('rate-limit');
+  });
+
+  it('回归：含 quota 字样但非额度的错误，不按 quota-exhausted 长冷却', () => {
+    // CURRENT.md 曾怀疑「quota 字样误判成额度耗尽 → 1h 长冷却」。
+    // 代码里从未有此路径（quota 判定是严格匹配）；这里把常见误判形态固化成测试，
+    // 防止未来误伤。
+    expect(classifyUpstreamFailure(400, { error: { type: 'invalid_quota_configuration' } })).toBe('transient');
+    expect(classifyUpstreamFailure(400, { error: { type: 'quota_check_failed' } })).toBe('transient');
+  });
+
+  it('quota_reached / quota_exceeded 形态是额度耗尽', () => {
+    for (const type of ['quota_exceeded', 'quota_reached']) {
+      expect(classifyUpstreamFailure(400, { error: { type } })).toBe('quota-exhausted');
+    }
   });
 
   it('5xx / 非 JSON → transient', () => {
