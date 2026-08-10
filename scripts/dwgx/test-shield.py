@@ -184,12 +184,102 @@ def case_success_passthrough():
         shield.kill(); up.shutdown()
 
 
+def load_shield_module():
+    """把盾当模块导入，用于直接测纯函数。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "kiro_shield_under_test", os.path.join(HERE, "kiro_shield.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["kiro_shield_under_test"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def case_client_message_chinese():
+    """给下游的文案必须是中文、且不漏内部术语。
+
+    盾对下游只回 200/503/透传，信息全在文案里。原来是英文加内部术语
+    （`credential swap in progress`），下游只知道「炸了」。
+    """
+    ks = load_shield_module()
+
+    # 每类原因都要能生成文案，且都得是中文。
+    reasons = ["network", "client", "perm", "swap", "budget"]
+    msgs = {r: ks.client_message(r, elapsed=89.0, attempts=4) for r in reasons}
+
+    def has_cjk(s):
+        return any("一" <= c <= "鿿" for c in s)
+
+    check("五类失败原因都有中文文案",
+          all(has_cjk(m) for m in msgs.values()),
+          "；".join(f"{r}={len(m)}字" for r, m in msgs.items()))
+
+    # 内部术语不该出现在下游看到的文案里。
+    leaks = ["credential swap", "retry budget", "upstream unreachable",
+             "keypool", "key pool", "号池", "盾"]
+    found = {r: [t for t in leaks if t.lower() in m.lower()]
+             for r, m in msgs.items()}
+    bad = {r: t for r, t in found.items() if t}
+    check("文案不泄漏内部术语（credential swap / 号池 / 盾 等）",
+          not bad, f"泄漏情况={bad or '无'}")
+
+    # 每条都要告诉下游「等了多久、试了几次」，否则等于没说。
+    check("每条文案都带重试次数与耗时",
+          all("4 次" in m and "1 分 29 秒" in m for m in msgs.values()),
+          f"样例={msgs['swap'][:70]}")
+
+    # 容量问题和请求问题必须能区分 —— 决定下游是重发还是改配置。
+    check("容量问题提示重发，请求问题提示先改对",
+          "重发" in msgs["swap"] and "检查" in msgs["client"],
+          f"swap={msgs['swap'][:40]}… / client={msgs['client'][:40]}…")
+
+    # markdown 星号在终端客户端里会原样显示，不能留。
+    check("文案不含 markdown 标记",
+          not any("**" in m for m in msgs.values()),
+          "无 ** 包裹")
+
+    # fmt_secs 的边界
+    cases = [(0, "0 秒"), (59, "59 秒"), (60, "1 分"), (89, "1 分 29 秒"),
+             (3600, "1 小时"), (3661, "1 小时 1 分")]
+    wrong = [(s, want, ks.fmt_secs(s)) for s, want in cases
+             if ks.fmt_secs(s) != want]
+    check("fmt_secs 秒/分/小时换算正确", not wrong, f"不符={wrong or '无'}")
+
+    # 负数不该出现，但真出现了也不能显示成 "-3 秒"
+    check("fmt_secs 负数被钳到 0", ks.fmt_secs(-5) == "0 秒",
+          f"fmt_secs(-5)={ks.fmt_secs(-5)}")
+
+
+def case_client_fault_message_delivered():
+    """端到端：客户端真的收到中文 503 文案，而不是英文。"""
+    up, up_port = start_fake([(401, UNAUTHORIZED)] * 20)
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port)
+        try:
+            msg = json.loads(body)["error"]["message"]
+        except Exception:
+            msg = body
+        has_cjk = any("一" <= c <= "鿿" for c in msg)
+        check("端到端：401 收敛后下游拿到的是中文文案",
+              status == 503 and has_cjk,
+              f"status={status} message={msg[:90]}")
+        check("端到端：文案里没有 credential swap 这类内部术语",
+              "credential swap" not in msg.lower()
+              and "check credentials" not in msg.lower(),
+              f"message={msg[:90]}")
+    finally:
+        shield.kill(); up.shutdown()
+
+
 def main():
     print("=== 盾行为验证（DWGX）===\n")
+    case_client_message_chinese()
     case_success_passthrough()
     case_pool_empty_absorbed()
     case_upstream_unavailable_absorbed()
     case_client_fault_fast()
+    case_client_fault_message_delivered()
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} 通过")
     return 1 if failed else 0

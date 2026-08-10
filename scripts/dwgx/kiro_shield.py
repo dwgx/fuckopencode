@@ -533,6 +533,71 @@ PERM_MAX_ATTEMPTS = int(os.environ.get("PERM_MAX_ATTEMPTS", "5"))
 PERM_DELAY = float(os.environ.get("PERM_DELAY_SECS", "8"))
 
 
+def fmt_secs(s):
+    """把秒数写成人话：89 -> 1 分 29 秒。"""
+    s = int(round(max(0.0, s)))
+    if s < 60:
+        return f"{s} 秒"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m} 分 {sec} 秒" if sec else f"{m} 分"
+    h, m = divmod(m, 60)
+    return f"{h} 小时 {m} 分" if m else f"{h} 小时"
+
+
+def client_message(reason, *, elapsed, attempts, detail=""):
+    """给下游客户端的中文说明。
+
+    为什么要单独做一层：盾对下游只回三种状态码（200/503/透传），
+    真正的信息全在文案里。原来的文案是英文加内部术语
+    （`credential swap in progress`），下游看到只知道「炸了」，
+    不知道炸在哪一层、盾做过什么、自己该怎么办。
+
+    每条都回答三件事：谁的问题、替你试了多久多少次、你该做什么。
+    盾在下游眼里就是上游，所以措辞上不暴露「号池」「盾」这类内部实现，
+    只说「上游」。诊断细节（凭据轮换中之类）放 detail，能说的才说。
+
+    文案里不用 markdown 标记 —— 终端客户端会把 ** 原样显示出来。
+    """
+    tried = f"已替你重试 {attempts} 次、等了 {fmt_secs(elapsed)}"
+    base = {
+        # 网络层根本没连上：DNS、连接被拒、TLS 失败。
+        "network": (
+            f"连不上上游服务。{tried}，仍然没连上。"
+            "这通常是上游临时抽风或网络波动，一般几分钟内自愈 —— "
+            "直接重发这条请求即可，不用改任何配置。"
+        ),
+        # 4xx：请求本身或凭据有问题，重试无意义。
+        "client": (
+            f"上游拒绝了这个请求，判定是请求本身或凭据的问题（不是容量问题）。"
+            f"{tried}，结果一样，所以不再等了。"
+            "请检查：请求体格式、模型名是否写对、API key 是否有效或过期。"
+            "这类问题重发通常没用，需要先改对再发。"
+        ),
+        # 确定性 5xx：上游明确报错，短窗内没恢复。
+        "perm": (
+            f"上游持续返回错误。{tried}，短窗内没等到恢复，先把结果交回给你，"
+            "避免你这边一直挂着。上游侧的问题，你的请求和配置没错 —— "
+            "过一会儿重发即可。"
+        ),
+        # 凭据轮换 / 池冷却：最常见的一类，盾的主战场。
+        "swap": (
+            f"上游正在轮换凭据或处于限流冷却，暂时接不了新请求。"
+            f"{tried}，还没轮到可用额度。这是容量问题，不是你的请求出错 —— "
+            "稍等片刻重发就好，通常一两分钟内恢复。"
+        ),
+        # 总预算耗尽：所有类型都没收敛。
+        "budget": (
+            f"上游一直繁忙。{tried}，已用尽重试预算，"
+            "只能把结果交回给你（再等下去你的客户端可能自己超时）。"
+            "上游负载问题，稍后重发即可。"
+        ),
+    }[reason]
+    if detail:
+        base += f"（诊断信息：{detail}）"
+    return base
+
+
 def swap_delay(attempt):
     """换号期退避：20s 起，1.4 倍增长，上限 60s。"""
     return min(SWAP_DELAY_FIRST * (1.4 ** max(0, attempt - 1)), SWAP_DELAY_MAX)
@@ -808,7 +873,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     record_event(502, "network", self.path, b"", attempt,
                                  time.monotonic() - t_start, "gave_up",
                                  note=f"upstream unreachable: {e}")
-                    self._fail(503, f"upstream unreachable: {e}")
+                    self._fail(503, client_message(
+                        "network", elapsed=time.monotonic() - t_start,
+                        attempts=attempt, detail=str(e)[:120]))
                     return
                 if not self._sleep_with_keepalive(
                         backoff_delay(attempt, None), streaming):
@@ -894,7 +961,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  note="客户端自身错误（号池无法处理），"
                                       f"{CLIENT_BUDGET:.0f}s 后返回 503；"
                                       "原始错误未透传，详情见本条响应原文")
-                    self._fail(503, "request rejected upstream, check credentials")
+                    self._fail(503, client_message(
+                        "client", elapsed=time.monotonic() - t_start,
+                        attempts=client_attempt,
+                        detail=f"上游返回 {status}"))
                     return
                 with _stats_lock:
                     STATS["retries"] += 1
@@ -930,7 +1000,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  retry_after=resp_headers.get("Retry-After"),
                                  note=f"确定性错误，{PERM_BUDGET:.0f}s 短窗内未恢复，"
                                       "返回 503（未透传原始错误）")
-                    self._fail(503, "upstream error absorbed, please retry")
+                    self._fail(503, client_message(
+                        "perm", elapsed=time.monotonic() - t_start,
+                        attempts=perm_attempt,
+                        detail=f"上游返回 {status}"))
                     return
                 with _stats_lock:
                     STATS["retries"] += 1
@@ -992,7 +1065,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "gave_up",
                                  retry_after=resp_headers.get("Retry-After"),
                                  note=f"{_budget:.0f}s 内未恢复，返回 503")
-                    self._fail(503, "credential swap in progress, please retry")
+                    # cool/auth 是上游明确给了冷却信号，swap 是凭据轮换 —— 都归到
+                    # 「容量问题」这类文案，但把判定写进诊断信息便于对账。
+                    _why = {"swap": "凭据轮换中", "cool": "上游要求冷却",
+                            "auth": "凭据需要刷新"}[verdict]
+                    self._fail(503, client_message(
+                        "swap", elapsed=time.monotonic() - t_start,
+                        attempts=swap_attempt,
+                        detail=f"{_why}，上游返回 {status}"))
                     return
                 with _stats_lock:
                     STATS["retries"] += 1
@@ -1048,7 +1128,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                      e_payload, attempt, time.monotonic() - t_start,
                      "gave_up",
                      note=f"{MAX_ATTEMPTS} 次 / {MAX_BUDGET:.0f}s 预算用尽，返回 503")
-        self._fail(503, "upstream busy, retry budget exhausted")
+        self._fail(503, client_message(
+            "budget", elapsed=time.monotonic() - t_start, attempts=attempt,
+            detail=f"上游最后返回 {last_status}" if last_status else ""))
 
     def _relay_body(self, status, resp_headers, payload):
         """转发一个已经完整读入内存的响应体（错误响应走这条）。"""
