@@ -82,6 +82,9 @@
 | `INJECTION_MODE` | `block` |
 | `USAGE_DB_PATH` | 不设 = `data/usage.db`（相对 `WorkingDirectory`）。设为空串关闭持久化 |
 | `USAGE_DB_RETENTION_DAYS` | 不设 = 30。`0` = 不清理 |
+| `KEY_PROBE_INTERVAL_MS` | 不设 = 1800000（30 分钟）。`0` = 关闭探活 |
+| `KEY_PROBE_IDLE_MS` | 不设 = 1800000。key 空闲超过这个时长才探 |
+| `KEY_PROBE_TIMEOUT_MS` | 不设 = 30000 |
 
 改 env 后要 `systemctl restart`（`EnvironmentFile` 只在启动时读）。
 

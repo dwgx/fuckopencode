@@ -93,6 +93,9 @@ claude
 | `STRIP_CONTROL_CHARS` | `1` | 剥离日志/转发内容里的控制符 |
 | `USAGE_DB_PATH` | `data/usage.db` | 用量库路径（相对工作目录）。设为空串关闭持久化 |
 | `USAGE_DB_RETENTION_DAYS` | `30` | 用量记录保留天数，`0` = 不清理 |
+| `KEY_PROBE_INTERVAL_MS` | `1800000` | key 探活周期（30 分钟），`0` = 关闭 |
+| `KEY_PROBE_IDLE_MS` | `1800000` | key 空闲多久才值得探活 |
+| `KEY_PROBE_TIMEOUT_MS` | `30000` | 单次探活请求超时 |
 
 用量库用 Node 内置 `node:sqlite`（Node 22+），**不引入任何 npm 依赖**。
 Node 20 上该模块不存在，此时自动降级：只记一条 warn，面板不显示历史累计，

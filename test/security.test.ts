@@ -32,6 +32,9 @@ const cfg: AppConfig = {
   dashboardPublic: false,
   usageDbPath: '',  // 单测不落盘
   usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
 };
 
 describe('detectInjection', () => {
