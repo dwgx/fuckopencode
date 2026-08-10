@@ -112,7 +112,8 @@ describe('i18n 词条 en/zh 对齐', () => {
     const en = new Set(dictKeys('en'));
     const zh = new Set(dictKeys('zh'));
     for (const k of ['polHd', 'polUpstream', 'polFallback', 'polFirstHit', 'polAfterN',
-                     'polBackoff', 'polQuotaNote', 'polAuthNote', 'polRateNote', 'polCfg']) {
+                     'polBackoff', 'polQuotaNote', 'polAuthNote', 'polRateNote', 'polCfg',
+                     'unattributed']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
       expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
     }
@@ -134,5 +135,52 @@ describe('冷却策略小节接线完整', () => {
     const code = inlineScript();
     expect(code).toContain(".replace('{n}'");
     expect(code).toContain(".replace('{base}'");
+  });
+});
+
+describe('耗时格式化', () => {
+  /** 把内联 JS 里的 ms() 抠出来真跑一遍。 */
+  function loadMs(): (n: unknown) => string {
+    const m = inlineScript().match(/var ms = function[\s\S]*?\n {2}\};/);
+    if (!m) throw new Error('内联 JS 里找不到 ms() 定义');
+    // eslint-disable-next-line no-new-func
+    return new Function(m[0] + '; return ms;')() as (n: unknown) => string;
+  }
+
+  it('毫秒不再被计数格式化器写成 2.1kms', () => {
+    const ms = loadMs();
+    // fmt() 是 k/M/B 计数格式化器，以前 avg/p95 直接套它再拼 'ms'，
+    // 线上真实出现过「2.1kms」「9.3kms」这种没人看得懂的输出。
+    expect(ms(2100)).toBe('2.10s');
+    expect(ms(9300)).toBe('9.30s');
+    for (const v of [1000, 2100, 9300, 12500, 60000, 89000]) {
+      expect(ms(v)).not.toMatch(/kms|Mms|Bms/);
+    }
+  });
+
+  it('秒/分边界正确（59999 该进位成 1m，不是 60.0s）', () => {
+    const ms = loadMs();
+    expect(ms(999)).toBe('999ms');
+    expect(ms(1000)).toBe('1.00s');
+    expect(ms(12500)).toBe('12.5s');
+    expect(ms(59999)).toBe('1m');
+    expect(ms(60000)).toBe('1m');
+    expect(ms(89000)).toBe('1m 29s');
+  });
+
+  it('异常输入不炸也不输出 NaN', () => {
+    const ms = loadMs();
+    for (const v of [0, -5, null, undefined, NaN, 'x']) {
+      expect(ms(v)).not.toContain('NaN');
+    }
+    expect(ms(0)).toBe('0ms');
+  });
+});
+
+describe('未归属请求不冒充成一个 key', () => {
+  it('面板显示未归属条数（否则 byKey 求和对不上总数）', () => {
+    const code = inlineScript();
+    expect(code).toContain('unattributedRequests');
+    expect(code).toContain("T('unattributed')");
   });
 });

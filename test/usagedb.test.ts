@@ -64,6 +64,33 @@ describe('UsageDb 基础读写', () => {
     db.close();
   });
 
+  it('未归属请求不冒充成一个 key（幽灵 key 回归测试）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'usage.db'), 30, log);
+
+    // 真 key 的请求
+    db.recordRequest(row({ at: 1000, keyFingerprint: '****0osU' }));
+    db.recordRequest(row({ at: 2000, keyFingerprint: '****ZOBb' }));
+    // 还没选到 key 就被拒的：keyFingerprint 为空 -> 落库写成 '-'
+    // 线上真实出现过 288 条这种（客户端 400 格式错误 / 401 鉴权失败），
+    // 修复前它们会作为一个指纹为 '-' 的「第三个 key」出现在面板上。
+    db.recordRequest(row({ at: 3000, keyFingerprint: '', status: 400 }));
+    db.recordRequest(row({ at: 4000, keyFingerprint: '', status: 401 }));
+    db.recordRequest(row({ at: 5000, keyFingerprint: '', status: 503 }));
+
+    const h = db.history()!;
+    expect(h.byKey.map((k) => k.fingerprint).sort()).toEqual(['****0osU', '****ZOBb']);
+    expect(h.byKey.some((k) => k.fingerprint === '-')).toBe(false);
+
+    // 但不能丢：总数要能对上账，否则面板数字自相矛盾。
+    expect(h.totalRequests).toBe(5);
+    expect(h.unattributedRequests).toBe(3);
+    expect(h.unattributedFailed).toBe(3);
+    const sum = h.byKey.reduce((n, k) => n + k.requests, 0);
+    expect(sum + h.unattributedRequests).toBe(h.totalRequests);
+
+    db.close();
+  });
+
   it('ok / failed 按状态码分类', () => {
     const db = new UsageDb(path.join(tmpDir, 'usage.db'), 30, log);
     db.recordRequest(row({ at: 1, status: 200 }));
