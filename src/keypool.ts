@@ -268,6 +268,34 @@ export class KeyPool {
   }
 
   /**
+   * 探活用：列出「健康但长时间没接过真实请求」的 key。
+   *
+   * 为什么需要：面板上的「可用」只代表**不在冷却期**，不代表验证过能用。
+   * 实测遇到过两个 key 都显示可用、但 40 分钟内谁都没接过真请求的情况 ——
+   * 那时候面板是绿的，可它们到底还能不能用没人知道。
+   *
+   * 只挑健康的：禁用中的 key 有明确的冷却到期时间，让它自然恢复就行，
+   * 拿真实请求去撞一个已知额度耗尽的 key 纯属浪费额度。
+   *
+   * @param idleMs 多久没被用过就算需要探活
+   * @returns 每项含 key 原文（调用方要发请求）与指纹（用于日志/落库）
+   */
+  staleKeys(idleMs: number): Array<{ key: string; fingerprint: string; idleForMs: number }> {
+    const now = this.now();
+    const out: Array<{ key: string; fingerprint: string; idleForMs: number }> = [];
+    for (const k of this.keys) {
+      if (k.disabledUntil > now) continue; // 禁用中，等自然恢复
+      if (k.inFlight > 0) continue; // 正在干活，不用探
+      // lastUsedAt = 0 表示本进程内从未被选中过（刚重启）—— 也要探，
+      // 否则重启后一个从没用过的坏 key 会一直挂着「可用」直到真实流量撞上它。
+      const idleFor = k.lastUsedAt === 0 ? Infinity : now - k.lastUsedAt;
+      if (idleFor < idleMs) continue;
+      out.push({ key: k.key, fingerprint: keyFingerprint(k.key), idleForMs: idleFor });
+    }
+    return out;
+  }
+
+  /**
    * 选择一个 key 并递增 inFlight。同步完成（无 await），保证原子性。
    * least-loaded：优先选 inFlight 最少的健康 key；全 0 时按 lastUsedAt 最旧优先轮转。
    * 所有 key 都禁用时抛 PoolEmptyError。
@@ -311,6 +339,11 @@ export class KeyPool {
     if (!k) return;
     k.failCount = 0;
     k.lastFailAt = -1;
+    // 记一次「确实成功过」的时刻。真实流量走 acquire() 时已经设过 lastUsedAt，
+    // 这里重复设一次无害；但探活（keyprobe）是直接打指定 key、不经 acquire() 的，
+    // 少了这行探活成功后 lastUsedAt 仍是旧值 —— 那个 key 会被判定为一直空闲，
+    // 每轮都重复探，白烧额度。
+    k.lastUsedAt = this.now();
   }
 
   /**

@@ -163,6 +163,9 @@ describe('v1 代理端到端', () => {
     dashboardPublic: false,
     usageDbPath: '',  // 单测不落盘（专门的用量持久化用例在下面自建临时库）
     usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
   };
 
   beforeAll(async () => {
@@ -446,6 +449,9 @@ describe('未鉴权放行模式的安全加固', () => {
     dashboardPublic: false,
     usageDbPath: '',  // 单测不落盘（专门的用量持久化用例在下面自建临时库）
     usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
   };
 
   beforeAll(async () => {
@@ -549,6 +555,9 @@ describe('监控面板访问控制', () => {
     dashboardPublic: false,
     usageDbPath: '',
     usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
   };
 
   beforeAll(async () => {
@@ -665,6 +674,9 @@ describe('面板完全公开模式（DASHBOARD_PUBLIC=1）', () => {
     dashboardPublic: true,
     usageDbPath: '',
     usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
   };
 
   beforeAll(async () => {
@@ -736,6 +748,9 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     dashboardPublic: true,
     usageDbPath: '',  // beforeAll 里指向临时目录
     usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
   };
 
   beforeAll(async () => {

@@ -22,6 +22,17 @@ export interface AppConfig {
   usageDbPath: string;
   /** 用量记录保留天数，0 = 不清理。 */
   usageDbRetentionDays: number;
+  /**
+   * key 主动探活的周期（毫秒）。0 = 关闭。
+   *
+   * 面板的「可用」只代表不在冷却期，不代表验证过能用 —— 探活用最小 token
+   * 的真实请求去证明它还活着。详见 keyprobe.ts。
+   */
+  keyProbeIntervalMs: number;
+  /** 一个 key 空闲多久才值得探（有真实流量经过就不用额外探）。 */
+  keyProbeIdleMs: number;
+  /** 单次探活请求的超时。探活是后台动作，不该无限等。 */
+  keyProbeTimeoutMs: number;
   /** 上游 base URL，末尾不带斜杠。订阅端点（opencode Zen 的 /zen/go）。 */
   anthropicBaseUrl: string;
   /**
@@ -134,6 +145,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // 显式设为空串 = 关闭持久化（此时面板只有内存窗口，代理行为完全不变）。
     usageDbPath: env.USAGE_DB_PATH === '' ? '' : (env.USAGE_DB_PATH || 'data/usage.db'),
     usageDbRetentionDays: intFromEnv(env.USAGE_DB_RETENTION_DAYS, 30, 0),
+    // 30 分钟一轮，探「空闲超过 30 分钟」的 key。两个值一致是刻意的：
+    // 一个 key 只要连续 30 分钟没接到真实流量，下一轮就会被探到。
+    keyProbeIntervalMs: intFromEnv(env.KEY_PROBE_INTERVAL_MS, 1_800_000, 0),
+    keyProbeIdleMs: intFromEnv(env.KEY_PROBE_IDLE_MS, 1_800_000, 0),
+    keyProbeTimeoutMs: intFromEnv(env.KEY_PROBE_TIMEOUT_MS, 30_000, 1_000),
     anthropicBaseUrl: (env.ANTHROPIC_BASE_URL || 'https://opencode.ai/zen/go').replace(/\/+$/, ''),
     payAsYouGoBaseUrl: (env.PAYG_BASE_URL || 'https://opencode.ai/zen').replace(/\/+$/, ''),
     modelMap: parseModelMap(env.MODEL_MAP),
