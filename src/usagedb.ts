@@ -75,8 +75,17 @@ export interface KeyUsageTotals {
 export interface UsageHistory {
   /** 库里最早一条记录的时间戳（面板显示「累计自 …」）。无数据时为 0。 */
   since: number;
-  /** 总请求数（所有 key）。 */
+  /** 总请求数（含未归属到 key 的）。 */
   totalRequests: number;
+  /**
+   * 还没选到 key 就被拒的请求数（客户端 400/401、池空 503）。
+   *
+   * 单独拎出来是因为它们不属于任何 key：混进 `byKey` 会让面板凭空多出一个
+   * 指纹为 `-` 的「幽灵 key」。但也不能丢，否则 `byKey` 求和对不上 `totalRequests`。
+   */
+  unattributedRequests: number;
+  /** 上面那些里失败的条数。 */
+  unattributedFailed: number;
   byKey: KeyUsageTotals[];
   /** 最近的 key 状态变更（最新在前，上限 20 条）。 */
   recentKeyEvents: Array<{
@@ -328,6 +337,10 @@ export class UsageDb {
 
   private queryHistory(): UsageHistory | null {
     try {
+      // 排除 key_fp = '-'：那是**还没选到 key 就被拒**的请求（客户端 400 格式
+      // 错误、401 鉴权失败、池空 503），它们不属于任何 key。混进 byKey 会在
+      // 面板上凭空多出一个「幽灵 key」—— 实测线上出现过 fp='-' 288 条排在
+      // 真 key 中间，让人以为池子里有三个号。
       const byKey = this.db
         .prepare(
           `SELECT key_fp                                    AS fingerprint,
@@ -338,10 +351,21 @@ export class UsageDb {
                   COALESCE(SUM(output_tokens), 0)            AS outputTokens,
                   MAX(at)                                    AS lastAt
              FROM requests
+            WHERE key_fp != '-'
             GROUP BY key_fp
             ORDER BY requests DESC`,
         )
         .all() as Array<Record<string, number | string>>;
+
+      // 未归属请求单独给一个数，面板可以显示「另有 N 条未到达上游」。
+      // 不能直接丢掉：它们是真实发生的请求，丢了总数就对不上。
+      const unattributed = this.db
+        .prepare(
+          `SELECT COUNT(*) AS requests,
+                  SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END) AS failed
+             FROM requests WHERE key_fp = '-'`,
+        )
+        .get() as { requests: number; failed: number };
 
       const meta = this.db
         .prepare('SELECT COALESCE(MIN(at), 0) AS since, COUNT(*) AS total FROM requests')
@@ -357,6 +381,8 @@ export class UsageDb {
       return {
         since: Number(meta.since) || 0,
         totalRequests: Number(meta.total) || 0,
+        unattributedRequests: Number(unattributed?.requests) || 0,
+        unattributedFailed: Number(unattributed?.failed) || 0,
         byKey: byKey.map((r) => ({
           fingerprint: String(r.fingerprint),
           requests: Number(r.requests) || 0,

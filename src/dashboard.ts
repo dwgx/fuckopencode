@@ -393,6 +393,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       kHealthy: 'healthy', kDisabled: 'disabled', kNever: 'never',
       carrying: 'carrying load', ofKeys: 'of', poolIdle: 'no in-flight requests',
       histSince: 'lifetime since', noHist: 'no persisted history',
+      unattributed: 'rejected before reaching a key',
       recentEvents: 'recent key events', noKeyEvents: 'no key state changes recorded',
       evDisabled: 'disabled', evRecovered: 'recovered', reqShort: 'req',
       authErr: 'invalid credential', rateErr: 'rate limited',
@@ -433,6 +434,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       kHealthy: '可用', kDisabled: '已禁用', kNever: '未用过',
       carrying: '个号在扛并发', ofKeys: '/', poolIdle: '当前无在飞请求',
       histSince: '累计自', noHist: '未启用历史持久化',
+      unattributed: '条未到达上游（格式/鉴权错误）',
       recentEvents: '最近状态变更', noKeyEvents: '暂无状态变更记录',
       evDisabled: '禁用', evRecovered: '恢复', reqShort: '请求',
       authErr: '凭据无效', rateErr: '限流',
@@ -495,6 +497,18 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
     return String(n);
+  };
+  /* 耗时专用。fmt() 是计数用的（k/M/B），拿它格式化毫秒会输出
+     「2.1kms」这种没人看得懂的东西 —— 秒该用秒表示。 */
+  var ms = function (n) {
+    n = Number(n) || 0;
+    if (n < 1000) return Math.round(n) + 'ms';
+    // 先算总秒数再分流，避免 59999 四舍五入成 "60.0s" 这种该进位没进位的写法。
+    var total = Math.round(n / 1000);
+    if (total < 60) return (n / 1000).toFixed(n < 10000 ? 2 : 1) + 's';
+    var m = Math.floor(total / 60);
+    var s = total - m * 60;
+    return m + 'm' + (s ? ' ' + s + 's' : '');
   };
   var size = function (n) {
     n = Number(n) || 0;
@@ -689,10 +703,15 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       $('kevs').innerHTML = '<div class="kev"><span class="w" style="grid-column:1/-1">' + T('noKeyEvents') + '</span></div>';
       return;
     }
+    /* 未归属请求（还没选到 key 就被拒的 400/401/池空 503）单独说一句。
+       它们不在逐 key 卡片里，不说明的话 byKey 求和会对不上总数。 */
+    var unattr = Number(lifetime.unattributedRequests) || 0;
     var head = '<div class="kev"><span class="w" style="grid-column:1/-1">' +
       T('recentEvents') + ' · ' + T('histSince') + ' ' +
       (lifetime.since ? esc(new Date(lifetime.since).toLocaleString()) : '—') +
-      ' · ' + fmt(lifetime.totalRequests) + ' ' + T('reqShort') + '</span></div>';
+      ' · ' + fmt(lifetime.totalRequests) + ' ' + T('reqShort') +
+      (unattr ? ' · ' + fmt(unattr) + ' ' + T('unattributed') : '') +
+      '</span></div>';
     $('kevs').innerHTML = head + evs.map(function (e) {
       var dis = e.type === 'disabled';
       return '<div class="kev">' +
@@ -818,10 +837,10 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       b(fmt(s.failed), 's-bad') + ' ' + T('fail') + ' · ' +
       b(fmt(s.streaming)) + ' ' + T('stream');
 
-    $('m-avg').innerHTML = fmt(s.avgDurationMs) + '<i>ms</i>';
+    $('m-avg').innerHTML = ms(s.avgDurationMs);
     $('d-lat').innerHTML =
-      'p95 ' + b(fmt(s.p95DurationMs)) + 'ms · ' +
-      T('last') + ' ' + b(ev.length ? ev[0].durationMs : 0) + 'ms';
+      'p95 ' + b(ms(s.p95DurationMs)) + ' · ' +
+      T('last') + ' ' + b(ms(ev.length ? ev[0].durationMs : 0));
 
     $('m-tok').textContent = fmt(s.inputTokens + s.outputTokens);
     $('d-tok').innerHTML =
