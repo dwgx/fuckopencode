@@ -2023,6 +2023,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       refreshKeys: 'refresh', noLegacyKeys: 'no legacy keys',
       providersTitle: 'Providers', providersSub: 'providers available on this account',
       provider: 'provider', modelCount: 'models', status: 'status', noProviders: 'no providers',
+      consoleNotConfigured: 'console not configured for this account (env proxy uses local keys only)',
       cookieInvalid: 'console session invalid, update the cookie below',
       cookieMissing: 'no console session, import a cookie to read console data',
       importFromBrowser: 'import from browser',
@@ -2250,6 +2251,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       refreshKeys: '刷新', noLegacyKeys: '暂无旧版 key',
       providersTitle: '模型提供方', providersSub: '该账号可用的提供方',
       provider: '提供方', modelCount: '模型数', status: '状态', noProviders: '暂无提供方',
+      consoleNotConfigured: '该账号未配置控制台凭据（env 代理仅使用本地 key）',
       cookieInvalid: '控制台登录态失效，请更新下方 cookie',
       cookieMissing: '缺少控制台登录态，导入 cookie 后可读取控制台数据',
       importFromBrowser: '从浏览器导入',
@@ -4364,7 +4366,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     api('GET', '/__admin/api/console/account/' + id + '/billing', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
-        detailErr('billing', errMsg(r));
+        var acct2 = findAccount(id);
+        // env 代理账号（hasConsole=false）：无控制台凭据是常态，显示中性提示而非错误。
+        if (acct2 && !acct2.hasConsole) {
+          detailErr('billing', T('consoleNotConfigured'));
+        } else {
+          detailErr('billing', errMsg(r));
+        }
         $('detail-autorecharge').innerHTML = '';
         return;
       }
@@ -4415,7 +4423,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       '<div class="d-ops"><button class="oc-btn" data-action="configure-ar">' + T('configure') + '</button></div>');
     var cs = data.cookieState || 'ok';
     var cw = $('detail-cookie');
-    if (cs === 'ok') {
+    var acct = detailState.id != null ? findAccount(detailState.id) : null;
+    // env 代理账号（hasConsole=false）与控制台无关：不显示 cookie 导入提示。
+    if (cs === 'ok' || (acct && !acct.hasConsole)) {
       cw.hidden = true;
     } else {
       cw.hidden = false;
