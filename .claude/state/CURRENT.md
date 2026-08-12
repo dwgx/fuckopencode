@@ -1031,3 +1031,88 @@ SETTINGS_META 全覆盖 apply，全部补齐。
   `src/admin.ts`/`test/admin.test.ts` 的改动是并行 agent 的，未碰。
 - 每项修复都验证过「去掉修复该测试变红」（临时 revert 单项 + 跑定向测试确认红，再还原）。
 - 遗留：未提交、未上线；线上 memory 约束 / billing spike 等旧遗留不变。
+
+## 第二十二轮：安全加固（2026-08-13，本地验证，未提交）
+
+对抗式审查安全清单 6 项全实施 + 回归测试（每项都验证「去掉修复会红」）。**只碰安全区域**（config.ts、settings.ts、kiro_shield.py、server.ts 鉴权/登录/会话区、相关测试）；count_tokens/requests 记账是并行 agent 的域，未碰。
+
+| # | 项 | 改法 | 回归测试（去掉修复会红） |
+|---|---|---|---|
+| 1 | DASHBOARD_OPEN 默认 false | loadConfig 默认 true→false（fail-closed） | security.test.ts「DASHBOARD_OPEN 默认 false」——改回 true 即红 |
+| 2 | 默认密码强提示 | 默认值保留（线上 13141516 在用）+ settings GET 加 `adminPassIsDefault` + 登录成功用默认密码打 stderr 告警 + DEFAULT_ADMIN_PASS 常量单源 | settings.test.ts「adminPassIsDefault：等于默认值时置 true」 |
+| 3 | 登录限速转发头 | 盾剥离伪造转发头**修复**（原 title-case 键 pop 小写永不命中——剥离从未生效，实测伪造头透传）；网关 clientIpForRateLimit fail-closed（非回环对端忽略转发头） | 盾 test-shield.py「覆写 cf-connecting-ip 并剥离伪造转发头」+ security.test.ts「轮换 XFF 无法改变非回环对端的键」 |
+| 4a | 会话 m1 | 密码版本 sha256(adminPass) 编进 HMAC——改密码旧签名会话立即失效 | e2e「m1：adminPass 变更后旧签名会话立即失效」——去掉 passwordVersion 即红 |
+| 4b | 会话 m2 | revokedSessions Set→Map + 过期清理 + MAX_REVOKED_SESSIONS 上限 | e2e「m2：revokedSessions 按过期清理 + 上限」——prune 变 no-op 即红 |
+| 4c | 登录 m4 | login POST 先过 adminOriginAllowed（跨站表单锁 DoS，校验在限速前） | e2e「m4：跨站表单登录被 Origin 校验拒绝」——去掉校验即红 |
+| 5 | 盾管理路径 401/403 透传 | classify() 在 body 标记判断前加 ADMIN_PATH_PREFIXES 401/403→pass | 盾 test-shield.py「管理路径 401 原样透传/不重试」 |
+
+**盾侧发现并修了一个潜伏 bug**（commit 30d20a7 引入）：`_collect_request` 的 `headers.pop("x-forwarded-for")` 等因 `http.server` 头键是 title-case（X-Forwarded-For）永不命中，**剥离伪造转发头从未生效**——轮换 XFF 直连盾即可绕过登录限速。已改为构 dict 时统一小写过滤。连带修复 test-shield.py：`call()` 补非回环 Host（`_check_host` 拒 Host:127.0.0.1，测试 harness 自 30d20a7 起全 403）。
+
+**验证**：typecheck 干净；security 65 / settings 27 / e2e 登录 13 / 盾 37/37 全绿。全量 `npm test` 1186/1187——仅剩 1 条失败「直通流式 input_tokens 落库」（并行 count_tokens/requests agent 的在途改动所致，本会话期间其改动让失败数从 4 收敛到 1，属其域，未替它修）。
+
+**需要用户注意**：
+- 默认密码方案选了「保留默认 + 强提示」而非「首次启动随机生成」：改默认值会破坏线上现有登录（13141516 在用），随机生成需面板可读（admin.ts UI，本域外）。强提示已三条路：settings GET adminPassIsDefault（面板据此显示）、登录 stderr 告警、DEFAULT_ADMIN_PASS 单源。面板 UI 那行提示（读 adminPassIsDefault 字段）留给 UI agent，一行。
+- 会话语义变化：改 adminPass 后旧签名会话**立即失效**（此前 24h 内仍有效）——已知取舍注释已同步。
+
+## 第二十三轮：监控/观测增强（2026-08-13，本地验证，未提交）
+
+对抗审查观测清单 + 用户「更强的观测」。**只碰监控/记账区**（count_tokens/requests/metrics/审计/admin 请求日志/usagedb audit 表）；鉴权/登录/会话/盾是并行安全 agent 的域（未碰），oauth/console/legacy 通道按任务约束未碰。
+
+| # | 项 | 改法 | 回归测试（去掉修复会红，已实测） |
+|---|---|---|---|
+| 1 | count_tokens 落库恒 0 | `handleCountTokens` 改 async+await（finally 不再抢跑于 .then()）；body 读失败/JSON 错写 ctx.error；`ctx.endpoint='count_tokens'` 标记 | e2e「count_tokens 落库真实 input_tokens」——去掉 await 后 `expected 0 to be greater than 0`；e2e「count_tokens 读失败写 ctx.error（413）」——去掉写 error 后 `null.toContain` 红 |
+| 1b | 记账请求不进请求数统计 | metrics 事件跳过 count_tokens（finally 里 `ctx.endpoint !== 'count_tokens'`）；db 聚合全部 `endpoint NOT IN ('probe','count_tokens')`（usageTrend/history byKey+total/statsByIp/usageByKeyFingerprints/tokenUsageAll）；listRequests 仍可见（endpoint 区分） | usagedb「count_tokens 排除出用量聚合」——恢复后 `expected 2 to be 1` |
+| 2 | 用量账本确认 | 直通流式 message_delta.usage.input_tokens 取用链 server.ts:2611-2617（第二十一轮 #7 已部署）→ 补 db 级断言（原只测 /__metrics events） | e2e「直通流式 input_tokens 落库」 |
+| 3 | 操作审计视图 | admin_audit 补 ip 列（迁移幂等）；登录/登出/tokens/settings/model-alias/账户 CRUD 审计全带 ip；登出补 op=logout；GET /__admin/api/audit 端点；用量 tab「操作审计」section（谁·何时·做了什么，联表账号名） | e2e「登出落 admin_audit + 审计端点读回」——去掉 logout 审计后 `expected false to be true`；usagedb listAdminAudit（ip + 联表 + limit） |
+| 4 | 错误观测 | 请求明细 error 列已有（.s-bad 详情行）→ 补 error 进 q 搜索 + placeholder 更新；successRate=ok/(ok+failed) 确认覆盖 429/5xx（usageTrend failed = status>=400 OR =0） | usagedb「error 列纳入搜索」 |
+
+**设计说明（审计脱敏口径）**：admin_audit 只存 op/accountId/ok/note/ip 摘要——金额与 cookie 明文绝不落库（沿用既有 insertAdminAudit 哲学）。面板审计视图对每个管理写操作显示：时间 / 操作 / 结果 / 账号（联表名字，删号后回落 #id）/ IP（来源）。console/legacy 写操作的 execute* 辅助函数无 req 且属「不碰通道」约束，其审计保持原 op/accountId/ok/note 不变（ip 为 null），其余打点全带 ip。
+
+**验证**：typecheck 干净；npm test **1187/1187**（27 文件，第二十二轮安全 agent 的 4 条在途失败已由本轮收敛）。变异验证：await、ctx.error、count_tokens 排除聚合、logout 审计四处去掉即红。
+
+## 第二十四轮：OAuth 账号 console 数据完整接入 + cookie 失效替代路径（2026-08-13，本地验证，未提交）
+
+任务：OAuth 授权账号的 console 数据完整覆盖 + refresh 失效明确状态 + cookie 失效的 OAuth 替代引导。
+**只碰 oauth.ts/console.ts/server.ts 的 console+OAuth 端点区 + admin.ts OAuth 弹层/提示区 + 相关测试**。
+typecheck 干净 + **1195/1195 全绿**（1187 + 新 8：console.test +6、admin.test 相关断言、e2e +2 场景）。
+
+### 现状探查结论（先探查再动手）
+
+- **OAuth 已全覆盖所有 console 读端点**：console.ts 所有读/写端点统一走 `getCredentials()`
+  （cookie 优先，401 后回退 Bearer），无 cookie-only 端点。workspaces 端点是 store 推断
+  （不查上游），OAuth 账号同样能用。真实上游是否认 Bearer 未实测（需活 OAuth 账号）——
+  代码层覆盖完整，诚实披露。
+- **缺失一：失效通道不可区分**。`recordFail` 只记 invalid，不记 cookie 还是 OAuth Bearer 失效
+  → 面板对 OAuth 账号也提示「更新 cookie」（错误指引）。
+- **缺失二：refresh 失效的误报面**。refresh 网络/5xx 失败此前也判 invalid → 面板会提示
+  用户重新授权，而一次网络抖动根本不需要重新授权（最贵的误报）。
+- **缺失三：OAuth 弹层 not_found 文案缺失**（落到泛 oauthFail）。
+- **补绑现状（确认）**：`persistOauthAccount` 按 workspaceId 幂等 —— 同 workspace 的现有
+  cookie 账号再走 Sign in with OpenCode 即「补绑」（cookie + refresh 并存，cookie 优先、
+  失效自动回退 Bearer）；不同 workspace 才新建。补绑零成本，已文档化（server.ts 注释）。
+
+### 改动（逐项）
+
+| 文件 | 改动 |
+|---|---|
+| src/console.ts | health 加 `channel` 字段；`recordFail` 带通道；`authChannel(id)` 新方法；getJson/postJson 401 记通道；refresh 401/403 → oauth 失效、5xx/网络 → **不**判失效 |
+| src/server.ts | ConsoleClientLike 加 `authChannel`；`consoleCookieState` 返回 `oauth-invalid`；billing invalid 路径区分；`sendConsoleReadFailure` 按失效通道给不同文案（OAuth → sign in with OpenCode）；`persistOauthAccount` 补绑语义注释 |
+| src/admin.ts | detail-cookie 横幅加 `detail-oauth` 按钮（复用 OAuth 弹层）+ oauth-invalid 专属文案 + oauth-invalid 时隐藏 cookie 导入行；`oauthError` 补 `not_found` 文案；i18n en/zh 加 `oauthInvalid`/`oauthInstead`/`oauthNotFound` |
+| test/console.test.ts | +6：Bearer 覆盖全部 15 个读端点 + 4 个写端点（refresh 单飞）、refresh 401→oauth 失效、refresh 5xx→不失效、cookie 401→cookie 失效后 Bearer 恢复、Bearer 数据请求 401→oauth 失效 |
+| test/e2e.test.ts | FakeConsoleClient 加 `oauthInvalid`/`authChannel`；+2：billing cookieState=oauth-invalid、读失败 502 文案指引重新授权（非更新 cookie） |
+| test/admin.test.ts | 钉住 not_found 映射、detail-oauth 接线、oauth-invalid 分支、i18n 新键 |
+
+### 验证（真实输出）
+
+```
+npm run typecheck  → 干净
+npm test           → Test Files 27 passed / Tests 1195 passed（2.6s）
+npm run build      → 干净
+```
+
+### 遗留
+
+- 真实上游 Bearer 接受度未实测（本地无活 OAuth 账号）；OAuth 账号线上实测时核对
+  console 各端点是否真认 Bearer，若不认需给 console.ts 的 Bearer fallback 加白名单降级。
+- 未提交、未上线（工作区含并行 agent 的未提交改动，提交范围待用户确认）。
+

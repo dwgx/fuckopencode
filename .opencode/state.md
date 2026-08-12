@@ -1,42 +1,37 @@
-# fuckopencode 任务状态
-
-更新时间：2026-08-12 14:20（本轮：RPM 限流 + UI 全站模板化 + 错误修复 + 安全，已部署，1151 测试绿）
+# 控制台数据接入提升：OAuth 完整接入 + cookie 失效替代路径
 
 ## 目标
-OpenCode 能力复刻到自建网关面板 + 线上稳定 + 全站控件模板化。用户已出门（2026-08-12），不问、按决策执行。
+1. OAuth 账号 console 数据全覆盖（Bearer 通道确认 + 补测试）
+2. OAuth 生命周期：refresh 失效 → 面板明确「OAuth 凭据失效，重新授权」；OAuth 弹层失败文案补全；补绑现状确认+文档化
+3. cookie 失效体验：详情页横幅加 OAuth 引导入口
+4. 测试：Bearer 通道全端点覆盖 + refresh 失效状态；npm test + typecheck 全绿
 
-## 本轮完成（已部署 + 1151 测试全绿）
-1. **per-key RPM 限流**（用户核心需求）：tokens 表 rpm_limit 列（0=不限流）+ RpmLimiter（src/ratelimit.ts：60 桶滑动窗口、拒绝也计数、惰性清理）+ chat/messages 入口限流（429 协议正确 Anthropic/OpenAI + retry-after + 不触发 keypool 冷却 + 不计入转发）+ 密钥 tab RPM 配置 UI（输入 + 保存 PATCH）。
-2. **UI 全站控件模板化**（用户硬要求「不许有一个控件不走模板」）：oc-btn/primary/ghost/danger/sm、oc-input/select/textarea/field/form、oc-hint/oc-hint-err、oc-modal 系列（confirm-ok 改 data-variant）、oc-check（GO checkbox）+ oc-switch（实验开关）、oc-chip/oc-dot（徽章/状态点）；旧类名 CSS 兼容别名；内联 JS new Function() 解析测试防线。
-3. **错误修复**：
-   - 详情页 loading 态（用户「点进啥也看不到」——是加载中无提示）
-   - 右键账号卡片进详情（contextmenu，输入框内放过）
-   - 错误 sticky 持久化（go/legacy/billing 等——不被 2s 轮询刷掉，用户手动操作成功才清）
-   - RPM 输入不被轮询清（tokenFingerprint 守卫——对抗审查 B1）
-   - set-rpm/toggle-token 失败走 flash（不写隐藏弹层——M2）
-   - consoleBlock 重复渲染（M3）
-   - legacy key 复制按钮（/keys/plain 明文端点——内存缓存 + 实时抓取 + TTL + 上限 + 鉴权）
-   - gmail auth failed 具体指引、billing 无 balance 显示 —、import-cookie 补 noteCredentialChanged
-   - LOGIN_HTML i18n（硬编码英文修复）
-4. **服务端正确性**（对抗审查修复）：retry-after 改为「窗口降到 limit 以下」时刻（饱和时 50s 而非恒 1s——实测验证）+ 429 前 drain body + Connection: close（防 keep-alive 假 400）+ now=0 边界（lw>0 漏计——真实场景不触发但已修）。
-5. **线上安全**：盾观测端点 /_shield/* 仅回环可访问（公网 404 实测）。
+## 约束
+- 只碰 oauth.ts / console.ts / server.ts 的 console+OAuth 端点区 / admin.ts 的 OAuth 弹层+提示区 / 相关测试
+- 不碰鉴权/登录/会话/盾、count_tokens/审计、accounts/tokens/settings 管理逻辑
+- 工作区有并行 agent 未提交改动（security/audit 等），我的 diff 要隔离开
 
-## 线上关键事实
-- 架构：FurCDN（cdn.taipei）直连 nbus:8787 回源（不是 cloudflared！）——**盾不能改回环监听**（面板 502 已踩坑）。
-- 网关 127.0.0.1:8788（systemd fuckopencode，/root/fuckopencode/dist），盾 0.0.0.0:8787（fuckopencode-shield，/opt/fuckopencode-shield/kiro_shield.py），面板密码 13141516。
-- 公网面板 200 稳定。本地隧道 8788 调试用。
-- 分发 key：dwgxnbnb（sk-****239d8bcd）RPM 默认 0。
+## 已确认事实（探查结论）
+- console.ts 所有读端点都走 `getCredentials()`（cookie 优先，401 后回退 Bearer）→ **代码层面 OAuth 已全覆盖所有端点**，无 cookie-only 端点。workspaces 端点是 store 推断不查上游。真实上游是否认 Bearer 未实测（需活 OAuth 账号），诚实披露。
+- `recordFail(id, auth)` 只记 invalid，**不记哪个通道失败** → cookieStatus 只有 ok/invalid，OAuth 失效也显示「更新 cookie」错误指引（误导）。
+- server.ts `consoleCookieState` 返回 ok/invalid/missing；billing invalid 路径写死 cookieState:'invalid'；sendConsoleReadFailure 文案只提 cookie。
+- admin.ts `oauthError(reason)`：expired/denied/net 有专文案，**not_found 落到泛 oauthFail**。
+- 补绑：`persistOauthAccount` 按 workspaceId 幂等 —— 同 workspaceId 已存在账号 → 更新 oauth refresh（即补绑生效）；不同 workspaceId → 新建。现状=workspaceId 匹配即补绑。
+- `ConsoleClientLike`（server.ts:1616）由 ConsoleClient + e2e FakeConsoleClient 实现。
+- 工作区未提交改动中 admin.ts/server.ts 有并行 agent 改动，注意别碰区域。
 
-## 遗留/待办（重要）
-1. **gmail/outlook console cookie 失效**（线上实测 __Host-console_session 过期）：面板已给指引（更新 cookie/从浏览器导入）——**需要用户重新登录 opencode.ai 粘贴 cookie**（共享 Chrome 是 gmail 会话——导入路径已修 noteCredentialChanged）。这是用户侧动作，等用户回来。
-2. **OOM 修复观察**：693 次崩溃全在 10:00 修复前，之后 0 次，触发条件大 body——需完整周期。
-3. **tokens 持久性**：checkpoint 加固已部署，WAL 丢失未复现。
-4. **工作树大量未提交**（历轮 + 本轮——69 文件），用户没让提交。
-5. 盾公网直连口子仍在（FurCDN 需公网回源，无 IP 白名单——并发闸门兜底 503，记录为已知）。
-6. 总览 24h/7d 切换按钮（端点已支持 range，一行接上）。
+## 改动清单
+- [x] src/console.ts：health 加 channel 字段；recordFail 带通道；refresh 401/403 → oauth 失效，5xx/网络 → 不失效；新增 `authChannel(id)`
+- [x] src/server.ts：ConsoleClientLike 加 authChannel；consoleCookieState 返回 oauth-invalid；billing invalid 路径区分；sendConsoleReadFailure 文案区分 OAuth；persistOauthAccount 补绑语义注释
+- [x] src/admin.ts：detail-cookie 横幅加 OAuth 按钮 + oauth-invalid 文案；oauthError 补 not_found；i18n en/zh 加 oauthInvalid/oauthInstead/oauthNotFound；detail-oauth 事件绑定
+- [x] test/console.test.ts：Bearer 全端点覆盖 + authChannel 失效测试（+6）
+- [x] test/e2e.test.ts：FakeConsoleClient 加 authChannel；oauth-invalid → billing cookieState + 502 文案（+2）
+- [x] 文档化：补绑语义（persistOauthAccount 幂等，server.ts 注释 + CURRENT.md 第二十四轮）
 
-## 下一轮候选
-1. 用户回来：更新 gmail/outlook cookie → 验证 legacy/console 数据恢复
-2. 提交工作树（等指示）
-3. 观察 OOM/盾/tokens
-4. 文档同步
+## 验证
+- [x] npm run typecheck — 干净
+- [x] npm test — 1195/1195 全绿
+- [x] npm run build — 干净
+
+## 完成（2026-08-13）
+全部完成。未提交（工作区含并行 agent 改动）。遗留：真实上游 Bearer 接受度未实测（需活 OAuth 账号）。
