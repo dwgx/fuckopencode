@@ -2778,14 +2778,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
 
   /** 账号渲染指纹：排除每秒变的 retryInMs/recoverInMs（倒计时由 data-rc 自走），
-   *  其余字段任何变化（含 degraded）都会触发重建。数据没变时保留 DOM——
-   *  否则 2s 轮询会把用户正在输入的 key/编辑表单清掉。 */
+   *  也排除 key 的 inFlight/lastUsedAt（keypool 实时值，任何请求都变——活跃流量下
+   *  2s 轮询会因它们重建列表，正在输入的 key/编辑表单被清空）。保留 disabledReason/
+   *  healthy/nickname 等状态字段，状态或昵称变化仍触发重建。 */
   function renderFingerprint(d) {
     return JSON.stringify(d.degraded) + '|' + (d.list || []).map(function (a) {
       return [a.id, a.name, a.kind, a.status, a.statusDetail, a.retryUntil, a.balance,
         a.monthlyLimit, a.monthlyUsage, a.lastProbeAt, a.lastBillingAt,
         JSON.stringify((a.keys || []).map(function (k) {
-          return [k.fingerprint, k.healthy, k.inFlight, k.disabledReason, k.lastUsedAt, k.nickname];
+          return [k.fingerprint, k.healthy, k.disabledReason, k.nickname];
         }))].join(':');
     }).join(';');
   }
@@ -4181,22 +4182,25 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     detailState.billing = null;
     switchView('accounts');
   }
-  /** 详情区块 → 标题/副标题 i18n key。首次进入时显示 loading 骨架（已有内容不覆盖）。 */
+  /** 详情区块 → 标题/副标题 i18n key。首次进入时显示 loading 骨架（已有内容不覆盖）。
+   *  键必须与对应 render 函数 dBlock() 实际用的键一致且都在 I18N 字典里——
+   *  否则 loading 骨架直接显示原始 key 名（DETAIL_BLOCK_KEYS 的 T() 是变量传键，
+   *  静态检查看不见）。 */
   var DETAIL_BLOCK_KEYS = [
     ['detail-workspace', 'workspaceTitle', 'workspaceSub'],
     ['detail-billing', 'balanceTitle', 'balanceSub'],
     ['detail-usage', 'usageTitle', 'usageSub'],
-    ['detail-models-usage', 'modelsUsageTitle', 'modelsUsageSub'],
-    ['detail-users-usage', 'usersUsageTitle', 'usersUsageSub'],
+    ['detail-models-usage', 'modelUsageTitle', 'modelUsageSub'],
+    ['detail-users-usage', 'userUsageTitle', 'userUsageSub'],
     ['detail-autorecharge', 'autoRechargeTitle', 'autoRechargeSub'],
     ['detail-budgets', 'budgetsTitle', 'budgetsSub'],
     ['detail-members', 'membersTitle', 'membersSub'],
     ['detail-sa', 'saTitle', 'saSub'],
     ['detail-providers', 'providersTitle', 'providersSub'],
     ['detail-pricing', 'pricingTitle', 'pricingSub'],
-    ['detail-go', 'goTitle', 'goSub'],
-    ['detail-legacy', 'legacyKeysTitle', 'legacyKeysSub'],
-    ['detail-legacy-billing', 'legacyBillingTitle', 'legacyBillingSub'],
+    ['detail-go', 'goSub', 'goSubHint'],
+    ['detail-legacy', 'legacyKeys', 'legacySub'],
+    ['detail-legacy-billing', 'legacyBilling', 'legacyBillingSub'],
   ];
   function loadAccountDetail() {
     var id = detailState.id;
@@ -4224,12 +4228,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   /** 工作区区块：显示当前 workspace（id + 名称）+ 切换入口。 */
   function loadWorkspaces(id) {
     api('GET', '/__admin/api/console/account/' + id + '/workspaces', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
         detailErr('workspace', errMsg(r));
         return;
       }
       renderWorkspaces(r.json.data, id);
-    }).catch(function () { detailErr('workspace', T('opFail')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('workspace', T('opFail')); });
   }
   function renderWorkspaces(data, id) {
     if (!clearSticky('workspace')) return;
@@ -4312,6 +4317,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
   function loadGo(id, fromTick) {
     api('GET', '/__admin/api/legacy/account/' + id + '/go', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       var el = $('detail-go');
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data || !r.json.data.go) {
         if (r.status === 404) { el.innerHTML = ''; return; }  // 非 legacy workspace 静默隐藏
@@ -4320,7 +4326,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         return;
       }
       renderGo(r.json.data.go, id, fromTick);
-    }).catch(function () { detailErr('go', T('consoleUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('go', T('consoleUnavailable')); });
   }
 
   /** Go 订阅区块：三窗口用量进度条 + 重置时间 + 开关。 */
@@ -4356,21 +4362,25 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
   function loadBilling(id, fromTick) {
     api('GET', '/__admin/api/console/account/' + id + '/billing', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
         detailErr('billing', errMsg(r));
         $('detail-autorecharge').innerHTML = '';
         return;
       }
       renderBilling(r.json.data, fromTick);
-    }).catch(function () { detailErr('billing', T('consoleUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('billing', T('consoleUnavailable')); });
   }
   function renderBilling(data, fromTick) {
     // sticky 错误在自动轮询成功时不覆盖（detailErr 的错误要持续显示到用户操作）。
     if (!clearSticky('billing', fromTick)) return;
     detailState.billing = data;
-    var bal = money(data.balance);
+    // balance/promotional 后端已是美元（microCentsToDollars 转换过，e2e 钉住
+    // data.balance === 42.18）——直接 toFixed(2)，不再过 money()（money 是
+    // microCents→美元，再除一次 1e8 会把非零余额压成 $0.00）。对齐账号列表 accountCard。
+    var bal = data.balance == null ? '—' : '$' + Number(data.balance).toFixed(2);
     var promo = Number(data.promotional || 0) > 0
-      ? '<div class="balance-card"><div class="v">' + money(data.promotional) + '</div><div class="l">' + T('promotional') + '</div></div>'
+      ? '<div class="balance-card"><div class="v">$' + Number(data.promotional).toFixed(2) + '</div><div class="l">' + T('promotional') + '</div></div>'
       : '';
     var pm = data.paymentMethods || [];
     var pmTxt = pm.length ? pm.map(function (m) {
@@ -4417,12 +4427,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     var id = detailState.id;
     if (id == null) return;
     api('GET', '/__admin/api/console/account/' + id + '/usage?range=' + detailState.range, null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
         detailErr('usage', errMsg(r));
         return;
       }
       renderUsageDetail(r.json.data);
-    }).catch(function () { detailErr('usage', T('usageUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('usage', T('usageUnavailable')); });
   }
   /** 每日成本趋势柱（最近 7 天，最高柱 accent 实色）。无成本数据返回提示。 */
   function trendHtml(byDay) {
@@ -4475,11 +4486,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // ── P0：模型消费 / 成员消费 / 成员预算状态 / 模型定价 ──
   function loadModelsUsage(id) {
     api('GET', '/__admin/api/console/account/' + id + '/usage/models?range=' + detailState.range, null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-models-usage');
       if (!el) return;
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) { el.innerHTML = ''; return; }
       renderModelsUsage((r.json.data.items) || []);
-    }).catch(function () { var el = $('detail-models-usage'); if (el) el.innerHTML = ''; });
+    }).catch(function () { if (detailState.id !== id) return; var el = $('detail-models-usage'); if (el) el.innerHTML = ''; });
   }
   function renderModelsUsage(items) {
     if (!items.length) { $('detail-models-usage').innerHTML = ''; return; }
@@ -4496,11 +4508,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
   function loadUsersUsage(id) {
     api('GET', '/__admin/api/console/account/' + id + '/usage/users?range=' + detailState.range, null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-users-usage');
       if (!el) return;
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) { el.innerHTML = ''; return; }
       renderUsersUsage((r.json.data.items) || []);
-    }).catch(function () { var el = $('detail-users-usage'); if (el) el.innerHTML = ''; });
+    }).catch(function () { if (detailState.id !== id) return; var el = $('detail-users-usage'); if (el) el.innerHTML = ''; });
   }
   function renderUsersUsage(items) {
     if (!items.length) { $('detail-users-usage').innerHTML = ''; return; }
@@ -4519,6 +4532,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   /** 成员预算状态：限/已用/超限徽标/重置时刻。无数据静默（区块里只扩表格）。 */
   function loadMemberBudgets(id) {
     api('GET', '/__admin/api/console/account/' + id + '/budgets/users-status', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) return;
       renderMemberBudgets((r.json.data.items) || []);
     }).catch(function () {});
@@ -4548,11 +4562,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   /** 模型定价：简化展示（模型名 + 输入/输出每百万 token 美元），61 模型限高滚动。 */
   function loadPricing(id) {
     api('GET', '/__admin/api/console/account/' + id + '/models-pricing', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-pricing');
       if (!el) return;
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) { el.innerHTML = ''; return; }
       renderPricing(r.json.data);
-    }).catch(function () { var el = $('detail-pricing'); if (el) el.innerHTML = ''; });
+    }).catch(function () { if (detailState.id !== id) return; var el = $('detail-pricing'); if (el) el.innerHTML = ''; });
   }
   function renderPricing(data) {
     var provs = (data && data.providers) || {};
@@ -4583,6 +4598,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   /** 旧版计费：余额（美元）+ 自动充值 + 最近 5 笔支付。失败语义与 legacy keys 同款。 */
   function loadLegacyBilling(id) {
     api('GET', '/__admin/api/legacy/account/' + id + '/billing', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-legacy-billing');
       if (!el) return;
       if (!r.ok && r.status === 404) { el.innerHTML = ''; return; }
@@ -4594,6 +4610,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       }
       renderLegacyBilling(r.json.data.billing);
     }).catch(function () {
+      if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-legacy-billing');
       if (el) el.innerHTML = '';
     });
@@ -4625,9 +4642,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
 
   function loadMembers(id) {    api('GET', '/__admin/api/console/account/' + id + '/members', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('members', errMsg(r)); return; }
       renderMembers(r.json);
-    }).catch(function () { detailErr('members', T('consoleUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('members', T('consoleUnavailable')); });
   }
   function renderMembers(j) {
     if (!clearSticky('members')) return;
@@ -4646,9 +4664,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
   function loadSa(id) {
     api('GET', '/__admin/api/console/account/' + id + '/keys', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('sa', errMsg(r)); return; }
       renderSa(r.json);
-    }).catch(function () { detailErr('sa', T('consoleUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('sa', T('consoleUnavailable')); });
   }
   function renderSa(j) {
     if (!clearSticky('sa')) return;
@@ -4673,6 +4692,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // cookie 缺失/格式错误 → 明确提示；其余网络错误 → 静默隐藏。
   function loadLegacyKeys(id, fromTick) {
     api('GET', '/__admin/api/legacy/account/' + id + '/keys', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-legacy');
       if (!el) return;
       if (!r.ok && r.status === 404) { el.innerHTML = ''; return; }
@@ -4683,7 +4703,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         return;
       }
       renderLegacyKeys(r.json, fromTick);
-    }).catch(function () { detailErr('legacy', T('consoleUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('legacy', T('consoleUnavailable')); });
   }
   /** cookie 相关失败识别：401/403，或错误 type/message 里带 cookie 字样。 */
   function isLegacyCookieError(r) {
@@ -4789,9 +4809,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
   function loadProviders(id) {
     api('GET', '/__admin/api/console/account/' + id + '/providers', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('providers', errMsg(r)); return; }
       renderProviders(r.json);
-    }).catch(function () { detailErr('providers', T('consoleUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('providers', T('consoleUnavailable')); });
   }
   function renderProviders(arr) {
     if (!clearSticky('providers')) return;
@@ -4809,9 +4830,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
   function loadBudgets(id) {
     api('GET', '/__admin/api/console/account/' + id + '/budgets', null).then(function (r) {
+      if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('budgets', errMsg(r)); return; }
       renderBudgets(r.json);
-    }).catch(function () { detailErr('budgets', T('consoleUnavailable')); });
+    }).catch(function () { if (detailState.id !== id) return; detailErr('budgets', T('consoleUnavailable')); });
   }
   function budgetRow(scope, val) {
     var v;
@@ -4867,12 +4889,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     ok.dataset.busy = '0';
     if (confirmState) ok.textContent = confirmState.okText || T('confirm');
   }
-  /** 写操作统一收尾：成功 → 关弹层 + flash + tick 刷新；失败 → 弹层内报错。 */
-  function opDone(r, okMsg) {
+  /** 写操作统一收尾：成功 → 关弹层 + flash + tick 刷新 + 按操作类型重载目标区块
+   *  （tick 只重载 billing/go/legacyKeys/legacyBilling，sa/budgets/members/providers
+   *  不刷新——写成功但表格不更新）；失败 → 弹层内报错。 */
+  function opDone(r, okMsg, reload) {
     if (r.ok) {
       closeConfirm();
       flash(okMsg);
       tick(true);
+      if (reload) reload();
     } else {
       unlockConfirm();
       $('confirm-err').textContent = errMsg(r);
@@ -4910,7 +4935,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           thresholdDollars: isNaN(thr) ? undefined : thr,
           rechargeAmountDollars: isNaN(amt) ? undefined : amt,
           confirm: true   // 弹层确认流程即服务端 confirm 信号（防误触扣款）
-        }).then(function (r) { opDone(r, T('arSaved')); });
+        }).then(function (r) { opDone(r, T('arSaved'), function () { loadBilling(id, false); }); });
       }
     });
   }
@@ -4926,7 +4951,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         var v = parseFloat($('ml-limit').value);
         if (isNaN(v) || v < 0) { $('confirm-err').textContent = T('invalidNumber'); unlockConfirm(); return; }
         api('POST', '/__admin/api/console/account/' + id + '/monthly-limit', { limitDollars: v })
-          .then(function (r) { opDone(r, T('mlSaved')); });
+          .then(function (r) { opDone(r, T('mlSaved'), function () { loadBudgets(id); }); });
       }
     });
   }
@@ -4942,7 +4967,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         var name = $('sa-name').value.trim();
         if (!name) { $('confirm-err').textContent = T('nameRequired'); unlockConfirm(); return; }
         api('POST', '/__admin/api/console/account/' + id + '/keys', { name: name })
-          .then(function (r) { opDone(r, T('saCreated')); });
+          .then(function (r) { opDone(r, T('saCreated'), function () { loadSa(id); }); });
       }
     });
   }
@@ -4956,7 +4981,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       body: '<div class="oc-hint">' + T('delSaConfirm') + '</div>',
       run: function () {
         api('DELETE', '/__admin/api/console/account/' + id + '/keys/' + encodeURIComponent(saId), null)
-          .then(function (r) { opDone(r, T('saDeleted')); });
+          .then(function (r) { opDone(r, T('saDeleted'), function () { loadSa(id); }); });
       }
     });
   }
@@ -4969,7 +4994,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       body: '<div class="oc-hint">' + T('cookieModalBody') + '</div>',
       run: function () {
         api('POST', '/__admin/api/console/import-cookie', { accountId: id })
-          .then(function (r) { opDone(r, T('cookieImported')); });
+          .then(function (r) { opDone(r, T('cookieImported'), function () { loadAccountDetail(); }); });
       }
     });
   }
@@ -5163,6 +5188,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           stickyErr['go'] = true; // 标记 sticky：2s 轮询的 loadGo 成功也不重建，错误留着（对抗审查 M1）
           var ge = $('go-err');
           if (ge) ge.textContent = errMsg(r);
+        } else {
+          // 成功清掉 sticky：否则 loadGo 的 clearSticky('go', true) 永远拒绝渲染，
+          // 错误残留且服务端状态渲染不出来（成功是用户主动操作，允许覆盖）。
+          delete stickyErr['go'];
+          var ge = $('go-err');
+          if (ge) ge.textContent = '';
         }
       });
     }
