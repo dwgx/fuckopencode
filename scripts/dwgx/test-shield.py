@@ -112,12 +112,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _NOREDIR_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def call(port, path="/v1/messages", body=None):
+def call(port, path="/v1/messages", body=None, headers=None):
+    # host 必须是非回环域名：盾的 `_check_host` 会拒绝 Host 指向本地回环的
+    # 请求（防公网伪造 Host:127.0.0.1 骗过网关「本机直连」豁免）。测试客户端
+    # 走的是真实公网形态（FurCDN → 盾），Host 用线上域名。
+    hdrs = {"content-type": "application/json", "authorization": "Bearer test",
+            "host": "fuckopencode.dwgx.top"}
+    if headers:
+        hdrs.update(headers)
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         data=json.dumps(body or {"model": "deepseek-v4-flash",
                                  "messages": [{"role": "user", "content": "hi"}]}).encode(),
-        headers={"content-type": "application/json", "authorization": "Bearer test"},
+        headers=hdrs,
         method="POST",
     )
     started = time.time()
@@ -468,6 +475,102 @@ def case_host_header_forwarded():
     finally:
         shield.kill(); srv.shutdown()
 
+
+def case_admin_401_passthrough():
+    """管理路径 401 直接透传（不重试、不包成 503）——面板登录失败立刻可见。
+
+    网关登录失败的 401 错误体带 `authentication_error`，原实现会被判成
+    `client`（2s×2 次/6s 预算）→ 面板登录失败被拖成「等几秒才 503」。
+    管理路径的 401 是业务状态（未登录/密码错），客户端自己知道要登录，
+    重试只会把「立刻 401」换成「迟到的 503」。
+    """
+    up, up_port = start_fake([(401, UNAUTHORIZED)] * 20)
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port, path="/__admin/api/login",
+                                    body={"username": "admin", "password": "x"})
+        check("管理路径 401 原样透传（status=401，不是 503）",
+              status == 401,
+              f"status={status} 耗时={elapsed:.1f}s body={body[:60]}")
+        check("管理路径 401 不重试（上游只被打 1 次）",
+              up.hits == 1,
+              f"上游被打={up.hits} 次（重试会是 2+ 次）")
+        check("管理路径 401 秒回（无 client-wait 等待）",
+              elapsed < 5,
+              f"耗时={elapsed:.1f}s（client-wait 是 6s+ 预算）")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+def case_inference_401_still_converged():
+    """非管理路径的 401 行为不变（仍快速收敛，不被长窗拖住）。"""
+    up, up_port = start_fake([(401, UNAUTHORIZED)] * 20)
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port)
+        check("推理路径 401 仍快速收敛（行为不变）",
+              status == 503 and elapsed < 15,
+              f"status={status} 耗时={elapsed:.1f}s")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+def case_forward_headers_overwritten():
+    """盾覆写 cf-connecting-ip 并剥离客户端伪造的转发头（登录限速按真实 IP）。
+
+    攻击者直连盾时轮换 X-Forwarded-For 试图绕过网关登录限速 —— 盾必须把
+    这些伪造头剥掉，改成真实对端 IP 写进 cf-connecting-ip，并打上
+    X-Shield-Forwarded 标记。网关凭「回环对端 + 覆写后的头」限速。
+    """
+    seen = {}
+
+    class HeaderCapture(FakeUpstream):
+        def do_POST(self):
+            seen["cf"] = self.headers.get("cf-connecting-ip", "")
+            seen["xff"] = self.headers.get("x-forwarded-for")
+            seen["xri"] = self.headers.get("x-real-ip")
+            seen["cfray"] = self.headers.get("cf-ray")
+            seen["shield"] = self.headers.get("x-shield-forwarded")
+            super().do_POST()
+
+    import socket as _s
+    with _s.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    srv = HTTPServer(("127.0.0.1", port), HeaderCapture)
+    srv.script = []
+    srv.hits = 0
+    import threading as _t
+    _t.Thread(target=srv.serve_forever, daemon=True).start()
+    shield, sh_port = start_shield(port)
+    try:
+        status, _, _ = call(sh_port, headers={
+            "x-forwarded-for": "203.0.113.9, 10.0.0.1",
+            "x-real-ip": "198.51.100.7",
+            "cf-ray": "fake-ray",
+        })
+        check("cf-connecting-ip 被覆写为真实对端 IP（本机测试 = 127.0.0.1）",
+              seen.get("cf") == "127.0.0.1",
+              f"upstream cf-connecting-ip={seen.get('cf')!r}")
+        check("客户端伪造的 x-forwarded-for 被剥离",
+              seen.get("xff") is None,
+              f"upstream x-forwarded-for={seen.get('xff')!r}")
+        check("客户端伪造的 x-real-ip 被剥离",
+              seen.get("xri") is None,
+              f"upstream x-real-ip={seen.get('xri')!r}")
+        check("客户端伪造的 cf-ray 被剥离",
+              seen.get("cfray") is None,
+              f"upstream cf-ray={seen.get('cfray')!r}")
+        check("注入 X-Shield-Forwarded=1 标记（网关可信代理判定）",
+              seen.get("shield") == "1",
+              f"upstream x-shield-forwarded={seen.get('shield')!r}")
+        check("请求本身成功透传",
+              status == 200,
+              f"status={status}")
+    finally:
+        shield.kill(); srv.shutdown()
+
+
 def main():
     print("=== 盾行为验证（DWGX）===\n")
     case_client_message_chinese()
@@ -475,6 +578,7 @@ def main():
     case_success_passthrough()
     case_302_passthrough()
     case_host_header_forwarded()
+    case_forward_headers_overwritten()
     case_pool_empty_absorbed()
     case_upstream_unavailable_absorbed()
     case_client_fault_fast()
@@ -483,6 +587,8 @@ def main():
     case_403_client_fault_message_delivered()
     case_403_no_body_fallback()
     case_content_policy_fast()
+    case_admin_401_passthrough()
+    case_inference_401_still_converged()
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} 通过")
     return 1 if failed else 0

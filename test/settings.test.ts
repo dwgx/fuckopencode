@@ -26,6 +26,7 @@ import {
   apiKeysMeta,
 } from '../src/settings.js';
 import { createApp } from '../src/server.js';
+import { DEFAULT_ADMIN_PASS } from '../src/config.js';
 
 /** 与 e2e.test.ts 同款的最小 AppConfig（测试用假上游/空池）。 */
 function makeCfg(over: Partial<AppConfig> = {}): AppConfig {
@@ -151,6 +152,8 @@ describe('validateSetting / parseSettingValue', () => {
       'compactMaxMessageChars',
     ]);
     expect(SETTINGS_META.adminUser?.default).toBe('admin');
+    // 默认密码与 config.ts 同源（DEFAULT_ADMIN_PASS 常量，改 env 默认值两边不会漂移）。
+    expect(SETTINGS_META.adminPass?.default).toBe(DEFAULT_ADMIN_PASS);
     expect(SETTINGS_META.adminPass?.default).toBe('13141516');
     expect(SETTINGS_META.clientTokenScale?.default).toBe(0.6657);
     expect(SETTINGS_META.compactTriggerBytes?.default).toBe(4 * 1024 * 1024);
@@ -301,13 +304,18 @@ describe('settings 端点 e2e', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       ok: boolean;
-      data: { settings: Record<string, { value: unknown; default: unknown; source: string }> };
+      data: {
+        settings: Record<string, { value: unknown; default: unknown; source: string }>;
+        adminPassIsDefault: boolean;
+      };
     };
     expect(body.ok).toBe(true);
     const s = body.data.settings;
     expect(s.adminUser).toEqual({ value: 'admin', default: 'admin', source: 'env' });
     // 密码不回显：value 与 default 都恒空串，source 才是有效信息。
     expect(s.adminPass).toEqual({ value: '', default: '', source: 'env' });
+    // 当前生效密码是自定义值（thankyouopencode），不是默认密码 → 标记 false。
+    expect(body.data.adminPassIsDefault).toBe(false);
     // apiKeys 只回掩码（****XXXX），明文不离开 PATCH 请求体。
     expect(s.apiKeys).toEqual({ value: ['****ey-1'], default: [], source: 'env' });
     expect(s.scaleClientTokens).toEqual({ value: false, default: false, source: 'env' });
@@ -315,6 +323,22 @@ describe('settings 端点 e2e', () => {
     expect(s.compactEnabled).toEqual({ value: false, default: false, source: 'env' });
     expect(s.compactTriggerBytes).toEqual({ value: 4 * 1024 * 1024, default: 4 * 1024 * 1024, source: 'env' });
     expect(s.compactMaxMessageChars).toEqual({ value: 8000, default: 8000, source: 'env' });
+  });
+
+  it('adminPassIsDefault：生效密码等于默认值时置 true（面板强提示的依据）', async () => {
+    const cfgDefault = makeCfg({ adminPass: DEFAULT_ADMIN_PASS });
+    const srv = createApp(cfgDefault, undefined, db);
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const a = srv.address();
+    const url = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+    try {
+      const res = await fetch(`${url}/__admin/api/settings`, { headers: envKeyHeaders });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { adminPassIsDefault?: boolean } };
+      expect(body.data.adminPassIsDefault).toBe(true);
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
   });
 
   it('PATCH 校验：未知键 / 类型错 / 值越界 → 400，什么都不改', async () => {

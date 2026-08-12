@@ -5,7 +5,7 @@ import { createServer, request as httpRequest, type Server } from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApp, MAX_LOGIN_FAIL_KEYS, loginFailKeyCount, type ConsoleClientLike, type ConsoleWriteResult, type LegacyBilling, type LegacyBillingReadResult, type LegacyClientLike, type LegacyGoReadResult, type LegacyGoStatus, type LegacyPlainKey, type LegacyReadResult, type LegacyWriteResult } from '../src/server.js';
+import { createApp, MAX_LOGIN_FAIL_KEYS, MAX_REVOKED_SESSIONS, loginFailKeyCount, pruneRevokedSessions, revokedSessionCount, revokeSessionForTest, type ConsoleClientLike, type ConsoleWriteResult, type LegacyBilling, type LegacyBillingReadResult, type LegacyClientLike, type LegacyGoReadResult, type LegacyGoStatus, type LegacyPlainKey, type LegacyReadResult, type LegacyWriteResult } from '../src/server.js';
 import { AccountsStore } from '../src/accounts.js';
 import { LegacyPlainCache } from '../src/legacy.js';
 import { UsageDb } from '../src/usagedb.js';
@@ -1436,6 +1436,42 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     expect(dbCfg.usageDbPath.includes('/dist/')).toBe(false);
   });
 
+  it('直通流式 input_tokens 落库（message_delta.usage 的真实值进 requests 行）', async () => {
+    // 第二十一轮 #7 修复了 message_delta.usage.input_tokens（不再恒 0），
+    // 这里验证账本链路走到底：ctx.inputTokens → db.recordRequest → requests 列。
+    // 放在额度耗尽测试**之前**：那一条 429 会把池里唯一 key 禁用 6h+，
+    // 之后的真实流量请求都会 503。
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        stream: true,
+        max_tokens: 50,
+        messages: [{ role: 'user', content: '流式落库记账测试' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
+    try {
+      const row = db
+        .prepare(
+          `SELECT path, stream, input_tokens, output_tokens FROM requests
+            WHERE path = '/v1/messages' AND stream = 1 ORDER BY id DESC LIMIT 1`,
+        )
+        .get() as { path: string; stream: number; input_tokens: number; output_tokens: number } | undefined;
+      expect(row).toBeDefined();
+      expect(row!.input_tokens).toBeGreaterThan(0);
+      expect(row!.output_tokens).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+
   it('上游失败时原始错误文案落进 error 列（不再是恒 NULL，失败原因可回溯）', async () => {
     // 额度耗尽的 429 走「上游返回但不 ok」这条路径 —— 不抛异常，
     // 所以只靠 catch 块记 error 是记不到的，恰恰是最需要留证据的那类失败。
@@ -1457,6 +1493,86 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
       // 上游那句原文要能在库里找到 —— 这是判断「key 到底怎么了」的直接证据。
       expect(row!.error).toContain('Weekly usage limit reached');
       expect(row!.error).toContain('429');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('count_tokens 落库真实 input_tokens（不再恒 0），且不计入用量聚合', async () => {
+    // 回归：handleCountTokens 此前没被 await —— finally 先于 .then() 记账，
+    // ctx.inputTokens 还没赋值就落库，requests 行 input_tokens 恒 0。
+    if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
+    let aggBefore = 0;
+    try {
+      const pre = db
+        .prepare(`SELECT COUNT(*) AS n FROM requests WHERE endpoint NOT IN ('probe', 'count_tokens')`)
+        .get() as { n: number };
+      aggBefore = pre.n;
+    } finally {
+      db.close();
+    }
+
+    const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'count 落库测试' }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { input_tokens: number }).input_tokens).toBeGreaterThan(0);
+
+    const db2 = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
+    try {
+      const row = db2
+        .prepare(
+          `SELECT endpoint, status, input_tokens, error FROM requests
+            WHERE path = '/v1/messages/count_tokens' ORDER BY id DESC LIMIT 1`,
+        )
+        .get() as { endpoint: string; status: number; input_tokens: number; error: string | null } | undefined;
+      expect(row).toBeDefined();
+      expect(row!.endpoint).toBe('count_tokens');
+      expect(row!.status).toBe(200);
+      expect(row!.input_tokens).toBeGreaterThan(0);
+      expect(row!.error).toBeNull();
+      // 记账请求不进「请求数」统计：非 count_tokens 的聚合行数不该因它 +1。
+      const agg = db2
+        .prepare(`SELECT COUNT(*) AS n FROM requests WHERE endpoint NOT IN ('probe', 'count_tokens')`)
+        .get() as { n: number };
+      expect(agg.n).toBe(aggBefore);
+      const cts = db2
+        .prepare(`SELECT COUNT(*) AS n FROM requests WHERE endpoint = 'count_tokens'`)
+        .get() as { n: number };
+      expect(cts.n).toBeGreaterThan(0);
+    } finally {
+      db2.close();
+    }
+  });
+
+  it('count_tokens 读失败时写 ctx.error 落库（body 过大 413）', async () => {
+    // 大 body 超过 maxBodyBytes → readBody 413 → ctx.error 要落进 requests.error 列。
+    // readBody 超限会 req.destroy()，客户端 fetch 可能收到 socket close 而不是响应
+    // 体（413 时连接被掐是本网关的既有行为）——所以不依赖响应，只断言落库。
+    const big = 'x'.repeat(dbCfg.maxBodyBytes + 1024);
+    await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: big }] }),
+    }).catch(() => {});  // socket close 是预期的
+
+    if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
+    try {
+      const row = db
+        .prepare(
+          `SELECT status, input_tokens, error FROM requests
+            WHERE path = '/v1/messages/count_tokens' ORDER BY id DESC LIMIT 1`,
+        )
+        .get() as { status: number; input_tokens: number; error: string | null } | undefined;
+      expect(row).toBeDefined();
+      expect(row!.status).toBe(413);
+      expect(row!.error).toContain('413');
     } finally {
       db.close();
     }
@@ -2410,6 +2526,63 @@ describe('管理面板（/__admin）鉴权与 CRUD 全流程', () => {
     expect(ops).toContainEqual(['login', null, 0, 'invalid credentials']);
   });
 
+  it('登出落 admin_audit（op=logout + ip），且审计端点能读回', async () => {
+    // 登录拿会话 cookie → 登出 → admin_audit 里出现 logout 行；审计读端点
+    // 返回最近操作（含 accountName 联表）。
+    const login = await fetch(`${baseUrl}/__admin/api/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'thankyouopencode' }),
+    });
+    expect(login.status).toBe(200);
+    const setCookie = login.headers.get('set-cookie') ?? '';
+    const cookie = setCookie.split(';')[0]!;
+
+    const created = await fetch(`${baseUrl}/__admin/api/accounts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ name: 'audit-view-acc', kind: 'unknown', keys: ['sk-audit-view-1'] }),
+    });
+    expect(created.status).toBe(201);
+    const accId = ((await created.json()) as { account: { id: number } }).account.id;
+
+    const out = await fetch(`${baseUrl}/__admin/api/logout`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+    });
+    expect(out.status).toBe(200);
+
+    // 审计读端点：最近操作里能看到 logout 与 account.create（联表带账号名）。
+    const audit = await fetch(`${baseUrl}/__admin/api/audit?limit=50`, {
+      headers: { accept: 'application/json', cookie },
+    });
+    expect(audit.status).toBe(200);
+    const body = (await audit.json()) as {
+      ok: boolean;
+      data: { items: Array<{ op: string; accountId: number | null; accountName: string | null; ok: boolean; note: string | null; ip: string | null }> };
+    };
+    expect(body.ok).toBe(true);
+    const ops = body.data.items;
+    expect(ops.some((r) => r.op === 'logout' && r.ok === true)).toBe(true);
+    expect(ops.some((r) => r.op === 'account.create' && r.accountId === accId && r.accountName === 'audit-view-acc')).toBe(true);
+    // 有 IP 来源（本机直连 → 127.0.0.1）。
+    expect(ops.some((r) => r.op === 'login' && r.ip != null)).toBe(true);
+
+    // db 层复核 logout 行落库。
+    const { DatabaseSync } = await import('node:sqlite');
+    const raw = new DatabaseSync(path.join(tmpDir, 'admin.db'), { readOnly: true });
+    try {
+      const row = raw
+        .prepare("SELECT op, ok, ip FROM admin_audit WHERE op = 'logout' ORDER BY id DESC LIMIT 1")
+        .get() as { op: string; ok: number; ip: string | null } | undefined;
+      expect(row).toBeDefined();
+      expect(row!.ok).toBe(1);
+      expect(row!.ip).toBeTruthy();
+    } finally {
+      raw.close();
+    }
+  });
+
   it('m2：账号名与 cookie 的控制符被剥离（不能伪造日志/终端输出）', async () => {
     const created = await fetch(`${baseUrl}/__admin/api/accounts`, {
       method: 'POST',
@@ -2820,6 +2993,8 @@ describe('console 数据端点（/__admin/api/console）', () => {
   class FakeConsoleClient implements ConsoleClientLike {
     authFail = false;
     errorFail = false;
+    /** OAuth Bearer 失效（refresh_token 过期）——cookieStatus invalid + authChannel oauth。 */
+    oauthInvalid = false;
     /** 只让 cost-by-day 通道失败（byDay 子通道独立性测试用）。 */
     costByDayFail = false;
     /** billingStatus 返回无 balance 字段的合法响应（模拟 gmail 无余额数据）。 */
@@ -2828,20 +3003,24 @@ describe('console 数据端点（/__admin/api/console）', () => {
 
     cookieStatus(id: number): 'ok' | 'invalid' {
       this.calls.push('cookieStatus');
-      return this.authFail ? 'invalid' : 'ok';
+      return this.authFail || this.oauthInvalid ? 'invalid' : 'ok';
+    }
+    authChannel(id: number): 'cookie' | 'oauth' | null {
+      return this.oauthInvalid ? 'oauth' : null;
     }
     lastError(id: number): 'auth' | 'upstream' | 'no-cred' | null {
-      if (this.authFail) return 'auth';
+      if (this.authFail || this.oauthInvalid) return 'auth';
       if (this.errorFail) return 'upstream';
       return null;
     }
     noteCredentialChanged(id: number): void {
       this.authFail = false;
       this.errorFail = false;
+      this.oauthInvalid = false;
     }
     async billingStatus(id: number): Promise<unknown | null> {
       this.calls.push('billingStatus');
-      if (this.authFail || this.errorFail) return null;
+      if (this.authFail || this.oauthInvalid || this.errorFail) return null;
       if (this.noBalance) {
         // 合法响应但没有 balance 字段（账号无余额数据）。
         return { billingMode: 'prepaid' };
@@ -2875,12 +3054,12 @@ describe('console 数据端点（/__admin/api/console）', () => {
     }
     async usageSummary(id: number, rangeDays: number): Promise<unknown | null> {
       this.calls.push(`usageSummary:${rangeDays}`);
-      if (this.authFail || this.errorFail) return null;
+      if (this.authFail || this.oauthInvalid || this.errorFail) return null;
       return { totalRequests: '10', totalCostMicroCents: '123000000' };
     }
     async usageCostByDay(id: number, rangeDays: number, bucket: 'day' | 'hour'): Promise<unknown | null> {
       this.calls.push(`usageCostByDay:${rangeDays}:${bucket}`);
-      if (this.authFail || this.errorFail || this.costByDayFail) return null;
+      if (this.authFail || this.oauthInvalid || this.errorFail || this.costByDayFail) return null;
       // DailyCost 形状（实测）：date + microCents 字符串。
       return [{ date: '2026-08-11', totalCostMicroCents: '150000000', totalTokens: '1000', totalRequests: '10' }];
     }
@@ -2969,7 +3148,7 @@ describe('console 数据端点（/__admin/api/console）', () => {
       return this.writeResult();
     }
     private writeResult(): ConsoleWriteResult {
-      if (this.authFail) return { ok: false, reason: 'auth' };
+      if (this.authFail || this.oauthInvalid) return { ok: false, reason: 'auth' };
       if (this.errorFail) return { ok: false, reason: 'upstream' };
       return { ok: true, data: {} };
     }
@@ -3132,6 +3311,35 @@ describe('console 数据端点（/__admin/api/console）', () => {
       expect(data.cookieState).toBe('invalid');
     } finally {
       client.authFail = false;
+    }
+  });
+
+  it('billing：OAuth Bearer 失效 → cookieState=oauth-invalid（面板提示重新授权而非更新 cookie）', async () => {
+    client.oauthInvalid = true;
+    try {
+      const res = await fetch(`${baseUrl}/__admin/api/console/account/${aId}/billing`);
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as Record<string, unknown>;
+      const data = json.data as { cookieState: string; balance: number | null };
+      expect(data.cookieState).toBe('oauth-invalid');
+      expect(data.balance).toBeNull();
+    } finally {
+      client.oauthInvalid = false;
+    }
+  });
+
+  it('读失败：OAuth Bearer 失效 → 502 channel_error 指引重新授权（不是更新 cookie）', async () => {
+    client.oauthInvalid = true;
+    try {
+      const res = await fetch(`${baseUrl}/__admin/api/console/account/${aId}/usage?range=7d`);
+      expect(res.status).toBe(502);
+      const json = (await res.json()) as { error: { type: string; message: string } };
+      expect(json.error.type).toBe('channel_error');
+      expect(json.error.message).toContain('OAuth credential expired or revoked');
+      expect(json.error.message).toContain('sign in with OpenCode');
+      expect(json.error.message).not.toContain('re-import from browser');
+    } finally {
+      client.oauthInvalid = false;
     }
   });
 
@@ -3947,6 +4155,100 @@ describe('面板账号密码登录（/__admin/api/login）', () => {
         const r = await loginPost({ username: 'admin', password: 'nope' }, { 'cf-connecting-ip': '10.0.0.9' });
         expect(r.status).toBe(401);
       }
+    } finally {
+      proxy.close();
+    }
+  });
+
+  it('m1：adminPass 变更后旧签名会话立即失效（HMAC 编入密码版本）', async () => {
+    const cfg = startLoginStack();
+    proxy = createApp(cfg, undefined, undefined, null);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    baseUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    const ip = '203.0.113.200'; // 唯一 IP：登录限速键在模块级 Map，避免污染
+    try {
+      // 登录 → 拿到会话
+      const login = await loginPost({ username: 'admin', password: 'thankyouopencode' }, { 'cf-connecting-ip': ip });
+      expect(login.status).toBe(200);
+      const token = /fc_admin_session=([0-9a-f]{64}\.\d+)/.exec(login.headers.get('set-cookie') ?? '')?.[1]!;
+      expect(token).toBeTruthy();
+      const okBefore = await fetch(`${baseUrl}/__admin/api/accounts`, {
+        headers: { cookie: `fc_admin_session=${token}` },
+      });
+      expect(okBefore.status).toBe(200);
+
+      // 模拟 settings 热改（applySettingsToConfig 同款：原地改 cfg.adminPass）。
+      cfg.adminPass = 'new-password-after-hotchange';
+      // 旧签名会话立即失效 —— 签名里编入了密码版本 sha256(adminPass)，密码变
+      // 签名对不上，攻击者拿旧 cookie 也不能在改密后复用。
+      const after = await fetch(`${baseUrl}/__admin/api/accounts`, {
+        headers: { cookie: `fc_admin_session=${token}` },
+      });
+      expect(after.status).toBe(401);
+
+      // 新密码可正常登录。
+      const relogin = await loginPost(
+        { username: 'admin', password: 'new-password-after-hotchange' },
+        { 'cf-connecting-ip': ip },
+      );
+      expect(relogin.status).toBe(200);
+    } finally {
+      proxy.close();
+    }
+  });
+
+  it('m2：revokedSessions 按过期清理 + 上限钳制（无界增长封口）', async () => {
+    const baseline = revokedSessionCount();
+    const added: string[] = [];
+    const add = (sig: string, expiry: number): void => {
+      revokeSessionForTest(sig, expiry);
+      added.push(sig);
+    };
+    try {
+      // 过期条目：prune 后必须消失（回归：曾是无过期信息的 Set，永不清理 → 无界增长）。
+      add('sig-expired-test', Date.now() - 1);
+      add('sig-alive-test', Date.now() + 86_400_000);
+      expect(revokedSessionCount()).toBe(baseline + 2);
+      pruneRevokedSessions(Date.now());
+      expect(revokedSessionCount()).toBe(baseline + 1);
+
+      // 上限：灌 MAX+10 条，尺寸恒 ≤ MAX（满时淘汰最旧）—— 防登出风暴内存 DoS。
+      for (let i = 0; i < MAX_REVOKED_SESSIONS + 10; i++) {
+        add(`sig-cap-${i}`, Date.now() + 86_400_000);
+      }
+      expect(revokedSessionCount()).toBeLessThanOrEqual(MAX_REVOKED_SESSIONS);
+    } finally {
+      // 清掉注入条目：全部覆盖为过期（expiry=0）后 prune。
+      for (const s of added) revokeSessionForTest(s, 0);
+      pruneRevokedSessions(Date.now());
+    }
+  });
+
+  it('m4：跨站表单登录被 Origin 校验拒绝（不能锁受害者 IP）', async () => {
+    const cfg = startLoginStack();
+    proxy = createApp(cfg, undefined, undefined, null);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const port = (proxy.address() as { port: number }).port;
+    baseUrl = `http://127.0.0.1:${port}`;
+    const host = `127.0.0.1:${port}`;
+    // 用 rawRequest：undici fetch 对 origin/host 是受限头，直接设置不可靠。
+    const loginRaw = (extra: Record<string, string>): ReturnType<typeof rawRequest> =>
+      rawRequest(port, '/__admin/api/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json', ...extra },
+        body: JSON.stringify({ username: 'admin', password: 'wrong' }),
+      });
+    try {
+      // 攻击者页面的 form 提交：Origin 是攻击者的，与 Host 不匹配 → 403，
+      // 且不累计失败计数（不会把受害者 IP 刷成锁定）。
+      const evil = await loginRaw({ origin: 'https://evil.example', host });
+      expect(evil.status).toBe(403);
+      // 同源 Origin（hostname+端口匹配）正常走登录流程（错密码 → 401 计数）。
+      const sameOrigin = await loginRaw({ origin: baseUrl, host, 'cf-connecting-ip': '203.0.113.201' });
+      expect(sameOrigin.status).toBe(401);
+      // 无 Origin（curl/脚本）放行（既有行为不变）。
+      const noOrigin = await loginRaw({ 'cf-connecting-ip': '203.0.113.202' });
+      expect(noOrigin.status).toBe(401);
     } finally {
       proxy.close();
     }

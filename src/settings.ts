@@ -16,10 +16,11 @@
  * 降级哲学与 usagedb 一致：db 不可用/查询失败 → get 返回 null、all 返回空，
  * 绝不抛 —— 热配置是管理面增强，缺了只是退回 env 默认。
  *
- * 已知取舍：改面板密码不会让已签发会话失效（签名会话无状态，黑名单只能按
- * 签名值逐个禁，改密码时无法全量枚举）——旧会话 24h 内仍有效，文档注明。
+ * 已知取舍：签名会话把**密码版本**（sha256(adminPass)）编进 HMAC —— 改密码后
+ * 旧签名立即失效（无需黑名单枚举）。登出走内存黑名单（按签名值，带过期清理）。
  */
 
+import { DEFAULT_ADMIN_PASS } from './config.js';
 import type { AppConfig } from './config.js';
 import type { UsageDb } from './usagedb.js';
 
@@ -112,7 +113,7 @@ export function apiKeysMeta(value: unknown): SettingValidation {
  */
 export const SETTINGS_META: Readonly<Record<string, SettingMeta>> = {
   adminUser: { default: 'admin', validate: stringMeta(1, 100) },
-  adminPass: { default: '13141516', validate: passwordMeta(8, 200) },
+  adminPass: { default: DEFAULT_ADMIN_PASS, validate: passwordMeta(8, 200) },
   apiKeys: { default: [], validate: apiKeysMeta },
   scaleClientTokens: { default: false, validate: boolMeta },
   clientTokenScale: { default: 0.6657, validate: floatMeta(0.001, 1) },

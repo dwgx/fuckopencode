@@ -343,6 +343,15 @@ INFERENCE_PATH_HINTS = (
     "/v1/responses",
 )
 
+# 网关自己的管理/面板路径。它们的 401/403 是**业务状态**（未登录/无权），
+# 客户端自己知道要登录、页面自己处理 —— 盾不该重试（把「立刻 401」拖成
+# 「几秒后 503」），也不该按认证错误标记吞掉（见 classify 里的顺序）。
+ADMIN_PATH_PREFIXES = (
+    "/__admin",
+    "/__dash",
+    "/__metrics",
+)
+
 
 def is_inference_path(path):
     """这条请求是不是推理调用（值得为它等 10 分钟）。"""
@@ -713,6 +722,19 @@ def classify(status, peek, path=""):
     # 实测：面板登录被重试循环吞掉后客户端拿到 200 登录页 =「无法登录」。
     if 300 <= status < 400:
         return "pass"
+    # 管理/面板路径（/__admin* /__dash* /__metrics）的 401/403 直接透传。
+    #
+    # 为什么必须放在所有 body 标记判断之前：网关登录失败的 401 错误体里带
+    # `authentication_error`，会被上面的 CLIENT_FAULT_BODY_MARKERS 判成
+    # `client`（2s × 2 次 / 6s 预算）→ 面板登录失败被拖成「等几秒才 503」，
+    # 而用户要的是立刻看到「密码错了」。管理路径的 401/403 是**业务状态**
+    # （未登录 / 无权 / 登录已过期），不是可恢复的瞬态故障，重试只会把
+    # 「立刻 401」换成「迟到的 503」——面板用户等的是错误原因不是转圈。
+    # 非管理路径的 401/403 行为不变（仍走 client/perm 拦截节奏）。
+    if status in (401, 403) and path:
+        base = path.split("?", 1)[0]
+        if any(base.startswith(p) for p in ADMIN_PATH_PREFIXES):
+            return "pass"
     text = peek.decode("utf-8", "replace") if peek else ""
     if text:
         # 先分流「号池救不了」的：客户端自己的错，等待纯属空转。
@@ -840,21 +862,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _collect_request(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
-        headers = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in HOP_BY_HOP
-        }
         # 安全（全面审查 B1/M3）：盾是唯一可信边界——
         # 1) 注入「经盾转发」标记：网关对带此头的请求不做「本机直连」免凭据豁免
         #    （否则公网直连 8787 伪造 Host: 127.0.0.1 即免凭据接管整个管理面）。
         # 2) 覆写 cf-connecting-ip 为真实对端，剥离客户端自带的转发头：
         #    登录限速按真实 IP 计数，否则攻击者轮换 X-Forwarded-For 无限爆破。
+        #
+        # 剥离必须按小写匹配：`self.headers.items()` 的键是 title-case
+        # （X-Forwarded-For），dict.pop 大小写敏感，直接 pop("x-forwarded-for")
+        # 永不命中 —— 实测伪造头原样透传到网关。改在构 dict 时统一小写过滤。
+        headers = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in HOP_BY_HOP
+            and k.lower() not in ("x-real-ip", "x-forwarded-for", "cf-ray")
+        }
         headers["X-Shield-Forwarded"] = "1"
         peer = getattr(self, "client_address", (None, None))[0] or ""
         if peer:
             headers["cf-connecting-ip"] = peer
-        for k in ("x-real-ip", "x-forwarded-for", "cf-ray"):
-            headers.pop(k, None)
         return headers, body
 
     def _wants_stream(self, body):

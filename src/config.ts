@@ -1,5 +1,16 @@
 export type InjectionMode = 'block' | 'log' | 'off';
 
+/**
+ * 面板登录密码的默认值（ADMIN_PASS env 未设时生效）。
+ *
+ * 刻意**不是**强随机：线上部署通常 env 显式设置（历史默认 admin/thankyouopencode、
+ * 现默认 13141516 都是用户在用），改默认值会破坏现有登录。安全兜底靠
+ * 设置页的「默认密码」告警（settings GET 的 adminPassIsDefault）+ 登录时
+ * 的 stderr 告警，而不是悄悄改默认值。新部署若不加 ADMIN_PASS，会看到
+ * 告警并建议改密码。
+ */
+export const DEFAULT_ADMIN_PASS = '13141516';
+
 export interface AppConfig {
   host: string;
   port: number;
@@ -46,7 +57,7 @@ export interface AppConfig {
   billingTimeoutMs: number;
   /** 面板登录账号（ADMIN_USER，默认 admin）。 */
   adminUser: string;
-  /** 面板登录密码（ADMIN_PASS，默认 thankyouopencode——上线必改）。 */
+  /** 面板登录密码（ADMIN_PASS，默认 DEFAULT_ADMIN_PASS——默认密码有告警）。 */
   adminPass: string;
   /** 面板会话 cookie 有效期（默认 24h）。 */
   adminSessionTtlMs: number;
@@ -84,8 +95,10 @@ export interface AppConfig {
   /** 是否透传客户端 x-claude-code-* 会话标记头（默认不透传，防共享部署冒充会话） */
   trustClaudeCodeHeaders: boolean;
   /**
-   * 监控面板是否免鉴权。仅在绑定回环地址时为 true —— 面板会展示调用方 IP/UA
-   * 等设备信息，绑非回环时必须带 key 才能看。
+   * 监控面板是否免鉴权。**默认关闭**（fail-closed）：配置翻转（如误删
+   * ADMIN_PASS/env 错配）不会让管理面免凭据裸奔。仅在绑定回环地址且
+   * DASHBOARD_OPEN=1 时为本机直连免 key —— 面板含调用方 IP/UA 等设备
+   * 信息，绑非回环时即使开着也必须带 key 才能看。
    */
   dashboardOpen: boolean;
   /**
@@ -210,10 +223,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // data/secret.key（不存在自动生成 0600）。用于加密账户 key 与 billing cookie。
     gatewaySecret: env.GATEWAY_SECRET ? String(env.GATEWAY_SECRET) : null,
     secretFilePath: env.SECRET_FILE || 'data/secret.key',
-    // 面板登录凭证：账号密码（默认 admin/thankyouopencode，上线必改）。
+    // 面板登录凭证：账号密码（默认 admin/DEFAULT_ADMIN_PASS，默认密码有告警）。
     // 登录成功签发 HttpOnly 会话 cookie（24h），与 API key 并存。
     adminUser: env.ADMIN_USER || 'admin',
-    adminPass: env.ADMIN_PASS || '13141516',
+    adminPass: env.ADMIN_PASS || DEFAULT_ADMIN_PASS,
     adminSessionTtlMs: intFromEnv(env.ADMIN_SESSION_TTL_MS, 24 * 3600_000, 60_000),
     // 面板登录失败限速：同 IP 失败 N 次锁 M 毫秒。
     adminLoginFailLimit: intFromEnv(env.ADMIN_LOGIN_FAIL_LIMIT, 5, 1),
@@ -241,8 +254,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxMessages: intFromEnv(env.MAX_MESSAGES, 4_000, 0),
     stripControlChars: boolFromEnv(env.STRIP_CONTROL_CHARS, true),
     trustClaudeCodeHeaders: boolFromEnv(env.TRUST_CLAUDE_CODE_HEADERS, false),
-    // 面板含设备信息，只在本机绑定时免鉴权。
-    dashboardOpen: boolFromEnv(env.DASHBOARD_OPEN, true) && hostnameIsSafe(host),
+    // 面板含设备信息，只在本机绑定时免鉴权。默认关闭（fail-closed）——
+    // 「配置翻转即全裸」的地雷：曾经默认 true，忘记设 DASHBOARD_OPEN=0 时
+    // 管理面就免凭据公开。线上靠 env 显式 DASHBOARD_OPEN=1 打开不受影响。
+    dashboardOpen: boolFromEnv(env.DASHBOARD_OPEN, false) && hostnameIsSafe(host),
     // 完全公开需显式开启，避免「不知不觉把 IP 记录挂到公网」。
     dashboardPublic: boolFromEnv(env.DASHBOARD_PUBLIC, false),
     // 实验性功能，默认全关；开任何一项都意味着「接受失真/丢字」的取舍。

@@ -1,7 +1,7 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { AppConfig } from './config.js';
+import { DEFAULT_ADMIN_PASS, type AppConfig } from './config.js';
 import { fetchUpstreamModels, postUpstreamChat, type UpstreamCall } from './upstream.js';
 import { KeyPool, PoolEmptyError, keyFingerprint, type KeyStateEvent } from './keypool.js';
 import {
@@ -277,9 +277,9 @@ function isAdminRequest(req: IncomingMessage, cfg: AppConfig): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// 面板账号密码登录（用户要求：默认 admin / thankyouopencode，env 可覆盖）。
-// 会话 = 内存 token + HttpOnly cookie；token 随机 32 字节，进程重启即失效
-// （重新登录即可，不落盘不泄露）。登录失败限速防爆破。
+// 面板账号密码登录（默认 admin / DEFAULT_ADMIN_PASS，env 可覆盖）。
+// 会话 = 签名 cookie（HMAC，密码版本进签名）；HttpOnly + SameSite=Lax + Secure。
+// 登录失败限速防爆破；跨站 Origin 校验防跨站表单锁定 DoS。
 // ---------------------------------------------------------------------------
 
 // 浏览器自动请求的静态资源（favicon/图标等）：无鉴权直接 404，不进 metrics。
@@ -297,10 +297,12 @@ const STATIC_ASSET_PATHS = new Set([
 ]);
 
 const ADMIN_SESSION_COOKIE = 'fc_admin_session';
-// 无状态签名会话：HMAC-SHA256(secret, expiry)。**不存内存** —— 服务重启会话
-// 不失效（用户不用每次部署后重新输入密码）。登出用内存黑名单（重启清空，
-// 已登出的 cookie 复活极少见，可接受）。
-const revokedSessions = new Set<string>(); // 登出的签名值
+// 无状态签名会话：HMAC-SHA256(secret, expiry + 密码版本)。**不存内存** ——
+// 服务重启会话不失效（用户不用每次部署后重新输入密码）。
+// 登出用内存黑名单（签名 → 过期时刻）。密码版本进 HMAC ⇒ 改密码后旧签名
+// 立即失效（见 passwordVersion）；黑名单按 expiry 过期清理 + 上限钳制，
+// 不会无界增长（见 MAX_REVOKED_SESSIONS）。
+const revokedSessions = new Map<string, number>(); // 签名 → 过期时刻
 const loginFails = new Map<string, { fails: number; lockedUntil: number }>(); // ip → 状态
 
 /** 兜底会话密钥：进程启动随机（randomBytes 32，模块级存一份，重启失效）。
@@ -326,15 +328,25 @@ function sessionKey(cfg: AppConfig): Buffer {
   }
 }
 
+/** 密码版本：sha256(adminPass)。编进签名 ⇒ 改密码（settings 热改 / env 重启）
+ *  后旧签名会话全部失效 —— 攻击者拿到旧会话 cookie 也不能在密码更换后复用。 */
+function passwordVersion(cfg: AppConfig): string {
+  return crypto.createHash('sha256').update(cfg.adminPass).digest('hex');
+}
+
 /** 签发无状态会话 token：`<签名>.<过期时刻>`。 */
 function createAdminSession(cfg: AppConfig, now: number): string {
   const expiry = now + cfg.adminSessionTtlMs;
-  const sig = crypto.createHmac('sha256', sessionKey(cfg)).update(String(expiry)).digest('hex');
+  const sig = crypto
+    .createHmac('sha256', sessionKey(cfg))
+    .update(`${expiry}.${passwordVersion(cfg)}`)
+    .digest('hex');
   return `${sig}.${expiry}`;
 }
 
 /** cookie 里的签名会话是否有效（签名 + 过期 + 未登出）；有效返回 true。 */
 function adminSessionValid(req: IncomingMessage, cfg: AppConfig): boolean {
+  pruneRevokedSessions(Date.now());
   const cookie = req.headers.cookie;
   if (typeof cookie !== 'string') return false;
   const m = /(?:^|;\s*)fc_admin_session=([0-9a-f]{64})\.(\d+)(?:;|$)/.exec(cookie);
@@ -343,17 +355,53 @@ function adminSessionValid(req: IncomingMessage, cfg: AppConfig): boolean {
   const expiry = Number(m[2]);
   if (!Number.isFinite(expiry) || expiry <= Date.now()) return false;
   if (revokedSessions.has(sig)) return false;
-  const expect = crypto.createHmac('sha256', sessionKey(cfg)).update(String(expiry)).digest('hex');
+  const expect = crypto
+    .createHmac('sha256', sessionKey(cfg))
+    .update(`${expiry}.${passwordVersion(cfg)}`)
+    .digest('hex');
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect));
 }
 
-/** 销毁会话（登出）：签名进黑名单 + 浏览器 cookie 清掉。 */
+/** 销毁会话（登出）：签名进黑名单（带过期时刻）+ 浏览器 cookie 清掉。 */
 function destroyAdminSession(req: IncomingMessage): void {
   const cookie = req.headers.cookie;
   if (typeof cookie === 'string') {
-    const m = /(?:^|;\s*)fc_admin_session=([0-9a-f]{64})\.\d+(?:;|$)/.exec(cookie);
-    if (m) revokedSessions.add(m[1]!);
+    const m = /(?:^|;\s*)fc_admin_session=([0-9a-f]{64})\.(\d+)(?:;|$)/.exec(cookie);
+    if (m) addRevokedSession(m[1]!, Number(m[2]));
   }
+  pruneRevokedSessions(Date.now());
+}
+
+/** 登出黑名单上限：无上限时每个登录会话都能往黑名单塞一条，长期运行会
+ *  无限吃内存（内存 DoS 面）。Map 满时淘汰最旧条目（插入序 = 最早签发 =
+ *  最早过期）——黑名单继续工作，只是最早的一批被换出。 */
+export const MAX_REVOKED_SESSIONS = 10_000;
+
+/** 登出黑名单当前条数（测试断言「清理/上限生效」用）。 */
+export function revokedSessionCount(): number {
+  return revokedSessions.size;
+}
+
+/** 按过期时刻清理黑名单：过期条目（expiry <= now）删掉。登出只会发生在
+ *  会话有效期内，所以清理后黑名单尺寸恒 ≤ 一个 TTL 窗口内的登出数。 */
+export function pruneRevokedSessions(now: number): void {
+  for (const [sig, expiry] of revokedSessions) {
+    if (expiry <= now) revokedSessions.delete(sig);
+  }
+}
+
+/** 测试专用：直接向黑名单注入一条（防 24h TTL 让过期清理/上限不可测）。
+ *  与登出路径共用 addRevokedSession（上限淘汰逻辑同款）。 */
+export function revokeSessionForTest(sig: string, expiry: number): void {
+  addRevokedSession(sig, expiry);
+}
+
+function addRevokedSession(sig: string, expiry: number): void {
+  if (revokedSessions.size >= MAX_REVOKED_SESSIONS) {
+    const oldest = revokedSessions.keys().next().value;
+    if (oldest != null) revokedSessions.delete(oldest);
+  }
+  revokedSessions.set(sig, expiry);
 }
 
 /** 登录失败限速：返回剩余锁定时长（ms，0 = 未锁定）。
@@ -407,15 +455,21 @@ function clearLoginFails(ip: string): void {
  *  若将来把网关绑到非回环地址，这里必须改为「只在可信代理层覆写转发头后
  *  才信任」，否则伪造 XFF 可绕过限速。 */
 /**
- * 提取调用方 IP（登录限速与 requests 落库共用同一套逻辑）。
+ * 提取调用方 IP（requests 落库用，纯展示/统计）。转发头只在网关绑回环的
+ * 前提下可信（见 loginRateKey 的说明）；登录限速是安全控制，走 fail-closed
+ * 的 clientIpForRateLimit，这里不重复做信任决策。
  *
  * 优先级：cf-connecting-ip（cloudflared/CDN 注入）→ x-real-ip → x-forwarded-for
  * 首段 → socket 地址，与 metrics.extractDevice 的口径一致（同一请求两个出口
- * 的 IP 对得上）。在网关绑回环的前提下（见上方注释），转发头只能由本地进程
- * （盾）或本机用户注入，伪造 XFF 只能骗到自己。
+ * 的 IP 对得上）。
  */
 function clientIpOf(req: IncomingMessage): string {
-  const h = req.headers;
+  return ipFromHeaders(req.headers) ?? (req.socket.remoteAddress ?? 'unknown').slice(0, 64);
+}
+
+/** 从转发头取 IP（cf-connecting-ip → x-real-ip → x-forwarded-for 首段）；
+ *  都没有返回 null（调用方回落 socket 地址）。 */
+function ipFromHeaders(h: IncomingHttpHeaders): string | null {
   const cf = h['cf-connecting-ip'];
   if (typeof cf === 'string' && cf.length > 0) return cf.slice(0, 64);
   const realIp = h['x-real-ip'];
@@ -425,12 +479,36 @@ function clientIpOf(req: IncomingMessage): string {
     const first = xff.split(',')[0]!.trim();
     if (first) return first.slice(0, 64);
   }
-  return (req.socket.remoteAddress ?? 'unknown').slice(0, 64);
+  return null;
 }
 
-/** 登录限速按 IP 记键：与请求落库的 IP 同一来源（clientIpOf）。 */
+/** socket 对端是否为回环地址（`::ffff:` 前缀的 IPv4 映射也算）。 */
+function isLoopbackPeer(addr: string | undefined): boolean {
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+/**
+ * 登录限速键 IP 的信任决策（导出供测试）。转发头（cf-connecting-ip / x-real-ip /
+ * x-forwarded-for）只在**回环对端**可信：盾 / cloudflared 是本机代理进程，把真实
+ * 客户端 IP 覆写进 cf-connecting-ip（盾还会剥离伪造转发头）。非回环对端 =
+ * 网关直连无盾（HOST 绑定到公网/局域网）—— 转发头可被任意伪造，轮换 XFF
+ * 就能给每个请求换新键绕过限速，此时一律回落 socket 地址（TCP 层无法伪造）。
+ *
+ * 与 clientIpOf 的差别只在「是否信任转发头」：requests 落库的 IP 沿用 clientIpOf
+ * （纯展示/统计），登录限速是安全控制，必须 fail-closed 用本函数。
+ */
+export function clientIpForRateLimit(
+  remoteAddress: string | undefined,
+  headers: IncomingHttpHeaders,
+): string {
+  if (!isLoopbackPeer(remoteAddress)) return (remoteAddress ?? 'unknown').slice(0, 64);
+  return ipFromHeaders(headers) ?? (remoteAddress ?? 'unknown').slice(0, 64);
+}
+
+/** 登录限速按 IP 记键：与请求落库的 IP 同一来源（clientIpOf），但转发头信任
+ *  走 fail-closed 的 clientIpForRateLimit（非回环直连伪造转发头不能绕过）。 */
 function loginRateKey(req: IncomingMessage): string {
-  return clientIpOf(req);
+  return clientIpForRateLimit(req.socket.remoteAddress, req.headers);
 }
 
 /** 面板登录端点：POST /__admin/api/login。
@@ -448,6 +526,15 @@ async function handleAdminLogin(
   cfg: AppConfig,
   db: UsageDb | null,
 ): Promise<void> {
+  // 跨站表单锁定 DoS（reviewer m4）：攻击者页面 `<form action=网关/__admin/api/login>`
+  // 提交错凭证，浏览器必带攻击者的 Origin —— 与 Host 不匹配 → 403，既不会累计
+  // 受害者的失败计数，也不会触发锁定。无 Origin（curl/脚本/同源表单部分场景）
+  // 放行 —— 同源请求本来就有 Origin 且匹配 Host。校验必须在限速检查**之前**，
+  // 否则跨站表单仍能靠反复命中限速检查把受害者锁住。
+  if (!adminOriginAllowed(req)) {
+    sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+    return;
+  }
   const ip = loginRateKey(req);
   const now = Date.now();
   const wantsJson = /application\/json/i.test(req.headers.accept ?? '');
@@ -490,7 +577,7 @@ async function handleAdminLogin(
     recordLoginFail(ip, cfg, now);
     // 登录审计：凭证失败留痕。限速拦截（上方 locked 分支）刻意不记——
     // 伪造 IP 刷限速会同步刷爆审计表，且拦截本身不是凭证尝试。
-    db?.insertAdminAudit({ at: now, op: 'login', accountId: null, ok: false, note: 'invalid credentials' });
+    db?.insertAdminAudit({ at: now, op: 'login', accountId: null, ok: false, note: 'invalid credentials', ip });
     if (wantsJson) {
       sendJson(res, 401, { error: { message: 'invalid credentials', type: 'authentication_error' } });
       return;
@@ -500,7 +587,13 @@ async function handleAdminLogin(
     return;
   }
   clearLoginFails(ip);
-  db?.insertAdminAudit({ at: now, op: 'login', accountId: null, ok: true, note: null });
+  db?.insertAdminAudit({ at: now, op: 'login', accountId: null, ok: true, note: null, ip });
+  // 默认密码告警：登录成功但用的还是 DEFAULT_ADMIN_PASS —— 新部署忘配
+  // ADMIN_PASS 的强信号。面板设置页另有 adminPassIsDefault 精确提示，这里
+  // 是日志侧兜底（journalctl 一眼能看到）。
+  if (cfg.adminPass === DEFAULT_ADMIN_PASS) {
+    console.warn(`[admin] 警告：面板登录成功但正在使用默认密码 "${DEFAULT_ADMIN_PASS}"，生产环境请用 env ADMIN_PASS 或设置页改密码`);
+  }
   const token = createAdminSession(cfg, now);
   // Secure：会话 cookie 只在 HTTPS/回环传输（Chrome 对 http://localhost 接受
   // Secure cookie，本机 ssh 隧道场景不受影响）——防经公网 http 明文携带会话。
@@ -516,8 +609,9 @@ async function handleAdminLogin(
 }
 
 /** 面板登出端点：POST /__admin/api/logout。 */
-function handleAdminLogout(req: IncomingMessage, res: ServerResponse): void {
+function handleAdminLogout(req: IncomingMessage, res: ServerResponse, db: UsageDb | null): void {
   destroyAdminSession(req);
+  db?.insertAdminAudit({ at: Date.now(), op: 'logout', accountId: null, ok: true, note: null, ip: clientIpOf(req) });
   res.writeHead(200, {
     'content-type': 'application/json',
     'set-cookie': `${ADMIN_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0`,
@@ -559,11 +653,42 @@ function sendLoginPage(res: ServerResponse): void {
  *
  * 契约：`?page=1&pageSize=20&q=<关键词>` → `{ok:true, data:{items, total, page, pageSize}}`。
  * pageSize 上限 100（超限 clamp）；page 下限 1。items 按 at 倒序，排除探活。
- * q 为可选：对 path/status/model/client/ua 做不区分大小写的包含过滤（LIKE 参数化，
- * 通配符已转义）。空串等价于不过滤。
+ * q 为可选：对 path/status/model/client/ua/ip/error 做不区分大小写的包含过滤
+ * （LIKE 参数化，通配符已转义）。空串等价于不过滤。
  * 错误响应沿用现有形状（{error:{message,type}}）：db 不可用/查询失败 → 503。
  * 鉴权：路由处先过 isAdminRequest，再过 adminOriginAllowed（读也防跨站）。
  */
+/**
+ * GET /__admin/api/audit：管理面操作审计（谁 · 何时 · 做了什么）。
+ *
+ * 契约：`?limit=N`（默认 50，上限 200）→ `{ok:true, data:{items:[{at, op,
+ * accountId, accountName, ok, note, ip}]}}`。items 按 at 倒序。
+ * 数据源是 admin_audit 表（insertAdminAudit 的脱敏摘要：只存 op/accountId/
+ * ok/note/ip，金额与 cookie 从不落库）。db 不可用/查询失败 → 503。
+ * 鉴权：路由处先过 isAdminRequest，再过 adminOriginAllowed（管理面信息，读也防跨站）。
+ */
+async function handleAuditRoute(req: IncomingMessage, res: ServerResponse, db: UsageDb): Promise<void> {
+  let limit = 50;
+  const qs = (req.url ?? '').split('?')[1];
+  if (qs) {
+    try {
+      const params = new URLSearchParams(qs);
+      const rawLimit = Number.parseInt(params.get('limit') ?? '', 10);
+      if (Number.isFinite(rawLimit) && rawLimit >= 1) limit = Math.min(200, Math.floor(rawLimit));
+    } catch {
+      // 畸形 query 不解析，走默认。
+    }
+  }
+  const items = db.listAdminAudit(limit);
+  if (items == null) {
+    sendJson(res, 503, {
+      error: { message: db.enabled ? 'usage db query failed' : `usage db unavailable: ${db.disabledReason ?? 'unknown'}`, type: 'server_error' },
+    });
+    return;
+  }
+  sendJson(res, 200, { ok: true, data: { items, limit } });
+}
+
 async function handleRequestsRoute(req: IncomingMessage, res: ServerResponse, db: UsageDb): Promise<void> {
   let page = 1;
   let pageSize = 20;
@@ -666,17 +791,20 @@ async function handleOverviewTrend(req: IncomingMessage, res: ServerResponse, db
 //   （SETTINGS_META，与 config.ts 对齐）；source = 'env' | 'db'（settings 表
 //   里有该键即 'db'）。
 //   **隐私口径**：adminPass 的 value/default 恒为 ''（活密码与默认密码都不
-//   回显，source='env' 即「用默认密码」，面板提示建议修改）；apiKeys 的
-//   value 是掩码数组（`****XXXX` 末 4 位，keyFingerprint 同款），明文只在
-//   PATCH 请求体由管理端自己提供。
+//   回显）；顶层 `adminPassIsDefault` 精确给出「当前生效密码是否等于默认值」
+//   （面板据此显示「建议修改默认密码」的强提示，比按 source 推断准确 ——
+//   source='env' 也可能是 env 显式设了强密码）。apiKeys 的 value 是掩码数组
+//   （`****XXXX` 末 4 位，keyFingerprint 同款），明文只在 PATCH 请求体由管理端
+//   自己提供。
 // - PATCH：body 是部分更新对象 `{<key>: value, ...}`（一次可改多键）。
 //   未知键/类型错/值越界 → 400 {error:{message,type}}；db 不可用或写入失败
 //   → 503。多键写入走**单事务**（全成或全败，绝不部分落库），成功后再
 //   applySettingsToConfig 原地改 cfg（apiKeys 是数组引用替换，verifyAuth
 //   下次读取即生效）→ 审计 op=settings.update → 200 全量 settings。
 // - 已知取舍：
-//   1. 改 adminPass 不清已有签名会话（无状态会话无法全量枚举黑名单），
-//      旧会话 24h 内仍有效 —— 文档注明，属可接受范围。
+//   1. 改 adminPass 会让**已签发会话立即失效**（签名编入密码版本
+//      sha256(adminPass)，applySettingsToConfig 改 cfg.adminPass 后旧签名
+//      对不上）——无需黑名单枚举。
 //   2. PATCH apiKeys 是**替换**语义：管理端若把自己当前用的 key 从列表移除，
 //      API key 鉴权会立即失效（fallback 是会话 cookie / 本机直连）。
 
@@ -779,7 +907,13 @@ async function handleGetSettings(
     return;
   }
   const stored = new SettingsStore(deps.db).all();
-  sendJson(res, 200, { ok: true, data: { settings: settingsView(deps.cfg, stored) } });
+  sendJson(res, 200, {
+    ok: true,
+    data: {
+      settings: settingsView(deps.cfg, stored),
+      adminPassIsDefault: deps.cfg.adminPass === DEFAULT_ADMIN_PASS,
+    },
+  });
 }
 
 /**
@@ -847,8 +981,15 @@ async function handlePatchSettings(
     accountId: null,
     ok: true,
     note: Object.keys(values).join(','),
+    ip: clientIpOf(req),
   });
-  sendJson(res, 200, { ok: true, data: { settings: settingsView(deps.cfg, store.all()) } });
+  sendJson(res, 200, {
+    ok: true,
+    data: {
+      settings: settingsView(deps.cfg, store.all()),
+      adminPassIsDefault: deps.cfg.adminPass === DEFAULT_ADMIN_PASS,
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,11 +1226,11 @@ async function handleCreateToken(
   }
   const r = deps.tokens.create(name, note, customKey);
   if (!r.ok) {
-    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.create', accountId: null, ok: false, note: name });
+    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.create', accountId: null, ok: false, note: name, ip: clientIpOf(req) });
     sendJson(res, 500, { error: { message: 'failed to create token', type: 'server_error' } });
     return;
   }
-  deps.db.insertAdminAudit({ at: Date.now(), op: 'token.create', accountId: null, ok: true, note: name });
+  deps.db.insertAdminAudit({ at: Date.now(), op: 'token.create', accountId: null, ok: true, note: name, ip: clientIpOf(req) });
   sendJson(res, 200, { ok: true, data: r.value });
 }
 
@@ -1134,12 +1275,12 @@ async function handlePatchToken(
   }
   const r = deps.tokens.update(id, patch);
   if (r === false) {
-    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.update', accountId: null, ok: false, note: `id=${id}` });
+    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.update', accountId: null, ok: false, note: `id=${id}`, ip: clientIpOf(req) });
     sendJson(res, 500, { error: { message: 'failed to update token', type: 'server_error' } });
     return;
   }
   if (r === 'missing') {
-    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.update', accountId: null, ok: false, note: `id=${id} missing` });
+    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.update', accountId: null, ok: false, note: `id=${id} missing`, ip: clientIpOf(req) });
     sendJson(res, 404, { error: { message: 'token not found', type: 'not_found_error' } });
     return;
   }
@@ -1149,6 +1290,7 @@ async function handlePatchToken(
     accountId: null,
     ok: true,
     note: `id=${id} ${fields.join(',')}`,
+    ip: clientIpOf(req),
   });
   sendJson(res, 200, { ok: true, data: deps.tokens.get(id) });
 }
@@ -1167,7 +1309,7 @@ async function handleDeleteToken(
   // 删除前先拿名字（审计留痕）；拿不到不阻塞删除。
   const before = deps.tokens.get(id);
   if (!deps.tokens.delete(id)) {
-    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.delete', accountId: null, ok: false, note: `id=${id}` });
+    deps.db.insertAdminAudit({ at: Date.now(), op: 'token.delete', accountId: null, ok: false, note: `id=${id}`, ip: clientIpOf(req) });
     sendJson(res, 500, { error: { message: 'failed to delete token', type: 'server_error' } });
     return;
   }
@@ -1177,6 +1319,7 @@ async function handleDeleteToken(
     accountId: null,
     ok: true,
     note: `id=${id}${before ? ` name=${before.name}` : ''}`,
+    ip: clientIpOf(req),
   });
   sendJson(res, 200, { ok: true });
 }
@@ -1346,16 +1489,16 @@ async function handlePutModelAlias(
   }
   const r = updateModelAlias(db, alias, target, note);
   if (r === false) {
-    db.insertAdminAudit({ at: Date.now(), op: 'model-alias.update', accountId: null, ok: false, note: 'update failed' });
+    db.insertAdminAudit({ at: Date.now(), op: 'model-alias.update', accountId: null, ok: false, note: 'update failed', ip: clientIpOf(req) });
     sendJson(res, 500, { error: { message: 'failed to update model alias', type: 'server_error' } });
     return;
   }
   if (r === 'missing') {
-    db.insertAdminAudit({ at: Date.now(), op: 'model-alias.update', accountId: null, ok: false, note: 'missing' });
+    db.insertAdminAudit({ at: Date.now(), op: 'model-alias.update', accountId: null, ok: false, note: 'missing', ip: clientIpOf(req) });
     sendJson(res, 404, { error: { message: 'model alias not found', type: 'not_found_error' } });
     return;
   }
-  db.insertAdminAudit({ at: Date.now(), op: 'model-alias.update', accountId: null, ok: true, note: null });
+  db.insertAdminAudit({ at: Date.now(), op: 'model-alias.update', accountId: null, ok: true, note: null, ip: clientIpOf(req) });
   deps.cfg.modelMap[alias] = target;
   sendJson(res, 200, { aliases: loadModelAliases(db) });
 }
@@ -1496,6 +1639,9 @@ export interface ConsoleClientLike {
   removeServiceAccount(id: number, saId: string): Promise<ConsoleWriteResult>;
   /** 通道健康态：该账户 cookie 是否已被判定失效（内存态，与本次调用无关）。 */
   cookieStatus(id: number): 'ok' | 'invalid';
+  /** 失效凭据所在通道（'cookie' | 'oauth'）——面板区分恢复指引（更新 cookie
+   *  还是重新 OAuth 授权）；未失效 → null。 */
+  authChannel(id: number): 'cookie' | 'oauth' | null;
   /** 最近一次调用失败原因（区分「合法 null 响应」与「真实失败」，budgets 用）。 */
   lastError(id: number): 'auth' | 'upstream' | 'no-cred' | null;
   /** 凭据更新后重置健康态（新 cookie/重新登录——防旧 invalid 标记死锁）。 */
@@ -1735,7 +1881,7 @@ export function createApp(
             sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
             return;
           }
-          handleAdminLogout(req, res);
+          handleAdminLogout(req, res, db);
           return;
         }
         // 页面请求（非 /api/*）：无鉴权 → 返回登录页（浏览器无 cookie 时）。
@@ -1944,6 +2090,19 @@ export function createApp(
           await handleRequestsRoute(req, res, db);
           return;
         }
+        // 操作审计（管理面写操作的脱敏留痕）：只读，同 requests 端点的门槛。
+        if (path === '/__admin/api/audit') {
+          if (req.method !== 'GET') {
+            sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+            return;
+          }
+          if (!adminOriginAllowed(req)) {
+            sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+            return;
+          }
+          await handleAuditRoute(req, res, db);
+          return;
+        }
         await handleAdminRoutes(req, res, { cfg, store, pool: keyPool, fetchImpl: adminFetchImpl, db, consoleClient: consoleClientImpl });
         return;
       }
@@ -2006,7 +2165,7 @@ export function createApp(
           sendJson(res, 415, { error: { message: 'content-type must be application/json', type: 'invalid_request_error' } });
           return;
         }
-        handleCountTokens(req, res, cfg, ctx);
+        await handleCountTokens(req, res, cfg, ctx);
         return;
       }
 
@@ -2041,28 +2200,34 @@ export function createApp(
       // /healthz 与面板自身的轮询不记账，否则面板会把自己刷满。
       if (path !== '/healthz' && !path.startsWith('/__')) {
         const device = extractDevice(req);
-        recordEvent({
-          at: startTime,
-          method: req.method ?? '?',
-          path,
-          protocol: ctx.protocol,
-          status: res.statusCode,
-          durationMs: elapsed,
-          model: ctx.model,
-          upstreamModel: ctx.upstreamModel,
-          endpoint: ctx.endpoint,
-          stream: ctx.stream,
-          inputTokens: ctx.inputTokens,
-          outputTokens: ctx.outputTokens,
-          thinkingTokens: ctx.thinkingTokens,
-          requestBytes: ctx.requestBytes,
-          device,
-          keyFingerprint: ctx.keyFingerprint,
-          error: ctx.error,
-          rewritten: ctx.rewritten,
-          stripped: ctx.stripped,
-          compressed: ctx.compressed,
-        });
+        // 记账请求（count_tokens）只落库、不进内存指标（reviewer m7：不混进
+        // 「请求数」统计 —— Claude Code 每条消息前都调一次 count_tokens，进
+        // events 会把面板「最近请求」与 summary.ok 刷满）。落库的详细请求页
+        // 仍可见（endpoint='count_tokens' 标记，input_tokens 是真实值）。
+        if (ctx.endpoint !== 'count_tokens') {
+          recordEvent({
+            at: startTime,
+            method: req.method ?? '?',
+            path,
+            protocol: ctx.protocol,
+            status: res.statusCode,
+            durationMs: elapsed,
+            model: ctx.model,
+            upstreamModel: ctx.upstreamModel,
+            endpoint: ctx.endpoint,
+            stream: ctx.stream,
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+            thinkingTokens: ctx.thinkingTokens,
+            requestBytes: ctx.requestBytes,
+            device,
+            keyFingerprint: ctx.keyFingerprint,
+            error: ctx.error,
+            rewritten: ctx.rewritten,
+            stripped: ctx.stripped,
+            compressed: ctx.compressed,
+          });
+        }
         // 同一份数据落库。内存指标环形缓冲重启即清零，落库的才能回答
         // 「这个 key 这个月一共扛了多少」。IP 与上游 cost（microCents）也落库：
         // 管理鉴权后的 IP 统计与「网关实际用量」端点要用；path/ua/client 进
@@ -2684,26 +2849,35 @@ async function handleMessagesPassThrough(
  * 上游走的是 OpenAI 协议，没有 count_tokens（Anthropic 端点也只返回 404 HTML），
  * 所以这里纯本地估算，不打上游 —— 既省一次往返，也避免烧订阅额度。
  * 估算口径：messages/system 的文本字符数 / 4。
+ *
+ * 观测注意（2026-08-13 修复）：此前是 `void readBody(...).then(...)` 没被 await
+ * —— finally 记账先于 .then() 回调执行，ctx.inputTokens 还没赋值就落库，requests
+ * 行 input_tokens 恒 0；body 读失败也不写 ctx.error。现在改成 async + await，
+ * 读失败记 ctx.error。endpoint 标记成 'count_tokens'：记账请求不进「请求数」
+ * 统计（metrics 事件直接跳过、db 聚合查询排除），面板详细请求里仍可见（带
+ * 真实 input_tokens），靠 endpoint 区分。
  */
-function handleCountTokens(req: IncomingMessage, res: ServerResponse, cfg: AppConfig, ctx: MetricsCtx): void {
-  void readBody(req, cfg.maxBodyBytes).then((read) => {
-    if (!read.ok) {
-      sendJson(res, read.status, {
-        error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
-      });
-      return;
-    }
-    const parsed = parseJson(read.text);
-    if (!parsed.ok) {
-      sendJson(res, 400, badBodyError(parsed.empty));
-      return;
-    }
-    const bodyObj = parsed.body as Record<string, unknown> | null;
-    if (bodyObj != null && typeof bodyObj.model === 'string') ctx.model = bodyObj.model;
-    const inputTokens = estimateInputTokens(parsed.body);
-    ctx.inputTokens = inputTokens;
-    sendJson(res, 200, { input_tokens: inputTokens });
-  });
+async function handleCountTokens(req: IncomingMessage, res: ServerResponse, cfg: AppConfig, ctx: MetricsCtx): Promise<void> {
+  ctx.endpoint = 'count_tokens';
+  const read = await readBody(req, cfg.maxBodyBytes);
+  if (!read.ok) {
+    ctx.error = `request body read failed (${read.status})`;
+    sendJson(res, read.status, {
+      error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
+    });
+    return;
+  }
+  const parsed = parseJson(read.text);
+  if (!parsed.ok) {
+    ctx.error = parsed.empty ? 'request body is empty' : 'invalid JSON body';
+    sendJson(res, 400, badBodyError(parsed.empty));
+    return;
+  }
+  const bodyObj = parsed.body as Record<string, unknown> | null;
+  if (bodyObj != null && typeof bodyObj.model === 'string') ctx.model = bodyObj.model;
+  const inputTokens = estimateInputTokens(parsed.body);
+  ctx.inputTokens = inputTokens;
+  sendJson(res, 200, { input_tokens: inputTokens });
 }
 
 /** 本地估算 input_tokens：messages/system 文本字符数 / 4（约 4 字符/token）。 */
@@ -2849,6 +3023,13 @@ async function handleOauthPoll(
  * 把登录身份落成账号（幂等）：同 workspaceId 已有账号 → 只更新 oauth 字段
  * （不覆盖用户自定义的名字）；否则 create 一个 `{kind:'unknown', keys:[], cookie:null}`
  * 的新账号。refresh_token 在这里加密落库；access_token 不在本函数出现。
+ *
+ * **补绑语义（确认）**：OAuth 登录天然按 workspaceId 归并 —— 现有 cookie 账号
+ * 只要用同一个 workspace（同一 OAuth 账号登录的 org 与 cookie 账号相同），
+ * 第二次走 Sign in with OpenCode 就是「补绑」：cookie 与 refresh_token 并存，
+ * console 通道 cookie 优先、失效自动回退 Bearer（见 ConsoleClient.getCredentials）。
+ * 不同 workspace 才新建账号。所以「现有 cookie 账号能否补绑 OAuth」= 能，
+ * 前提是同一个 workspace；面板无需单独入口，复用弹层再授权一次即可。
  */
 function persistOauthAccount(store: AccountsStore | null, identity: OauthIdentity): boolean {
   if (store == null || !store.enabled) {
@@ -3128,15 +3309,22 @@ function consoleNoCookie(res: ServerResponse, deps: ConsoleDeps, accountId: numb
 }
 
 /**
- * cookieState 推断：store 的 cookie 存在性（missing）+ ConsoleClient 健康态
- * （cookieStatus，失败后内存标记）+ 其余 ok。
+ * cookieState 推断：store 的 cookie/OAuth 存在性（missing）+ ConsoleClient 健康态
+ * （cookieStatus + authChannel，失败后内存标记）+ 其余 ok。
+ * oauth-invalid 单独一个值：OAuth 账号 refresh_token 失效时，面板应提示
+ * 「重新授权」而不是「更新 cookie」——两条通道的恢复路径完全不同。
  */
-function consoleCookieState(store: AccountsStore, accountId: number, client: ConsoleClientLike): 'ok' | 'invalid' | 'missing' {
+function consoleCookieState(
+  store: AccountsStore,
+  accountId: number,
+  client: ConsoleClientLike,
+): 'ok' | 'invalid' | 'oauth-invalid' | 'missing' {
   // cookie 或 OAuth refresh_token 任一存在即可用（Bearer fallback 通道）。
   if (!store.enabled || (store.cookieOf(accountId) == null && store.getOauthRefresh?.(accountId) == null)) {
     return 'missing';
   }
-  return client.cookieStatus(accountId);
+  if (client.cookieStatus(accountId) !== 'invalid') return 'ok';
+  return client.authChannel(accountId) === 'oauth' ? 'oauth-invalid' : 'invalid';
 }
 
 /**
@@ -3208,9 +3396,12 @@ async function handleConsoleBilling(res: ServerResponse, deps: ConsoleDeps, acco
   ]);
 
   if (status == null) {
-    // 主余额源失败：cookieStatus 已同步更新 —— invalid 说明 cookie 失效（健康态
+    // 主余额源失败：cookieStatus 已同步更新 —— invalid 说明凭据失效（健康态
     // 通常已提前拦截，这里兜住竞态）；否则是真实上游故障。
     if (client.cookieStatus(accountId) === 'invalid') {
+      // 区分失效通道：OAuth Bearer 失效 → oauth-invalid（面板提示重新授权）；
+      // cookie 失效 → invalid（面板提示更新 cookie）。
+      const invalidState = client.authChannel(accountId) === 'oauth' ? 'oauth-invalid' : 'invalid';
       sendJson(res, 200, {
         ok: true,
         data: {
@@ -3219,7 +3410,7 @@ async function handleConsoleBilling(res: ServerResponse, deps: ConsoleDeps, acco
           autoRecharge: null,
           ledger: null,
           paymentMethods: null,
-          cookieState: 'invalid',
+          cookieState: invalidState,
         },
       });
       return;
@@ -3471,9 +3662,17 @@ async function sendConsoleList(
   });
 }
 
-/** 读失败统一出口：cookieStatus invalid → channel_error（带失效指引）；否则 upstream_error。 */
+/** 读失败统一出口：cookieStatus invalid → channel_error（按失效通道给不同指引）；
+ * 否则 upstream_error。 */
 function sendConsoleReadFailure(res: ServerResponse, client: ConsoleClientLike, accountId: number): void {
   if (client.cookieStatus(accountId) === 'invalid') {
+    if (client.authChannel(accountId) === 'oauth') {
+      sendConsoleChannelError(
+        res,
+        'console channel auth failed: OAuth credential expired or revoked — sign in with OpenCode to re-authorize this account',
+      );
+      return;
+    }
     sendConsoleChannelError(
       res,
       'console channel auth failed: console login expired or invalid — update this account\'s cookie or re-import from browser',
