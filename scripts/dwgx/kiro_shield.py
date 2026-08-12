@@ -40,6 +40,7 @@ fuckopencode 网关之间（盾占 8787，网关退到 8788 —— 详见 .claud
                                      （nbus 实际用 http://127.0.0.1:8788）
   MAX_BUDGET_SECS    总重试预算(秒)   默认 600
   MAX_ATTEMPTS       最大尝试次数     默认 60
+  MAX_CONCURRENCY    最大并发请求数   默认 200（超出直接回 503，不为风暴开线程）
 """
 
 import collections
@@ -47,6 +48,7 @@ import http.server
 import itertools
 import json
 import os
+import re
 import socketserver
 import sys
 import threading
@@ -55,21 +57,38 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """不跟随 3xx 重定向（见 Handler._attempt 的注释：登录 302 不能被吞）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 HOST = os.environ.get("SHIELD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SHIELD_PORT", "8993"))
 UPSTREAM = os.environ.get("UPSTREAM", "http://172.30.0.1:8990").rstrip("/")
 MAX_BUDGET = float(os.environ.get("MAX_BUDGET_SECS", "600"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "60"))
 
-# 逐跳头，不能转发
+# 并发上限：ThreadingMixIn 每请求一线程，请求风暴期会无限开线程直到把进程
+# 打死（MemoryMax=128M，实测挂过，只能靠重启恢复）。这里给并发加闸：满时
+# 直接回 503，不排队、不再开线程 —— 503 对客户端可重试，比把盾整个拖死好。
+MAX_CONCURRENCY = max(1, int(os.environ.get("MAX_CONCURRENCY", "200")))
+
+# 逐跳头，不能转发。
+# 注意：**host 不在这里** —— 代理必须转发原始 Host。曾把 host 误放进这张表，
+# 导致转发后 urllib 自动补 `Host: 127.0.0.1:8788`，网关的 Origin 校验
+# （Origin hostname vs Host hostname）全部 403 —— 面板任何写操作都失败。
+# content-length 由 urllib 按 body 自动重算，删掉避免不一致。
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length",
 }
 
 _stats_lock = threading.Lock()
 STATS = {"requests": 0, "retries": 0, "absorbed": 0, "gave_up": 0,
-         "swap_waits": 0, "swap_gave_up": 0, "cool_waits": 0,
+         "rejected": 0, "swap_waits": 0, "swap_gave_up": 0, "cool_waits": 0,
          "auth_waits": 0, "perm_waits": 0, "perm_gave_up": 0,
          "client_waits": 0, "client_gave_up": 0, "by_status": {}}
 
@@ -189,6 +208,13 @@ CLIENT_FAULT_BODY_MARKERS = (
     "authentication_error",
     "Missing API key",
     "not_found_error",                   # 路径/资源不存在
+    # fuckopencode 网关注入检测（injectionMode=block）的确定性拦截：内容是
+    # 扫描出来的结果，重试多少次都是同一个 400。实测 2026-08-11 有 31 次
+    # 这类响应落进 auth 长窗（5s→32.8s 升档，90s 预算）空转，客户端白挂
+    # 一分半才收到错误。归 client 超短窗快速收敛。
+    "message content violates content policy",
+    # 网关 JSON 解析失败：请求体本身就坏，重试不会变好。
+    "invalid JSON body",
 )
 
 # 这些 4xx 是**客户端自己**的问题，与上游无关，永不重试。
@@ -545,6 +571,51 @@ def fmt_secs(s):
     return f"{h} 小时 {m} 分" if m else f"{h} 小时"
 
 
+# 上游错误体里可能混进的密钥形态。命中即打码，防诊断信息泄漏真实凭据。
+_SECRET_PATTERNS = (
+    # sk- 开头（OpenAI/DeepSeek 等）
+    re.compile(r"(?i)sk-[a-z0-9][a-z0-9_-]{5,}"),
+    # Authorization 头形态
+    re.compile(r"(?i)bearer\s+[a-z0-9._-]{8,}"),
+    # auth=/apikey=/key=/token= 参数形态
+    re.compile(r"(?i)\b(?:auth|apikey|key|token)[=:]\s*[a-z0-9._-]{8,}"),
+)
+
+
+def _redact(text):
+    """把密钥形态统一替换成 ***。"""
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub("***", text)
+    return text
+
+
+def upstream_error_detail(status, payload):
+    """错误诊断信息：403 时带上游 error.message 的关键部分，其余只报状态码。
+
+    上游 403 的 body 里往往藏着真实原因（如 RegionError: 模型仅限中国区
+    托管、需显式 opt-in），只有状态码时客户端会误以为是登录问题。
+    兼容 {error:{message}} 与顶层 {message} 两种形态；非 JSON / 无 message /
+    非 403 一律退回「上游返回 <status>」，行为与原来完全一致。
+    """
+    if status == 403:
+        try:
+            data = json.loads(payload[:MAX_PEEK_BYTES].decode("utf-8", "replace"))
+        except (ValueError, TypeError):
+            data = None
+        msg = None
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message")
+            if not isinstance(msg, str):
+                msg = data.get("message")
+        if isinstance(msg, str) and msg.strip():
+            # 先脱敏再截断：顺序不能反，否则截断可能把密钥切成半截漏出去
+            detail = _redact(msg.strip())[:200]
+            return f"上游返回 403：{detail}"
+    return f"上游返回 {status}"
+
+
 def client_message(reason, *, elapsed, attempts, detail=""):
     """给下游客户端的中文说明。
 
@@ -637,6 +708,11 @@ def classify(status, peek, path=""):
     兜底是**拦**而不是放：只有 PERMANENT_BODY_MARKERS 命中才回 "pass"。
     "auth" 是 4xx 的兜底节奏，与 cool 共用「听 Retry-After + 升档」。
     """
+    # 3xx（重定向）直接透传：重试只会无限循环 —— 网关管理面登录成功返回
+    # 302 → /__admin（带 Set-Cookie），重试 POST 同一个 login 还是 302。
+    # 实测：面板登录被重试循环吞掉后客户端拿到 200 登录页 =「无法登录」。
+    if 300 <= status < 400:
+        return "pass"
     text = peek.decode("utf-8", "replace") if peek else ""
     if text:
         # 先分流「号池救不了」的：客户端自己的错，等待纯属空转。
@@ -705,11 +781,12 @@ def classify(status, peek, path=""):
     #
     # 4xx 用 auth 节奏而非 retry 节奏：403/401 多是凭据/风控问题，
     # 拿 1 秒退避猛打只会加重上游风控；auth 节奏听 Retry-After 并升档。
-    # 非推理路径（面板/管理 API）：仍然拦，但走 `perm` 的短预算。
-    # 面板背后有人盯着转圈，浏览器 fetch 30~120 秒就超时了，
-    # 给它 900 秒长窗等于「转圈到超时」而不是「等到成功」。
+    # 非推理路径（面板/管理 API / /__admin/* / /healthz）：**直接透传不重试**。
+    # 这些是网关自己的管理面（有独立鉴权），盾不该拦截 —— 实测 502（如
+    # console 通道无 cookie）被重试拖到 cloudflared 100s 超时（524），
+    # 面板用户等的是「失败原因」而不是「转圈 2 分钟」。
     if path and not is_inference_path(path):
-        return "retry" if status in RETRYABLE else "perm"
+        return "pass"
     if status in RETRYABLE:
         return "retry"
     if status in CLIENT_FAULT_STATUSES:
@@ -719,6 +796,16 @@ def classify(status, peek, path=""):
     if 400 <= status < 500:
         return "auth"
     return "retry"
+
+
+def network_delay(attempt):
+    """网络层失败（连不上上游）专用退避：5s 起、1.5 倍、上限 30s。
+
+    曾用 backoff_delay（1s 起 12s 上限）：网关 OOM 崩溃/重启窗口内，盾 2s 间隔
+    重试 42 次，新进程一启动就被重试请求淹没 → 更快 OOM（死亡螺旋，实测 119 次
+    循环崩溃）。网关重启要几秒到几十秒，退避必须比启动时间长才有意义。
+    """
+    return max(5.0, min(5.0 * (1.5 ** max(0, attempt - 1)), 30.0))
 
 
 def backoff_delay(attempt, retry_after):
@@ -744,6 +831,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         http.server.BaseHTTPRequestHandler.setup(self)
         # 是否已经发出保活响应头。一旦为真，状态码就锁定成 200 了。
         self._ka_open = False
+        # 不跟随 3xx 重定向的 opener（见 _attempt 注释：跟随会吞掉登录 302）。
+        self._opener = urllib.request.build_opener(_NoRedirectHandler())
 
     def log_message(self, fmt, *args):
         pass  # 用自己的 log()
@@ -825,15 +914,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return False
 
     def _attempt(self, headers, body):
-        """打一次上游。返回 (status, resp_headers, reader) 或抛异常。"""
+        """打一次上游。返回 (status, resp_headers, reader) 或抛异常。
+
+        必须禁用重定向跟随：urllib 默认会跟随 3xx（POST→GET、丢 Set-Cookie）。
+        网关管理面登录成功返回 302 → /__admin + Set-Cookie，被跟随后客户端
+        拿到的是页面而不是重定向 —— 「无法登录」的根源（2026-08-11 实测）。
+        不跟随时 3xx 会以 HTTPError 形式抛回，e.code 即状态码，照常分类透传。
+        """
         req = urllib.request.Request(
             UPSTREAM + self.path, data=body, headers=headers, method=self.command
         )
         try:
-            resp = urllib.request.urlopen(req, timeout=600)
+            resp = self._opener.open(req, timeout=600)
             return resp.status, resp.headers, resp
         except urllib.error.HTTPError as e:
             return e.code, e.headers, e
+
+    def _reject_busy(self):
+        """并发满：立刻回 503，不排队、不占上游、不耗重试预算。
+
+        回 503 而非 429 的原因与预算耗尽相同：Cursor 对 503 会重试、
+        对 429 会停会话。文案沿用「盾在下游眼里就是上游」的口径，
+        不暴露并发/盾这类内部实现。
+
+        先 `_collect_request()` 把请求体读掉再回 —— 这是关键：如果在客户端
+        还没写完请求体时就发响应+关连接，内核看到 socket 里还有没读的数据
+        会发 RST，客户端在自己的 sendall 上撞 BrokenPipe，拿不到这个 503。
+        """
+        self._collect_request()
+        with _stats_lock:
+            STATS["rejected"] += 1
+        log(f"503 busy: concurrency cap {MAX_CONCURRENCY} reached {self.path}")
+        self._fail(503, "上游瞬时负载过高，暂时无法接受更多请求，请稍后重发。")
 
     def _proxy(self):
         with _stats_lock:
@@ -878,7 +990,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         attempts=attempt, detail=str(e)[:120]))
                     return
                 if not self._sleep_with_keepalive(
-                        backoff_delay(attempt, None), streaming):
+                        network_delay(attempt), streaming):
                     log(f"client gone during backoff {self.path}")
                     return
                 retried = True
@@ -909,16 +1021,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             # 非 2xx：错误体都很小，读一小段用于判定。读完就得整体
             # 转发这段内容，不能再交给 _relay 重读（流已被消费）。
-            peek = b""
+            # 上限 4KB：错误体远小于此，防畸形上游给超大 body 拖内存；
+            # 判定与事件记录只用前 4KB，超限部分直接丢弃。
+            payload = b""
             try:
-                peek = reader.read(MAX_PEEK_BYTES)
+                payload = reader.read(MAX_PEEK_BYTES)
             except Exception:
                 pass
-            try:
-                rest = reader.read()
-            except Exception:
-                rest = b""
-            payload = peek + rest
             try:
                 reader.close()
             except Exception:
@@ -964,7 +1073,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._fail(503, client_message(
                         "client", elapsed=time.monotonic() - t_start,
                         attempts=client_attempt,
-                        detail=f"上游返回 {status}"))
+                        detail=upstream_error_detail(status, payload)))
                     return
                 with _stats_lock:
                     STATS["retries"] += 1
@@ -1003,7 +1112,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._fail(503, client_message(
                         "perm", elapsed=time.monotonic() - t_start,
                         attempts=perm_attempt,
-                        detail=f"上游返回 {status}"))
+                        detail=upstream_error_detail(status, payload)))
                     return
                 with _stats_lock:
                     STATS["retries"] += 1
@@ -1072,7 +1181,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._fail(503, client_message(
                         "swap", elapsed=time.monotonic() - t_start,
                         attempts=swap_attempt,
-                        detail=f"{_why}，上游返回 {status}"))
+                        detail=f"{_why}，{upstream_error_detail(status, payload)}"))
                     return
                 with _stats_lock:
                     STATS["retries"] += 1
@@ -1233,9 +1342,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _is_loopback(self):
+        """回环客户端判定：本机（cloudflared/隧道）或 ::1。FurCDN 公网回源是外网 IP，返回 False。"""
+        ip = getattr(self, "client_address", (None, None))[0]
+        return ip in ("127.0.0.1", "::1", "localhost")
+
     # 观测端点走前缀匹配：/_shield/events 可以带 ?verdict=&outcome=&limit=
     def _shield_route(self):
-        """命中观测端点则处理并返回 True，否则 False（继续代理）。"""
+        """命中观测端点则处理并返回 True，否则 False（继续代理）。
+
+        安全：观测端点只对回环客户端开放（本机 ssh 隧道 / cloudflared 同机）。
+        FurCDN 公网回源打 /_shield/* 一律 404，不泄露面板也不占线程。
+        """
+        if not self._is_loopback():
+            if self.path.startswith("/_shield/"):
+                self._send_json({"error": "not found"}, 404)
+                return True
+            return False
         base = self.path.split("?", 1)[0]
         if base == "/_shield/stats":
             self._stats()
@@ -1285,12 +1408,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self._shield_route():
             return
-        self._proxy()
+        if not Server._concurrency.acquire(blocking=False):
+            self._reject_busy()
+            return
+        try:
+            self._proxy()
+        finally:
+            Server._concurrency.release()
 
     def do_GET(self):
         if self._shield_route():
             return
-        self._proxy()
+        if not Server._concurrency.acquire(blocking=False):
+            self._reject_busy()
+            return
+        try:
+            self._proxy()
+        finally:
+            Server._concurrency.release()
 
     do_PUT = do_POST
     do_DELETE = do_POST
@@ -1310,7 +1445,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _stats(self):
         with _stats_lock:
-            self._send_json(dict(STATS))
+            d = dict(STATS)
+        # 并发上限的观测：当前活跃线程数（含主线程）。压测/排查风暴时看它
+        # 是否被 MAX_CONCURRENCY 卡住 —— 线程数有上限是盾不再被打死的证据。
+        d["threads"] = threading.active_count()
+        self._send_json(d)
 
     def _events(self):
         """异常事件列表。支持 ?verdict= &outcome= &limit= 过滤。"""
@@ -1407,6 +1546,12 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     # ⚠️ 这个值已经丢过两次（本文件被整体重写时带走）——所以本文件现已纳入
     # ws-vps 仓库管理，改完务必 commit，不要只改服务器上的副本。
     request_queue_size = 1024
+
+    # 并发闸门：ThreadingMixIn 每请求一线程，并发数 = 线程数。风暴期不给上限
+    # 的话线程会一路涨到把 128M 进程打死（实测挂过、靠重启恢复）。信号量卡住
+    # 同时进行的代理请求数，满了立刻回 503（见 Handler._reject_busy）——
+    # 超出的请求不排队、不占上游，线程自然也就不会累积。
+    _concurrency = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
 
 if __name__ == "__main__":

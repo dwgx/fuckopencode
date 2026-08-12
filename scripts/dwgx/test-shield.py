@@ -3,11 +3,13 @@
 盾的行为验证（DWGX）—— 不依赖线上，纯本地跑。
 
 起一个假 fuckopencode 上游，按脚本编排的状态码序列作答，然后确认：
-  1. 整池被禁的 503（`all upstream keys are disabled`）被盾吸收，
-     客户端最终拿到 200 而不是 503。
-  2. 502 `upstream unavailable` 同样被吸收。
-  3. 客户端自己的错（401 unauthorized）**不**被长窗拖住，快速收敛。
-  4. 2xx 直接透传，不预读（SSE 实时性不受影响）。
+   1. 整池被禁的 503（`all upstream keys are disabled`）被盾吸收，
+      客户端最终拿到 200 而不是 503。
+   2. 502 `upstream unavailable` 同样被吸收。
+   3. 客户端自己的错（401 unauthorized）**不**被长窗拖住，快速收敛。
+   4. 2xx 直接透传，不预读（SSE 实时性不受影响）。
+   5. 403 的**真实原因**（错误体 error.message，如 RegionError）透传到
+      诊断信息里，且密钥形态被脱敏；403 无 body 时退回「上游返回 403」。
 
 用法：
   python3 scripts/dwgx/test-shield.py
@@ -49,6 +51,8 @@ class FakeUpstream(BaseHTTPRequestHandler):
         self.server.hits += 1
         payload = body.encode()
         self.send_response(status)
+        if status == 302:
+            self.send_header("location", "/__admin")
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(payload)))
         self.end_headers()
@@ -98,6 +102,16 @@ def start_shield(upstream_port, **env_overrides):
     raise RuntimeError("盾未在 10 秒内监听")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """测试客户端也不跟随 3xx —— 跟随会让 302 用例跑到假上游的 GET 501 上。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NOREDIR_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def call(port, path="/v1/messages", body=None):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
@@ -108,7 +122,7 @@ def call(port, path="/v1/messages", body=None):
     )
     started = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with _NOREDIR_OPENER.open(req, timeout=60) as r:
             return r.status, r.read().decode("utf-8", "replace"), time.time() - started
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace"), time.time() - started
@@ -120,6 +134,21 @@ UPSTREAM_DOWN = json.dumps({"error": {"message": "upstream unavailable",
                                       "type": "server_error"}})
 UNAUTHORIZED = json.dumps({"error": {"message": "unauthorized",
                                      "type": "authentication_error"}})
+CONTENT_POLICY = json.dumps({"error": {
+    "message": "message content violates content policy",
+    "type": "invalid_request_error"}})
+# 上游 403 真实原因：模型区域限制（用户反馈的原型）。无标记词，落 auth 兜底。
+REGION_403 = json.dumps({"error": {
+    "type": "RegionError",
+    "message": "The latest version of this model is only available hosted in "
+               "China and requires explicit opt in: https://example.com/opt-in"}})
+# 带 authentication_error 标记的 403（用户实测形态）：落 client 分支。
+# message 里混进假 sk- 密钥，验证脱敏。
+REGION_403_CLIENT = json.dumps({"error": {
+    "type": "authentication_error",
+    "message": "RegionError: The latest version of this model is only available "
+               "hosted in China and requires explicit opt in: "
+               "https://example.com/opt-in key sk-live-abc123def456ghi789"}})
 
 RESULTS = []
 
@@ -167,6 +196,19 @@ def case_client_fault_fast():
         check("客户端 401 快速收敛（不拖长窗）",
               elapsed < 15,
               f"status={status} 耗时={elapsed:.1f}s（长窗会是 25s+）")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+def case_content_policy_fast():
+    """网关注入拦截（400 content policy）是确定性错误，不该被 auth 长窗拖住。"""
+    up, up_port = start_fake([(400, CONTENT_POLICY)] * 20)
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port)
+        check("400 content policy 快速收敛（不拖 auth 长窗）",
+              elapsed < 15,
+              f"status={status} 耗时={elapsed:.1f}s（auth 长窗会是 25s+）")
     finally:
         shield.kill(); up.shutdown()
 
@@ -272,14 +314,175 @@ def case_client_fault_message_delivered():
         shield.kill(); up.shutdown()
 
 
+def case_upstream_detail_message():
+    """403 诊断信息带上游 error.message，且脱敏、截断；非 403 行为不变。"""
+    ks = load_shield_module()
+    prefix = "上游返回 403："
+
+    region = json.dumps({
+        "error": {
+            "type": "RegionError",
+            "message": "RegionError: The latest version of this model is only "
+                       "available hosted in China and requires explicit opt in: "
+                       "https://example.com/opt-in "
+                       "key sk-live-abcdef1234567890abcdef1234567890 "
+                       "Bearer fake-token-abcdef",
+        }}).encode()
+    d = ks.upstream_error_detail(403, region)
+    check("403 诊断信息带上游 message 关键部分",
+          d.startswith(prefix) and "RegionError" in d
+          and "requires explicit opt in" in d,
+          f"detail={d[:110]}…")
+    check("403 诊断信息中密钥形态被脱敏（sk-/Bearer）",
+          "sk-live-abcdef" not in d and "fake-token-abcdef" not in d
+          and "***" in d,
+          f"detail={d[:110]}…")
+
+    top = json.dumps({"message": "顶层 message 形态也认"}).encode()
+    d2 = ks.upstream_error_detail(403, top)
+    check("兼容顶层 {message} 形态",
+          d2 == prefix + "顶层 message 形态也认", f"detail={d2}")
+
+    d3 = ks.upstream_error_detail(403, b"not json at all")
+    check("非 JSON 错误体退回「上游返回 403」",
+          d3 == "上游返回 403", f"detail={d3}")
+
+    d4 = ks.upstream_error_detail(401, region)
+    check("非 403 状态码不带 message（行为不变）",
+          d4 == "上游返回 401", f"detail={d4}")
+
+    long_msg = json.dumps({"error": {"message": "x" * 500}}).encode()
+    d5 = ks.upstream_error_detail(403, long_msg)
+    check("超长 message 截断到 200 字符",
+          len(d5) == len(prefix) + 200, f"len={len(d5)}")
+
+
+def case_403_region_message_delivered():
+    """端到端：403（RegionError，落 auth 兜底）收敛后诊断信息带真实原因。"""
+    up, up_port = start_fake([(403, REGION_403)] * 20)
+    shield, sh_port = start_shield(
+        up_port, AUTH_BUDGET_SECS="6", AUTH_MAX_ATTEMPTS="2")
+    try:
+        status, body, elapsed = call(sh_port)
+        try:
+            msg = json.loads(body)["error"]["message"]
+        except Exception:
+            msg = body
+        check("403 收敛后诊断信息包含上游真实原因",
+              status == 503 and "hosted in China" in msg
+              and "requires explicit opt in" in msg,
+              f"status={status} message={msg[:110]}")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+def case_403_client_fault_message_delivered():
+    """端到端：client 分支的 403 同样带真实原因，且不泄漏 sk- 明文。"""
+    up, up_port = start_fake([(403, REGION_403_CLIENT)] * 20)
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port)
+        try:
+            msg = json.loads(body)["error"]["message"]
+        except Exception:
+            msg = body
+        check("client 分支 403 带真实原因",
+              status == 503 and "RegionError" in msg
+              and "requires explicit opt in" in msg,
+              f"status={status} message={msg[:110]}")
+        check("诊断信息不泄漏 sk- 明文",
+              "sk-live-abc123def456ghi789" not in msg
+              and "***" in msg,
+              f"message={msg[:110]}")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+def case_403_no_body_fallback():
+    """端到端：403 无 body 时保持「上游返回 403」，不硬凑内容。"""
+    up, up_port = start_fake([(403, "")] * 20)
+    shield, sh_port = start_shield(
+        up_port, AUTH_BUDGET_SECS="6", AUTH_MAX_ATTEMPTS="2")
+    try:
+        status, body, elapsed = call(sh_port)
+        try:
+            msg = json.loads(body)["error"]["message"]
+        except Exception:
+            msg = body
+        check("403 无 body 保持「上游返回 403」",
+              status == 503 and "上游返回 403" in msg
+              and "RegionError" not in msg,
+              f"status={status} message={msg[:110]}")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+
+
+def case_302_passthrough():
+    """3xx 重定向直接透传，不跟随、不重试（登录 302 不能被吞）。"""
+    up, up_port = start_fake([(302, "")])
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port)
+        check("302 直接透传（不跟随、不重试）",
+              status == 302 and up.hits == 1,
+              f"status={status} upstream_hits={up.hits} body={body[:60]}")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+
+def case_host_header_forwarded():
+    """Host 头必须原样转发（曾误入 HOP_BY_HOP 导致网关 Origin 校验 403）。"""
+    seen = {}
+
+    class HostCapture(FakeUpstream):
+        def do_POST(self):
+            seen["host"] = self.headers.get("host", "")
+            super().do_POST()
+
+    port = t_free_port() if False else None
+    import socket as _s
+    with _s.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    srv = HTTPServer(("127.0.0.1", port), HostCapture)
+    srv.script = []
+    srv.hits = 0
+    import threading as _t
+    _t.Thread(target=srv.serve_forever, daemon=True).start()
+    shield, sh_port = start_shield(port)
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{sh_port}/v1/messages",
+            data=json.dumps({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+            headers={"content-type": "application/json", "host": "fuckopencode.dwgx.top"},
+            method="POST",
+        )
+        with _NOREDIR_OPENER.open(req, timeout=30) as r:
+            r.read()
+        check("Host 头原样转发到上游",
+              seen.get("host") == "fuckopencode.dwgx.top",
+              f"upstream host={seen.get('host')!r}")
+    finally:
+        shield.kill(); srv.shutdown()
+
 def main():
     print("=== 盾行为验证（DWGX）===\n")
     case_client_message_chinese()
+    case_upstream_detail_message()
     case_success_passthrough()
+    case_302_passthrough()
+    case_host_header_forwarded()
     case_pool_empty_absorbed()
     case_upstream_unavailable_absorbed()
     case_client_fault_fast()
     case_client_fault_message_delivered()
+    case_403_region_message_delivered()
+    case_403_client_fault_message_delivered()
+    case_403_no_body_fallback()
+    case_content_policy_fast()
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} 通过")
     return 1 if failed else 0
