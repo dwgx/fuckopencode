@@ -41,8 +41,11 @@ export interface RequestEvent {
   model: string;
   /** 实际发给上游的模型名 */
   upstreamModel: string;
-  /** 命中订阅端点还是按量付费 */
-  endpoint: 'subscription' | 'payg' | '-';
+  /**
+   * 命中订阅端点还是按量付费；`count_tokens` 是纯本地估算的记账请求
+   * （reviewer m7：记账请求不进「请求数」统计，面板聚合与趋势都排除它）。
+   */
+  endpoint: 'subscription' | 'payg' | 'count_tokens' | '-';
   stream: boolean;
   inputTokens: number;
   outputTokens: number;

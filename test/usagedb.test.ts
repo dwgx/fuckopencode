@@ -174,6 +174,63 @@ describe('UsageDb 基础读写', () => {
     expect(rows[1]).toMatchObject({ at: 2000, op: 'import-cookie', account_id: null, ok: 0, note: 'no-target' });
   });
 
+  it('管理审计：ip 列落库 + listAdminAudit 回读（联表账号名）', () => {
+    const p = path.join(tmpDir, 'usage.db');
+    const db = new UsageDb(p, 30, log);
+    db.insertAdminAudit({ at: 1000, op: 'login', accountId: null, ok: true, note: null, ip: '127.0.0.1' });
+    db.insertAdminAudit({ at: 2000, op: 'account.patch', accountId: 7, ok: false, note: 'update failed', ip: '10.0.0.2' });
+    db.close();
+
+    const list = new UsageDb(p, 30, log);
+    const items = list.listAdminAudit(50);
+    expect(items).not.toBeNull();
+    expect(items).toHaveLength(2);
+    expect(items![0]).toMatchObject({ at: 2000, op: 'account.patch', accountId: 7, ok: false, note: 'update failed', ip: '10.0.0.2' });
+    expect(items![1]).toMatchObject({ at: 1000, op: 'login', accountId: null, ok: true, note: null, ip: '127.0.0.1' });
+    // 有账号关联时联表带名字；无账号（accountId null）则名字为 null。
+    expect(items![0]!.accountName).toBeNull();
+    expect(items![1]!.accountName).toBeNull();
+    list.close();
+  });
+
+  it('listAdminAudit：账号存在时联表出账号名，limit 生效', () => {
+    const p = path.join(tmpDir, 'usage.db');
+    const db = new UsageDb(p, 30, log);
+    // 先建账号（accounts 表 DDL 由 UsageDb 负责），再写审计行。
+    db.close();
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string) => any;
+    };
+    const raw = new DatabaseSync(p);
+    raw.exec(`INSERT INTO accounts (name, keys_enc, created_at) VALUES ('audit-acc', '[]', 1)`);
+    raw.close();
+
+    const db2 = new UsageDb(p, 30, log);
+    db2.insertAdminAudit({ at: 5000, op: 'account.delete', accountId: 1, ok: true, note: null, ip: '127.0.0.1' });
+    db2.insertAdminAudit({ at: 4000, op: 'login', accountId: null, ok: false, note: 'invalid', ip: '127.0.0.1' });
+    const items = db2.listAdminAudit(1)!;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ op: 'account.delete', accountId: 1, accountName: 'audit-acc', ok: true });
+    db2.close();
+  });
+
+  it('count_tokens 记账请求被排除出用量聚合（不混进请求数统计）', () => {
+    const p = path.join(tmpDir, 'usage.db');
+    const db = new UsageDb(p, 30, log);
+    const now = 1_700_000_000_000;
+    db.recordRequest(row({ endpoint: 'subscription', at: now, inputTokens: 10 }));
+    db.recordRequest(row({ endpoint: 'count_tokens', at: now + 1000, inputTokens: 5000 }));
+    db.recordRequest(row({ endpoint: 'probe', at: now + 2000, inputTokens: 50 }));
+
+    const h = db.history()!;
+    expect(h.totalRequests).toBe(1); // 只有 subscription 那条
+    // usageTrend 同样排除 count_tokens：仅 subscription 计入。
+    const t = db.usageTrend(7, now + 3000)!;
+    expect(t.requests).toBe(1);
+    expect(t.inputTokens).toBe(10);
+    db.close();
+  });
+
   it('跨实例持久化：重开同一文件数据还在（这正是内存 metrics 做不到的）', () => {
     const p = path.join(tmpDir, 'usage.db');
     const db1 = new UsageDb(p, 30, log);
@@ -706,6 +763,29 @@ describe('listRequests 详细请求分页', () => {
     expect(page.total).toBe(2);
     expect(page.items).toHaveLength(2);
     expect(page.items.every((r) => r.endpoint !== 'probe')).toBe(true);
+    db.close();
+  });
+
+  it('error 列纳入搜索（q 命中 error 文案，如 rate-limited/额度耗尽）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'detail-err-search.db'), 30, log);
+    db.recordRequest(row({ at: 1000, error: 'upstream 429 rate_limit_error: Weekly usage limit reached' }));
+    db.recordRequest(row({ at: 2000, error: 'upstream 500 overloaded' }));
+    db.recordRequest(row({ at: 3000, error: null }));
+    const hit = db.listRequests(1, 20, 'Weekly usage')!;
+    expect(hit.total).toBe(1);
+    expect(hit.items[0]!.error).toContain('Weekly usage limit reached');
+    const miss = db.listRequests(1, 20, 'no-such-string')!;
+    expect(miss.total).toBe(0);
+    db.close();
+  });
+
+  it('count_tokens 记账请求仍可见于详细请求列表（endpoint 标记区分）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'detail-count.db'), 30, log);
+    db.recordRequest(row({ at: 1000, endpoint: 'count_tokens', path: '/v1/messages/count_tokens', inputTokens: 4321 }));
+    db.recordRequest(row({ at: 2000, path: '/v1/messages', ua: 'claude-cli/1.0.27' }));
+    const page = db.listRequests(1, 20)!;
+    expect(page.total).toBe(2);
+    expect(page.items.some((r) => r.endpoint === 'count_tokens' && r.inputTokens === 4321)).toBe(true);
     db.close();
   });
 
