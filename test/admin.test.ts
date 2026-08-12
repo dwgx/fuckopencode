@@ -372,7 +372,7 @@ describe('key 昵称：面板显示 + 改名弹层', () => {
 
   it('昵称变化会触发面板重建（renderFingerprint 的 key 元组含 nickname）', () => {
     const code = inlineScript();
-    expect(code).toContain('k.lastUsedAt, k.nickname');
+    expect(code).toContain('k.disabledReason, k.nickname');
   });
 });
 
@@ -1934,6 +1934,170 @@ describe('第二批：legacy key 明文复制按钮', () => {
     for (const k of ['legacyKeyNotFound', 'legacyKeyCopyTitle']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
       expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
+  });
+});
+
+/** 花括号配对提取内联 JS 里指定函数的源码（支持 `function name(...)` 与
+ *  `var name = function (...)` 两种形式）。配对扫描对字符串里的花括号免疫——
+ *  renderFingerprint/opDone/money 这些目标函数体内没有带花括号的字符串。 */
+function fnSource(name: string): string {
+  const code = inlineScript();
+  const pat = new RegExp(`(?:function ${name}\\s*\\([^)]*\\)|var ${name}\\s*=\\s*function\\s*\\([^)]*\\))\\s*\\{`);
+  const start = code.search(pat);
+  if (start < 0) throw new Error(`内联 JS 找不到函数 ${name}`);
+  const bodyStart = code.indexOf('{', start);
+  let depth = 0;
+  for (let i = bodyStart; i < code.length; i++) {
+    if (code[i] === '{') depth++;
+    else if (code[i] === '}') {
+      depth--;
+      if (depth === 0) return code.slice(start, i + 1);
+    }
+  }
+  throw new Error(`函数 ${name} 的花括号未闭合`);
+}
+
+/** 在沙箱里求值一个纯函数（外部依赖用 stubs 提供），返回可调用函数。 */
+function evalFn<T extends (...args: any[]) => any>(name: string, stubs: Record<string, unknown> = {}): T {
+  const src = fnSource(name);
+  const params = Object.keys(stubs);
+  const body = src.startsWith('var ')
+    ? `${src}\nreturn ${name};`
+    : `return ${src};`;
+  return new Function(...params, body)(...Object.values(stubs)) as T;
+}
+
+describe('对抗审查 6 项修复的回归测试', () => {
+  it('1a. money() 仍是 microCents→美元（把美元值再过 money 会压成 $0.00）', () => {
+    const money = evalFn<(mc: unknown) => string>('money');
+    expect(money(4218000000)).toBe('$42.18');  // 1e8 microCents = $1
+    expect(money(42.18)).toBe('$0.00');        // 若把「已是美元」的值再过 money，就丢精度——正是被修的 bug
+    expect(money(null)).toBe('—');
+    expect(money(0)).toBe('$0.00');
+  });
+
+  it('1b. renderBilling 的 balance/promotional 不再过 money()（后端已是美元）', () => {
+    const src = fnSource('renderBilling');
+    expect(src).toContain('Number(data.balance).toFixed(2)');
+    expect(src).toContain('Number(data.promotional).toFixed(2)');
+    expect(src).not.toContain('money(data.balance)');
+    expect(src).not.toContain('money(data.promotional)');
+    // 账户列表页 accountCard 的显示口径没被误改。
+    expect(fnSource('accountCard')).toContain("'$' + Number(a.balance).toFixed(2)");
+  });
+
+  it('2. renderFingerprint 排除 inFlight/lastUsedAt，保留状态字段', () => {
+    const fp = evalFn<(d: unknown) => string>('renderFingerprint');
+    const base: any = {
+      degraded: false,
+      list: [{
+        id: 1, name: 'a', kind: 'subscription', status: 'ok', statusDetail: null,
+        retryUntil: 0, balance: 10, monthlyLimit: 100, monthlyUsage: 5,
+        lastProbeAt: 123, lastBillingAt: 456,
+        keys: [{ fingerprint: 'abc', healthy: true, inFlight: 0, disabledReason: null, lastUsedAt: 111, nickname: 'k1' }],
+      }],
+    };
+    const clone = (x: any): any => JSON.parse(JSON.stringify(x));
+    // 只有 inFlight/lastUsedAt 变（任何请求都会变）→ 指纹不变，2s 轮询不重建列表。
+    const busy = clone(base);
+    busy.list[0].keys[0].inFlight = 2;
+    busy.list[0].keys[0].lastUsedAt = 999;
+    expect(fp(base)).toBe(fp(busy));
+    // disabledReason 变（禁用/恢复）→ 指纹变，触发重建。
+    const disabled = clone(base);
+    disabled.list[0].keys[0].disabledReason = 'quota-exhausted';
+    expect(fp(base)).not.toBe(fp(disabled));
+    // nickname 变 → 指纹变，改名仍能刷新。
+    const renamed = clone(base);
+    renamed.list[0].keys[0].nickname = 'k2';
+    expect(fp(base)).not.toBe(fp(renamed));
+  });
+
+  it('3. GO toggle 成功路径清 stickyErr[go] + 清空 go-err（失败才保留）', () => {
+    const code = inlineScript();
+    // 成功分支存在：delete stickyErr['go']（单引号 go 只在 toggle 成功分支出现）+
+    // go-err 文本被清空。
+    expect(code).toContain("delete stickyErr['go'];");
+    expect(code).toContain("ge.textContent = '';");
+    // 失败分支保留 sticky 标记，结构仍在。
+    expect(code).toContain("stickyErr['go'] = true;");
+    expect(code).toContain("ge.textContent = errMsg(r);");
+    // 成功分支的 delete 必须位于 else 里（跟着 toggle 的 POST 响应），而不是
+    // clearSticky 内部的 delete stickyErr[name]。
+    const pos = code.indexOf("stickyErr['go'] = true;");
+    const seg = code.slice(pos - 200, pos + 400);
+    expect(seg).toMatch(/if \(!r\.ok\) \{[\s\S]*?\} else \{[\s\S]*?delete stickyErr\['go'\];/);
+  });
+
+  it('4a. opDone 成功后调用第三个参数 reload，失败不调用', () => {
+    const calls: string[] = [];
+    const opDone = evalFn<(r: { ok: boolean }, msg: string, reload?: () => void) => void>('opDone', {
+      closeConfirm: () => calls.push('close'),
+      flash: () => calls.push('flash'),
+      tick: () => calls.push('tick'),
+      unlockConfirm: () => calls.push('unlock'),
+      errMsg: () => 'err',
+      $: () => ({}),
+    });
+    let reloaded = 0;
+    opDone({ ok: true }, 'ok', () => reloaded++);
+    expect(reloaded).toBe(1);
+    expect(calls).toContain('tick');
+    opDone({ ok: false }, 'bad', () => reloaded++);
+    expect(reloaded).toBe(1);  // 失败路径不 reload
+    expect(calls).toContain('unlock');
+  });
+
+  it('4b. 每个写操作按类型重载对应区块（tick 不刷 sa/budgets/members/providers）', () => {
+    const code = inlineScript();
+    expect(code).toContain("opDone(r, T('arSaved'), function () { loadBilling(id, false); })");
+    expect(code).toContain("opDone(r, T('mlSaved'), function () { loadBudgets(id); })");
+    expect(code).toContain("opDone(r, T('saCreated'), function () { loadSa(id); })");
+    expect(code).toContain("opDone(r, T('saDeleted'), function () { loadSa(id); })");
+    expect(code).toContain("opDone(r, T('cookieImported'), function () { loadAccountDetail(); })");
+  });
+
+  it('5. DETAIL_BLOCK_KEYS 引用的全部 i18n 键都在字典（变量传键的 T(b[1]) 场景）', () => {
+    const code = inlineScript();
+    const start = code.indexOf('var DETAIL_BLOCK_KEYS = [');
+    const end = code.indexOf('];', start);
+    const arrSrc = code.slice(start, end);
+    const refs = [...arrSrc.matchAll(/\[['"]([\w-]+)['"], ['"](\w+)['"], ['"](\w+)['"]\]/g)]
+      .map((m) => [m[1]!, m[2]!, m[3]!] as [string, string, string]);
+    expect(refs.length).toBeGreaterThan(10);
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    for (const [, title, sub] of refs) {
+      expect(en.has(title), `en 缺 ${title}`).toBe(true);
+      expect(en.has(sub), `en 缺 ${sub}`).toBe(true);
+      expect(zh.has(title), `zh 缺 ${title}`).toBe(true);
+      expect(zh.has(sub), `zh 缺 ${sub}`).toBe(true);
+    }
+    // 坏键（不在字典的 8 个）不能再出现在数组里。
+    for (const bad of ['modelsUsageTitle', 'modelsUsageSub', 'usersUsageTitle', 'usersUsageSub',
+                       'goTitle', 'legacyKeysTitle', 'legacyKeysSub', 'legacyBillingTitle']) {
+      expect(arrSrc, `DETAIL_BLOCK_KEYS 里残留坏键 ${bad}`).not.toContain(bad);
+    }
+    // 骨架键与对应 render 函数 dBlock() 实际用的键一致（loading 标题 = 渲染后标题）。
+    expect(code).toContain("['detail-models-usage', 'modelUsageTitle', 'modelUsageSub']");
+    expect(code).toContain("['detail-users-usage', 'userUsageTitle', 'userUsageSub']");
+    expect(code).toContain("['detail-go', 'goSub', 'goSubHint']");
+    expect(code).toContain("['detail-legacy', 'legacyKeys', 'legacySub']");
+    expect(code).toContain("['detail-legacy-billing', 'legacyBilling', 'legacyBillingSub']");
+  });
+
+  it('6. 每个详情 load* 回调首行有 detailState.id 切换守卫（旧账号慢响应不渲染进新视图）', () => {
+    const detailLoaders = ['loadWorkspaces', 'loadUsage', 'loadModelsUsage', 'loadUsersUsage',
+      'loadMemberBudgets', 'loadPricing', 'loadLegacyBilling', 'loadMembers', 'loadSa',
+      'loadLegacyKeys', 'loadProviders', 'loadBudgets', 'loadBilling', 'loadGo'];
+    for (const fn of detailLoaders) {
+      const src = fnSource(fn);
+      expect(src, `${fn} 缺详情切换守卫`).toContain('if (detailState.id !== id) return;');
+      // 守卫必须是 `.then(function (r) {` 之后的头一行：成功路径拦截旧账号响应。
+      const thenI = src.indexOf('.then');
+      expect(thenI, `${fn} 找不到 .then`).toBeGreaterThan(-1);
+      expect(src.slice(thenI, thenI + 160), `${fn} 的 then 回调首行必须是守卫`).toContain('if (detailState.id !== id) return;');
     }
   });
 });
