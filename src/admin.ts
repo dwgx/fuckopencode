@@ -4160,7 +4160,19 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function detailErr(name, msg) {
     stickyErr[name] = true;
     var el = $('detail-' + name);
-    if (el) el.innerHTML = '<div class="oc-hint oc-hint-err">' + esc(msg) + '</div>';
+    if (!el) return;
+    var acct = detailState.id != null ? findAccount(detailState.id) : null;
+    // env 代理账号（hasConsole=false）：console 区块无凭据是常态，显示中性说明而非红字。
+    if (acct && !acct.hasConsole) {
+      el.innerHTML = '<div class="oc-hint">' + esc(T('consoleNotConfigured')) + '</div>';
+      return;
+    }
+    // 凭据类错误（cookie 失效/登录过期/无凭据）：顶部横幅已提示，区块给中性提示不重复红字。
+    if (/cookie|credential|auth failed|expired|invalid|登录态|登录已失效/i.test(msg)) {
+      el.innerHTML = '<div class="oc-hint">' + esc(msg) + '</div>';
+      return;
+    }
+    el.innerHTML = '<div class="oc-hint oc-hint-err">' + esc(msg) + '</div>';
   }
   /** 渲染成功前的守卫：自动轮询且该块还挂着 sticky 错误 → 拒绝渲染（保留错误
    *  给用户看）；否则清除 sticky 标记并放行（用户操作触发的成功）。 */
@@ -4366,13 +4378,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     api('GET', '/__admin/api/console/account/' + id + '/billing', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
-        var acct2 = findAccount(id);
-        // env 代理账号（hasConsole=false）：无控制台凭据是常态，显示中性提示而非错误。
-        if (acct2 && !acct2.hasConsole) {
-          detailErr('billing', T('consoleNotConfigured'));
-        } else {
-          detailErr('billing', errMsg(r));
-        }
+        detailErr('billing', errMsg(r));  // detailErr 统一处理 env 中性化/凭据类中性化
         $('detail-autorecharge').innerHTML = '';
         return;
       }
