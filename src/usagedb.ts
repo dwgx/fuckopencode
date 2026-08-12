@@ -186,6 +186,20 @@ export interface AdminAuditRow {
   accountId: number | null;
   ok: boolean;
   note: string | null;
+  /** 调用方 IP（管理面写操作/登录的来源，面板审计视图展示「谁」）。可空：
+   *  部分打点位置没有 req（历史调用），或 db 里是补列前的旧行。 */
+  ip?: string | null;
+}
+
+/** 面板审计视图的一行：admin_audit + accounts.name（LEFT JOIN，见 listAdminAudit）。 */
+export interface AdminAuditViewRow {
+  at: number;
+  op: string;
+  accountId: number | null;
+  accountName: string | null;
+  ok: boolean;
+  note: string | null;
+  ip: string | null;
 }
 
 /**
@@ -453,7 +467,7 @@ export class UsageDb {
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       );
       this.insertAdminAuditStmt = this.db.prepare(
-        `INSERT INTO admin_audit (at, op, account_id, ok, note) VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO admin_audit (at, op, account_id, ok, note, ip) VALUES (?, ?, ?, ?, ?, ?)`,
       );
       this.enabled = true;
       this.disabledReason = null;
@@ -502,15 +516,16 @@ export class UsageDb {
       -- 前导列是 key_fp，用不上；没这条就是全表扫 + 临时 B-tree 排序。
       CREATE INDEX IF NOT EXISTS idx_key_events_at ON key_events(at);
 
-      -- 管理面写操作审计（console 写操作 / import-cookie）。只存摘要
-      -- （op/account_id/ok/note），绝不存金额与 cookie。清理随保留期走。
+      -- 管理面写操作审计（console 写操作 / import-cookie / 登录登出 / CRUD）。
+      -- 只存摘要（op/account_id/ok/note/ip），绝不存金额与 cookie。清理随保留期走。
       CREATE TABLE IF NOT EXISTS admin_audit (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         at INTEGER NOT NULL,
         op TEXT NOT NULL,
         account_id INTEGER,
         ok INTEGER NOT NULL,
-        note TEXT
+        note TEXT,
+        ip TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_admin_audit_at ON admin_audit(at);
 
@@ -582,6 +597,21 @@ export class UsageDb {
     this.ensureRequestsColumns();
     this.ensureTokensPrefixColumn();
     this.ensureTokensRpmColumn();
+    // 旧库升级：admin_audit 表补 ip 列（面板审计视图展示「谁」）。失败只记
+    // 日志 —— 审计是观测设施，缺 ip 只是那列恒 null，不影响其他列。
+    this.ensureAdminAuditIpColumn();
+  }
+
+  /** 旧库升级：admin_audit 表补 ip 列（幂等：已存在则不动）。 */
+  private ensureAdminAuditIpColumn(): void {
+    try {
+      const cols = this.db.prepare("SELECT name FROM pragma_table_info('admin_audit')").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'ip')) {
+        this.db.exec('ALTER TABLE admin_audit ADD COLUMN ip TEXT');
+      }
+    } catch (err) {
+      this.log(`[usagedb] admin_audit ip 列补列失败（降级：审计无来源 IP）: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -740,9 +770,10 @@ export class UsageDb {
       ? `WHERE endpoint != 'probe' AND (
            path LIKE ? ESCAPE '\\' OR CAST(status AS TEXT) LIKE ? ESCAPE '\\' OR
            model LIKE ? ESCAPE '\\' OR COALESCE(client, '') LIKE ? ESCAPE '\\' OR
-           COALESCE(ua, '') LIKE ? ESCAPE '\\' OR COALESCE(ip, '') LIKE ? ESCAPE '\\')`
+           COALESCE(ua, '') LIKE ? ESCAPE '\\' OR COALESCE(ip, '') LIKE ? ESCAPE '\\' OR
+           COALESCE(error, '') LIKE ? ESCAPE '\\')`
       : `WHERE endpoint != 'probe'`;
-    const bind = like ? [like, like, like, like, like, like] : [];
+    const bind = like ? [like, like, like, like, like, like, like] : [];
     try {
       const totalRow = this.db.prepare(`SELECT COUNT(*) AS n FROM requests ${where}`).get(...bind) as { n: number };
       const rows = this.db
@@ -826,7 +857,7 @@ export class UsageDb {
                   COALESCE(GROUP_CONCAT(DISTINCT client), '') AS clients,
                   MAX(at)                                    AS lastAt
              FROM requests
-            WHERE endpoint != 'probe' AND ip IS NOT NULL AND ip != ''
+            WHERE endpoint NOT IN ('probe', 'count_tokens') AND ip IS NOT NULL AND ip != ''
             GROUP BY ip
             ORDER BY requests DESC, ip ASC`,
         )
@@ -870,7 +901,7 @@ export class UsageDb {
                   COALESCE(SUM(output_tokens), 0)  AS outputTokens,
                   COALESCE(SUM(cost_micro_cents), 0) AS costMicroCents
              FROM requests
-            WHERE at >= ? AND endpoint != 'probe' AND (${placeholders})`,
+            WHERE at >= ? AND endpoint NOT IN ('probe', 'count_tokens') AND (${placeholders})`,
         )
         .get(sinceMs, ...tails.map((t) => `%${t}`)) as Record<string, number>;
       return {
@@ -909,7 +940,7 @@ export class UsageDb {
                   COALESCE(SUM(output_tokens), 0)         AS outputTokens,
                   COALESCE(SUM(cost_micro_cents), 0)      AS costMicroCents
              FROM requests
-            WHERE token_fp IS NOT NULL AND token_fp != ''
+            WHERE token_fp IS NOT NULL AND token_fp != '' AND endpoint != 'count_tokens'
             GROUP BY token_fp
             ORDER BY requests DESC`,
         )
@@ -980,7 +1011,7 @@ export class UsageDb {
                   COALESCE(SUM(output_tokens), 0)        AS outputTokens,
                   COALESCE(SUM(cost_micro_cents), 0)     AS costMicroCents
              FROM requests
-            WHERE at >= ? AND at < ? AND endpoint != 'probe'
+            WHERE at >= ? AND at < ? AND endpoint NOT IN ('probe', 'count_tokens')
             GROUP BY b`,
         )
         .all(bucketMs, since, until) as Array<Record<string, number>>;
@@ -1063,9 +1094,44 @@ export class UsageDb {
   insertAdminAudit(row: AdminAuditRow): void {
     if (!this.enabled) return;
     try {
-      this.insertAdminAuditStmt.run(row.at, row.op, row.accountId, row.ok ? 1 : 0, row.note);
+      this.insertAdminAuditStmt.run(row.at, row.op, row.accountId, row.ok ? 1 : 0, row.note, row.ip ?? null);
     } catch (err) {
       this.log(`[usagedb] 写入管理审计失败（已忽略）: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  /**
+   * 最近的管理面操作（GET /__admin/api/audit 的数据源，面板审计视图）。
+   * LEFT JOIN accounts 把 accountId 换成可读名字（审计视图展示「谁」不需要
+   * 前端再拉一遍账号列表）。按 at 倒序 + LIMIT —— 带 (at) 索引，浅查询。
+   * 失败返回 null（调用方 503），不抛 —— 观测设施降级哲学。
+   */
+  listAdminAudit(limit: number): Array<AdminAuditViewRow> | null {
+    if (!this.enabled) return null;
+    const n = Math.max(1, Math.min(200, Math.floor(limit) || 50));
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT a.at, a.op, a.account_id AS accountId, a.ok, a.note, a.ip,
+                  acc.name AS accountName
+             FROM admin_audit a
+             LEFT JOIN accounts acc ON acc.id = a.account_id
+            ORDER BY a.at DESC, a.id DESC
+            LIMIT ?`,
+        )
+        .all(n) as Array<Record<string, unknown>>;
+      return rows.map((r) => ({
+        at: Number(r.at) || 0,
+        op: String(r.op),
+        accountId: r.accountId == null ? null : Number(r.accountId),
+        accountName: r.accountName == null ? null : String(r.accountName),
+        ok: Boolean(r.ok),
+        note: r.note == null ? null : String(r.note),
+        ip: r.ip == null ? null : String(r.ip),
+      }));
+    } catch (err) {
+      this.log(`[usagedb] 管理审计查询失败: ${err instanceof Error ? err.message : err}`);
+      return null;
     }
   }
 
@@ -1110,6 +1176,8 @@ export class UsageDb {
       // 同时排除 endpoint = 'probe'：探活是后台维护动作（keyprobe 落库），
       // 不是用户的「累计请求」—— 混进 byKey/totalRequests 会让面板累计数
       // 虚高，且探针每轮都打会给「最近使用」制造假新鲜。
+      // 同口径排除 endpoint = 'count_tokens'：记账请求是纯本地估算（Claude Code
+      // 每条消息前都调一次），不是真实上游流量，混进按 key 的用量账本会虚高。
       const byKey = this.db
         .prepare(
           `SELECT key_fp                                    AS fingerprint,
@@ -1120,7 +1188,7 @@ export class UsageDb {
                   COALESCE(SUM(output_tokens), 0)            AS outputTokens,
                   MAX(at)                                    AS lastAt
              FROM requests
-            WHERE key_fp != '-' AND endpoint != 'probe'
+            WHERE key_fp != '-' AND endpoint NOT IN ('probe', 'count_tokens')
             GROUP BY key_fp
             ORDER BY requests DESC`,
         )
@@ -1136,10 +1204,10 @@ export class UsageDb {
         )
         .get() as { requests: number; failed: number };
 
-      // 总数与 byKey 同口径：排除探活（probe 是维护动作，不是用户请求）。
+      // 总数与 byKey 同口径：排除探活与记账请求（都是维护动作，不是用户流量）。
       const meta = this.db
         .prepare(
-          `SELECT COALESCE(MIN(at), 0) AS since, COUNT(*) AS total FROM requests WHERE endpoint != 'probe'`,
+          `SELECT COALESCE(MIN(at), 0) AS since, COUNT(*) AS total FROM requests WHERE endpoint NOT IN ('probe', 'count_tokens')`,
         )
         .get() as { since: number; total: number };
 
