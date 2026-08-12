@@ -133,6 +133,11 @@ describe('重构后的 UI 骨架（tabs / sidebar / dropdown / OAuth 弹层）',
     }
     expect(code).toContain('expiresIn');
     expect(code).toContain('verificationUriComplete');
+    // oauthError 覆盖后端全部失败原因：expired/denied/not_found/net + 兜底 fail。
+    expect(code).toContain("reason === 'expired'");
+    expect(code).toContain("reason === 'denied'");
+    expect(code).toContain("reason === 'not_found'");
+    expect(code).toContain("reason === 'net'");
   });
 
   it('用量视图渲染 /__metrics（renderUsage + fetchUsage + key 池 + 事件列表）', () => {
@@ -144,6 +149,21 @@ describe('重构后的 UI 骨架（tabs / sidebar / dropdown / OAuth 弹层）',
     expect(code).toContain('function fetchUsage(');
     expect(code).toContain("fetch('/__metrics'");
   });
+
+  it('操作审计视图：挂载点 + fetch/render + 接入 tick + i18n', () => {
+    const code = inlineScript();
+    // 挂载点：用量 tab 的审计 section。
+    for (const id of ['sec-usage-audit', 'audit-events']) {
+      expect(ADMIN_HTML).toContain(`id="${id}"`);
+    }
+    // 前端函数与数据源端点。
+    expect(code).toContain('function renderAudit(');
+    expect(code).toContain('function fetchAudit(');
+    expect(code).toContain("'/__admin/api/audit?limit=50'");
+    expect(code).toContain('fetchAudit();');  // tick 里每 2s 轮询
+    // subnav 入口。
+    expect(code).toContain("['subAudit', 'sec-usage-audit']");
+  });
 });
 
 describe('UI v3：账户详情视图（console 数据展示）', () => {
@@ -151,12 +171,18 @@ describe('UI v3：账户详情视图（console 数据展示）', () => {
     for (const id of ['view-account-detail', 'sec-account-detail', 'detail-billing', 'detail-usage',
                       'detail-autorecharge', 'detail-budgets', 'detail-members', 'detail-sa',
                       'detail-providers', 'detail-cookie', 'detail-cookie-paste', 'detail-name',
-                      'detail-back', 'detail-import', 'detail-paste-save']) {
+                      'detail-back', 'detail-import', 'detail-paste-save', 'detail-cookie-import',
+                      'detail-oauth', 'detail-oauth-row']) {
       expect(ADMIN_HTML).toContain(`id="${id}"`);
     }
     const code = inlineScript();
     expect(code).toContain("'account-detail': 'view-account-detail'");
     expect(code).toContain("'account-detail': [['subDetail', 'sec-account-detail']]");
+    // cookie 失效横幅里的 OAuth 替代路径已接上 startOAuth（OAuth 弹层）。
+    expect(code).toContain("$('detail-oauth').addEventListener('click', startOAuth)");
+    // oauth-invalid 状态有专属文案与「隐藏 cookie 导入行」分支。
+    expect(code).toContain("T('oauthInvalid')");
+    expect(code).toContain("$('detail-cookie-import').hidden = oauthOnly");
   });
 
   it('详情渲染/加载函数存在（open/close/load + 各数据块）', () => {
@@ -194,11 +220,15 @@ describe('UI v3：账户详情视图（console 数据展示）', () => {
     expect(code).toContain("loadLegacyKeys(detailState.id, !manual);");
   });
 
-  it('cookie 警示条按 cookieState 显示（invalid/missing）', () => {
+  it('cookie 警示条按 cookieState 显示（invalid/missing/oauth-invalid）', () => {
     const code = inlineScript();
     expect(code).toContain("var cs = data.cookieState || 'ok';");
-    expect(code).toContain("T('cookieInvalid') : T('cookieMissing')");
+    expect(code).toContain("T('cookieInvalid')");
+    expect(code).toContain("T('cookieMissing')");
+    expect(code).toContain("T('oauthInvalid')");
     expect(code).toContain("'detail-cookie-t'");
+    // oauth-invalid 是独立分支（不是 cookie 文案）：只有 oauth-invalid 才提示重新授权。
+    expect(code).toContain('var oauthOnly = cs === \'oauth-invalid\';');
   });
 });
 
@@ -465,7 +495,8 @@ describe('管理面板 i18n 词条 en/zh 对齐', () => {
                      'confirm', 'arModalTitle', 'arRequiresAmount', 'mlModalTitle', 'invalidNumber',
                      'saModalTitle', 'cookieModalBody', 'arSaved', 'mlSaved', 'saCreated',
                      'saDeleted', 'cookieImported', 'cookiePasted', 'consoleUnavailable',
-                     'usageUnavailable', 'delSaConfirm', 'oauthLoggedIn', 'none', 'date']) {
+                     'usageUnavailable', 'delSaConfirm', 'oauthLoggedIn', 'none', 'date',
+                     'oauthInvalid', 'oauthInstead', 'oauthNotFound']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
       expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
     }

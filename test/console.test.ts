@@ -656,3 +656,170 @@ describe('Bearer fallback（OAuth 账号无 cookie 也能读控制台数据）',
     expect((refreshReq.body as { client_id: string }).client_id).toBe('custom-client-id');
   });
 });
+
+describe('OAuth Bearer 通道覆盖全部 console 端点（无 cookie 的 OAuth 账号）', () => {
+  const log = (): void => {};
+
+  function oauthOnlyAccounts(saved: Array<string | null>): ConsoleAccounts {
+    return {
+      cookieOf: () => null,
+      workspaceIdOf: (id) => (id === 1 ? 'ws-1' : null),
+      getOauthRefresh: (id) => (id === 1 ? 'rt-1' : null),
+      setOauthRefresh: (_id, t) => {
+        saved.push(t);
+        return true;
+      },
+    };
+  }
+
+  it('全部读端点走 Bearer（authorization 头、无 cookie、带 x-org-id），refresh 单飞只打一次', async () => {
+    const saved: Array<string | null> = [];
+    const { f, reqs } = fakeFetch(async (req) => {
+      if (String(req.url).includes('/auth/device/token')) {
+        return jsonResponse(200, { access_token: 'at-1', refresh_token: 'rt-2', expires_in: 3600 });
+      }
+      return jsonResponse(200, { items: [] });
+    });
+    const client = new ConsoleClient(cfg(), oauthOnlyAccounts(saved), log, { fetchImpl: f });
+
+    await Promise.all([
+      client.billingStatus(1),
+      client.billingAccount(1),
+      client.billingLedger(1),
+      client.autoRecharge(1),
+      client.paymentMethods(1),
+      client.usageSummary(1, 7),
+      client.usageCostByDay(1, 7),
+      client.usageModels(1, 7),
+      client.usageUsers(1, 7),
+      client.budgetsUsersStatus(1),
+      client.modelPricing(1),
+      client.members(1, 50),
+      client.serviceAccounts(1, 50),
+      client.providers(1),
+      client.budgetsOrg(1),
+    ]);
+
+    const apiReqs = reqs.filter((r) => !String(r.url).includes('/auth/device/token'));
+    // 15 个读端点全部真实打上游（无缓存干扰：第一次调用、并发共享 access）。
+    expect(apiReqs).toHaveLength(15);
+    for (const r of apiReqs) {
+      expect(r.authorization).toBe('Bearer at-1');
+      expect(r.cookie).toBeNull();
+      expect(r.orgId).toBe('ws-1');
+    }
+    // 并发下 refresh 单飞：只有一个 refresh 请求；新 refresh_token 写回。
+    expect(reqs.filter((r) => String(r.url).includes('/auth/device/token'))).toHaveLength(1);
+    expect(saved).toEqual(['rt-2']);
+  });
+
+  it('全部写端点走 Bearer（POST + authorization 头）', async () => {
+    const saved: Array<string | null> = [];
+    const { f, reqs } = fakeFetch(async (req) => {
+      if (String(req.url).includes('/auth/device/token')) {
+        return jsonResponse(200, { access_token: 'at-1', refresh_token: 'rt-2' });
+      }
+      return jsonResponse(200, {});
+    });
+    const client = new ConsoleClient(cfg(), oauthOnlyAccounts(saved), log, { fetchImpl: f });
+
+    await client.setAutoRecharge(1, { enabled: true, thresholdDollars: 5, rechargeAmountDollars: 20 });
+    await client.setMonthlyLimit(1, 50);
+    await client.createServiceAccount(1, 'bot');
+    await client.removeServiceAccount(1, 'sa_1');
+
+    const apiReqs = reqs.filter((r) => !String(r.url).includes('/auth/device/token'));
+    expect(apiReqs).toHaveLength(4);
+    for (const r of apiReqs) {
+      expect(r.authorization).toBe('Bearer at-1');
+      expect(r.cookie).toBeNull();
+      expect(r.orgId).toBe('ws-1');
+      expect(r.method).toBe('POST');
+    }
+  });
+});
+
+describe('OAuth 失效状态（refresh token 过期/撤销）', () => {
+  const log = (): void => {};
+
+  it('refresh 401 → 明确 oauth 失效（cookieStatus invalid + authChannel=oauth），不静默', async () => {
+    const accounts: ConsoleAccounts = {
+      cookieOf: () => null,
+      workspaceIdOf: () => 'ws-1',
+      getOauthRefresh: () => 'rt-dead',
+      setOauthRefresh: () => true,
+    };
+    const { f } = fakeFetch(() => jsonResponse(401, {}));
+    const client = new ConsoleClient(cfg(), accounts, log, { fetchImpl: f });
+
+    expect(await client.billingStatus(1)).toBeNull();
+    expect(client.cookieStatus(1)).toBe('invalid');
+    expect(client.authChannel(1)).toBe('oauth');
+  });
+
+  it('refresh 5xx/网络失败 → 不判 OAuth 失效（authChannel=null + cookieStatus ok）', async () => {
+    // 一次性网络/上游抖动不能触发「重新授权」这种最贵的误报：只有 401/403
+    // 才是 refresh_token 真失效的证据。
+    const accounts: ConsoleAccounts = {
+      cookieOf: () => null,
+      workspaceIdOf: () => 'ws-1',
+      getOauthRefresh: () => 'rt-x',
+      setOauthRefresh: () => true,
+    };
+    const { f } = fakeFetch(() => new Response('err', { status: 502 }));
+    const client = new ConsoleClient(cfg(), accounts, log, { fetchImpl: f });
+
+    expect(await client.billingStatus(1)).toBeNull();
+    expect(client.cookieStatus(1)).toBe('ok');
+    expect(client.authChannel(1)).toBeNull();
+    expect(client.lastError(1)).toBe('upstream');
+  });
+
+  it('cookie 401 → cookie 失效（authChannel=cookie），随后 Bearer 回退成功即清失效', async () => {
+    let status = 401;
+    const accounts: ConsoleAccounts = {
+      cookieOf: () => 'auth=legacy-only-cookie', // 旧版 auth cookie（对新版 API 无效）
+      workspaceIdOf: () => 'ws-1',
+      getOauthRefresh: () => 'rt-1',
+      setOauthRefresh: () => true,
+    };
+    const { f, reqs } = fakeFetch(async (req) => {
+      if (String(req.url).includes('/auth/device/token')) {
+        return jsonResponse(200, { access_token: 'at-1', refresh_token: 'rt-2' });
+      }
+      return jsonResponse(status, {});
+    });
+    const client = new ConsoleClient(cfg(), accounts, log, { fetchImpl: f });
+
+    await client.billingStatus(1); // cookie → 401
+    expect(client.cookieStatus(1)).toBe('invalid');
+    expect(client.authChannel(1)).toBe('cookie'); // 是 cookie 失效，不是 OAuth
+
+    status = 200;
+    await client.billingStatus(1); // invalid → 回退 Bearer → 成功
+    expect(client.cookieStatus(1)).toBe('ok');
+    expect(client.authChannel(1)).toBeNull();
+    expect(reqs.some((r) => String(r.url).includes('/auth/device/token'))).toBe(true);
+  });
+
+  it('纯 OAuth 账号 Bearer 数据请求 401（access 过期）→ oauth 失效', async () => {
+    const accounts: ConsoleAccounts = {
+      cookieOf: () => null,
+      workspaceIdOf: () => 'ws-1',
+      getOauthRefresh: () => 'rt-1',
+      setOauthRefresh: () => true,
+    };
+    // 首次 refresh 成功拿到 access，但数据请求 401 → 该判 oauth 失效。
+    const { f } = fakeFetch(async (req) => {
+      if (String(req.url).includes('/auth/device/token')) {
+        return jsonResponse(200, { access_token: 'at-1', refresh_token: 'rt-2', expires_in: 3600 });
+      }
+      return jsonResponse(401, {});
+    });
+    const client = new ConsoleClient(cfg(), accounts, log, { fetchImpl: f });
+
+    expect(await client.billingStatus(1)).toBeNull();
+    expect(client.cookieStatus(1)).toBe('invalid');
+    expect(client.authChannel(1)).toBe('oauth');
+  });
+});
