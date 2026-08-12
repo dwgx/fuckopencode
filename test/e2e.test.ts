@@ -4383,9 +4383,9 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
 
   it('账号未配 legacy workspace → 502 明确提示', async () => {
     const res = await fetch(`${baseUrl}/__admin/api/legacy/account/${bId}/keys`);
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(404);
     const body = (await res.json()) as { error: { message: string; type: string } };
-    expect(body.error.type).toBe('channel_error');
+    expect(body.error.type).toBe('not_found_error');
     expect(body.error.message).toContain('legacy workspace not configured');
   });
 
@@ -4593,7 +4593,7 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
 
   it('keys/plain：未配 legacy workspace / __Host- cookie → 502 明确提示', async () => {
     const noWs = await fetch(`${baseUrl}/__admin/api/legacy/account/${bId}/keys/plain`);
-    expect(noWs.status).toBe(502);
+    expect(noWs.status).toBe(404);
     expect(((await noWs.json()) as { error: { message: string } }).error.message).toContain('legacy workspace not configured');
     const badCookie = await fetch(`${baseUrl}/__admin/api/legacy/account/${cId}/keys/plain`);
     expect(badCookie.status).toBe(502);
@@ -4634,7 +4634,7 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
 
   it('GET go 未配 legacy workspace / __Host- cookie → 502 明确提示', async () => {
     const noWs = await fetch(`${baseUrl}/__admin/api/legacy/account/${bId}/go`);
-    expect(noWs.status).toBe(502);
+    expect(noWs.status).toBe(404);
     expect(((await noWs.json()) as { error: { message: string } }).error.message).toContain('legacy workspace not configured');
     const badCookie = await fetch(`${baseUrl}/__admin/api/legacy/account/${cId}/go`);
     expect(badCookie.status).toBe(502);
@@ -4792,7 +4792,7 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
     expect(wired.status).toBe(502);
     expect(((await wired.json()) as { error: { type: string } }).error.type).toBe('channel_error');
     const noWs = await fetch(`${baseUrl}/__admin/api/legacy/account/${bId}/billing`);
-    expect(noWs.status).toBe(502);
+    expect(noWs.status).toBe(404);
     expect(((await noWs.json()) as { error: { message: string } }).error.message).toContain('legacy workspace not configured');
     const badCookie = await fetch(`${baseUrl}/__admin/api/legacy/account/${cId}/billing`);
     expect(badCookie.status).toBe(502);

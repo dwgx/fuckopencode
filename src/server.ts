@@ -4022,7 +4022,8 @@ async function runLegacyWrite(
   if (!legacyGuard(res, deps, accountId)) return;
   const ws = deps.store!.legacyWorkspaceIdOf(accountId);
   if (!ws) {
-    sendConsoleChannelError(res, 'legacy workspace not configured for this account');
+    // 404 = 该账号没有旧版工作区（env 代理等），前端静默隐藏区块——不是错误。
+    sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
   const cookie = deps.store!.cookieOf(accountId);
@@ -4058,7 +4059,8 @@ async function runLegacyWriteNoBody(
   if (!legacyGuard(res, deps, accountId)) return;
   const ws = deps.store!.legacyWorkspaceIdOf(accountId);
   if (!ws) {
-    sendConsoleChannelError(res, 'legacy workspace not configured for this account');
+    // 404 = 该账号没有旧版工作区（env 代理等），前端静默隐藏区块——不是错误。
+    sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
   const cookie = deps.store!.cookieOf(accountId);
@@ -4078,7 +4080,8 @@ async function handleLegacyKeysList(res: ServerResponse, deps: LegacyDeps, accou
   if (!legacyGuard(res, deps, accountId)) return;
   const ws = deps.store!.legacyWorkspaceIdOf(accountId);
   if (!ws) {
-    sendConsoleChannelError(res, 'legacy workspace not configured for this account');
+    // 404 = 该账号没有旧版工作区（env 代理等），前端静默隐藏区块——不是错误。
+    sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
   const cookie = deps.store!.cookieOf(accountId);
@@ -4108,7 +4111,8 @@ async function handleLegacyPlainKeys(res: ServerResponse, deps: LegacyDeps, acco
   }
   const ws = deps.store!.legacyWorkspaceIdOf(accountId);
   if (!ws) {
-    sendConsoleChannelError(res, 'legacy workspace not configured for this account');
+    // 404 = 该账号没有旧版工作区（env 代理等），前端静默隐藏区块——不是错误。
+    sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
   const cookie = deps.store!.cookieOf(accountId);
@@ -4133,7 +4137,8 @@ async function handleLegacyGoStatus(res: ServerResponse, deps: LegacyDeps, accou
   if (!legacyGuard(res, deps, accountId)) return;
   const ws = deps.store!.legacyWorkspaceIdOf(accountId);
   if (!ws) {
-    sendConsoleChannelError(res, 'legacy workspace not configured for this account');
+    // 404 = 该账号没有旧版工作区（env 代理等），前端静默隐藏区块——不是错误。
+    sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
   const cookie = deps.store!.cookieOf(accountId);
@@ -4150,7 +4155,8 @@ async function handleLegacyBilling(res: ServerResponse, deps: LegacyDeps, accoun
   if (!legacyGuard(res, deps, accountId)) return;
   const ws = deps.store!.legacyWorkspaceIdOf(accountId);
   if (!ws) {
-    sendConsoleChannelError(res, 'legacy workspace not configured for this account');
+    // 404 = 该账号没有旧版工作区（env 代理等），前端静默隐藏区块——不是错误。
+    sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
   const cookie = deps.store!.cookieOf(accountId);
