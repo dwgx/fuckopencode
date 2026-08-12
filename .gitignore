@@ -15,3 +15,6 @@ coverage/
 
 # 用量库（运行时产物；线上落在 dist/ 外面，deploy 时不会被覆盖）
 data/
+
+# 面板本地截图（会话调试产物，不入库）
+.opencode/tmp/
