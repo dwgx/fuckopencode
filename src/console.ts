@@ -107,8 +107,12 @@ export class ConsoleClient {
   /** 写代数：每账户的 invalidate 计数。invalidate 后返回的挂起读响应
    * 一律丢弃（防旧值把刚失效的缓存写回去，M2 竞态）。 */
   private readonly generations = new Map<number, number>();
-  /** 健康态：每账户的连续失败次数 + 是否判定 cookie 失效（面板「会话已失效」的数据源）。 */
-  private readonly health = new Map<number, { consecutiveFails: number; invalid: boolean }>();
+  /** 健康态：每账户的连续失败次数 + 是否判定凭据失效 + 失效发生在哪个通道
+   *  （cookie 或 OAuth Bearer —— 面板据此给不同恢复指引）。 */
+  private readonly health = new Map<
+    number,
+    { consecutiveFails: number; invalid: boolean; channel: 'cookie' | 'oauth' | null }
+  >();
   private readonly lastErr = new Map<number, 'auth' | 'upstream' | 'no-cred' | null>();
   /** OAuth access_token 进程内缓存（refresh 一次用 expires_in，避免每次请求
    *  都 refresh —— refresh 会轮换，并发请求互相踩踏旧 token 导致 400）。 */
@@ -268,6 +272,16 @@ export class ConsoleClient {
   }
 
   /**
+   * 失效凭据所在的通道（'cookie' | 'oauth'）——未失效 → null。
+   * 面板据此区分恢复指引：cookie 失效 → 更新/导入 cookie；OAuth Bearer
+   * 失效（refresh_token 过期/撤销）→ 重新走 Sign in with OpenCode 授权。
+   */
+  authChannel(id: number): 'cookie' | 'oauth' | null {
+    const h = this.health.get(id);
+    return h && h.invalid ? (h.channel ?? 'cookie') : null;
+  }
+
+  /**
    * 凭据更新（粘贴新 cookie / OAuth 重新登录 / 切换 workspace）后调用：清
    * invalid 标记 + access 缓存 + **读缓存** —— 否则健康态死锁（旧 cookie 401
    * 标记后新 cookie 永不被尝试，审查 H2），且切换 workspace 后读缓存仍按旧
@@ -359,7 +373,8 @@ export class ConsoleClient {
     }
     if (res.status === 401 || res.status === 403) {
       // 静默：cookie 是敏感凭证，失效时不打任何日志细节，只标记健康态。
-      this.recordFail(id, true);
+      // 通道一并记下（cookie 失效 vs OAuth Bearer 失效 → 面板给不同指引）。
+      this.recordFail(id, true, cred.type === 'cookie' ? 'cookie' : 'oauth');
       return null;
     }
     if (!res.ok) {
@@ -407,7 +422,7 @@ export class ConsoleClient {
       return { ok: false, reason: 'upstream' };
     }
     if (res.status === 401 || res.status === 403) {
-      this.recordFail(id, true);
+      this.recordFail(id, true, cred.type === 'cookie' ? 'cookie' : 'oauth');
       return { ok: false, reason: 'auth' };
     }
     if (!res.ok) {
@@ -499,7 +514,11 @@ export class ConsoleClient {
         }
       }
       if (!r.ok) {
-        this.recordFail(id, true);
+        // 401/403 = refresh_token 真失效（invalid_grant / revoked）→ OAuth 凭据失效；
+        // 其他（网络/5xx）是上游故障，**不误判失效** —— 面板不能因为一次网络
+        // 抖动就提示用户重新授权（对 OAuth 账号这是最贵的误报）。
+        const auth = r.status === 401 || r.status === 403;
+        this.recordFail(id, auth, 'oauth');
         this.log(`[console] account=${id} oauth refresh fail ${r.status}`);
         return null;
       }
@@ -554,18 +573,20 @@ export class ConsoleClient {
     }
   }
 
-  private recordFail(id: number, auth: boolean): void {
+  private recordFail(id: number, auth: boolean, channel: 'cookie' | 'oauth' | null = null): void {
     let h = this.health.get(id);
     if (!h) {
-      h = { consecutiveFails: 0, invalid: false };
+      h = { consecutiveFails: 0, invalid: false, channel: null };
       this.health.set(id, h);
     }
     if (auth) {
-      // 只有 auth 失败（401/403）判定 cookie 失效 —— cookie 失效的唯一证据。
+      // 只有 auth 失败（401/403）判定凭据失效 —— cookie 失效的唯一证据；
+      // 同时记下是哪个通道失效（cookie vs OAuth Bearer，面板据此给恢复指引）。
       h.invalid = true;
+      h.channel = channel;
     } else {
       // 非 auth 失败（网络/5xx/parse）只累计连续计数（供面板观测），
-      // **不触发 invalid**：网络抖动与上游故障和 cookie 无关（M-6），
+      // **不触发 invalid**：网络抖动与上游故障和凭据无关（M-6），
       // 混入会让通道被误判失效，面板 2s 轮询白白打无效状态。
       h.consecutiveFails++;
     }
@@ -577,6 +598,7 @@ export class ConsoleClient {
     if (h) {
       h.consecutiveFails = 0;
       h.invalid = false;
+      h.channel = null;
     }
     this.lastErr.set(id, null);
   }

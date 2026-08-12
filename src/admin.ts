@@ -24,6 +24,7 @@ import { refreshBilling, type FetchLike } from './billing.js';
 import type { UsageDb } from './usagedb.js';
 import { deleteModelAlias, loadModelAliases, saveModelAlias } from './modelmap.js';
 import { stripControl } from './errors.js';
+import { extractDevice } from './metrics.js';
 
 // ---------------------------------------------------------------------------
 // 请求体读取（与 server.ts 的 readBody/parseJson 保持同语义：408/413/空体区分）
@@ -81,6 +82,11 @@ const BODY_READ_STATUS_MESSAGE: Record<number, string> = {
   408: 'request body read timed out',
   413: 'request body too large',
 };
+
+/** 审计打点的调用方 IP（与 requests 落库同一来源 metrics.extractDevice）。 */
+function auditIp(req: IncomingMessage): string | null {
+  return extractDevice(req).ip || null;
+}
 
 function sendJson(res: ServerResponse, status: number, obj: unknown): void {
   const body = JSON.stringify(obj);
@@ -465,7 +471,7 @@ export async function handleAdminRoutes(
       return;
     }
     if (req.method === 'DELETE') {
-      handleDelete(res, deps, id);
+      handleDelete(req, res, deps, id);
       return;
     }
   } else if (segs.length === 2) {
@@ -496,7 +502,7 @@ export async function handleAdminRoutes(
       return;
     }
     if (req.method === 'DELETE') {
-      handleRemoveKey(res, deps, id, fingerprint);
+      handleRemoveKey(req, res, deps, id, fingerprint);
       return;
     }
     if (req.method === 'PATCH') {
@@ -550,7 +556,7 @@ async function handleCreate(req: IncomingMessage, res: ServerResponse, deps: Adm
   if (!created.ok) {
     // m6：key 已属于其他账户 → 400（数据层的跨账户知识转成业务错误）。
     // 审计在调用后记录：失败的创建也要留痕（op/ok/note，绝不记 key 明文）。
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.create', accountId: null, ok: false, note: created.reason });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.create', accountId: null, ok: false, note: created.reason, ip: auditIp(req) });
     if (created.reason === 'conflict') {
       sendJson(res, 400, {
         error: { message: `key already belongs to account "${created.ownerName}"`, type: 'invalid_request_error' },
@@ -560,7 +566,7 @@ async function handleCreate(req: IncomingMessage, res: ServerResponse, deps: Adm
     sendJson(res, 500, { error: { message: 'failed to create account', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.create', accountId: created.value.id, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.create', accountId: created.value.id, ok: true, note: null, ip: auditIp(req) });
   // §3.4 热加载：落盘 → 进内存。新 key 的 lastUsedAt=0 → 下一轮探针自动探它。
   for (const key of v.value.keys) deps.pool.addKey(key, created.value.id);
   sendAccount(res, 201, deps, created.value.id);
@@ -580,11 +586,11 @@ async function handlePatch(req: IncomingMessage, res: ServerResponse, deps: Admi
     return;
   }
   if (!deps.store!.update(id, v.value)) {
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: false, note: 'update failed' });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: false, note: 'update failed', ip: auditIp(req) });
     sendJson(res, 500, { error: { message: 'failed to update account', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: true, note: null, ip: auditIp(req) });
   // 凭据更新（cookie/oauth）后重置 console 健康态——防旧 invalid 标记死锁（审查 H2）。
   if (v.value.cookie !== undefined || v.value.workspaceId !== undefined) {
     deps.consoleClient?.noteCredentialChanged?.(id);
@@ -597,7 +603,7 @@ async function handlePatch(req: IncomingMessage, res: ServerResponse, deps: Admi
 }
 
 /** DELETE /__admin/api/accounts/:id：删账户 + 从 pool 移除其全部 key。 */
-function handleDelete(res: ServerResponse, deps: AdminDeps, id: number): void {
+function handleDelete(req: IncomingMessage, res: ServerResponse, deps: AdminDeps, id: number): void {
   const store = deps.store!;
   if (store.get(id) == null) {
     sendNotFound(res, `account ${id} not found`);
@@ -605,11 +611,11 @@ function handleDelete(res: ServerResponse, deps: AdminDeps, id: number): void {
   }
   const removed = store.remove(id);
   if (removed == null) {
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.delete', accountId: id, ok: false, note: 'remove failed' });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.delete', accountId: id, ok: false, note: 'remove failed', ip: auditIp(req) });
     sendJson(res, 500, { error: { message: 'failed to delete account', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.delete', accountId: id, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.delete', accountId: id, ok: true, note: null, ip: auditIp(req) });
   for (const key of removed) deps.pool.removeKey(key);
   res.writeHead(204, { 'content-length': '0' });
   res.end();
@@ -636,17 +642,17 @@ async function handleAddKey(req: IncomingMessage, res: ServerResponse, deps: Adm
       added.reason === 'conflict'
         ? `key already belongs to account "${added.ownerName}"`
         : 'key already exists';
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.add-key', accountId: id, ok: false, note: added.reason });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.add-key', accountId: id, ok: false, note: added.reason, ip: auditIp(req) });
     sendJson(res, 400, { error: { message, type: 'invalid_request_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.add-key', accountId: id, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.add-key', accountId: id, ok: true, note: null, ip: auditIp(req) });
   deps.pool.addKey(key, id);
   sendAccount(res, 200, deps, id);
 }
 
 /** DELETE /__admin/api/accounts/:id/keys/:fingerprint：按指纹删 key（匹配第一个）。 */
-function handleRemoveKey(res: ServerResponse, deps: AdminDeps, id: number, fingerprint: string): void {
+function handleRemoveKey(req: IncomingMessage, res: ServerResponse, deps: AdminDeps, id: number, fingerprint: string): void {
   const store = deps.store!;
   if (store.get(id) == null) {
     sendNotFound(res, `account ${id} not found`);
@@ -654,11 +660,11 @@ function handleRemoveKey(res: ServerResponse, deps: AdminDeps, id: number, finge
   }
   const removed = store.removeKey(id, fingerprint);
   if (removed == null) {
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.remove-key', accountId: id, ok: false, note: 'not found' });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.remove-key', accountId: id, ok: false, note: 'not found', ip: auditIp(req) });
     sendNotFound(res, `no key with fingerprint ${fingerprint} in account ${id}`);
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.remove-key', accountId: id, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.remove-key', accountId: id, ok: true, note: null, ip: auditIp(req) });
   deps.pool.removeKey(removed);
   res.writeHead(204, { 'content-length': '0' });
   res.end();
@@ -700,11 +706,11 @@ async function handleRenameKey(req: IncomingMessage, res: ServerResponse, deps: 
     return;
   }
   if (!store.setKeyNickname(id, plain, nickname)) {
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.rename-key', accountId: id, ok: false, note: 'update failed' });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.rename-key', accountId: id, ok: false, note: 'update failed', ip: auditIp(req) });
     sendJson(res, 500, { error: { message: 'failed to update key nickname', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.rename-key', accountId: id, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.rename-key', accountId: id, ok: true, note: null, ip: auditIp(req) });
   sendAccount(res, 200, deps, id);
 }
 
@@ -809,11 +815,11 @@ async function handleSaveModelAlias(req: IncomingMessage, res: ServerResponse, d
     return;
   }
   if (!saveModelAlias(db, v.value.alias, v.value.target, v.value.note)) {
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.save', accountId: null, ok: false, note: 'save failed' });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.save', accountId: null, ok: false, note: 'save failed', ip: auditIp(req) });
     sendJson(res, 500, { error: { message: 'failed to save model alias', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.save', accountId: null, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.save', accountId: null, ok: true, note: null, ip: auditIp(req) });
   deps.cfg.modelMap[v.value.alias] = v.value.target;
   sendJson(res, 200, { aliases: loadModelAliases(db) });
 }
@@ -845,11 +851,11 @@ async function handleDeleteModelAlias(
     return;
   }
   if (!deleteModelAlias(db, alias)) {
-    deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.delete', accountId: null, ok: false, note: 'delete failed' });
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.delete', accountId: null, ok: false, note: 'delete failed', ip: auditIp(req) });
     sendJson(res, 500, { error: { message: 'failed to delete model alias', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.delete', accountId: null, ok: true, note: null });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'model-alias.delete', accountId: null, ok: true, note: null, ip: auditIp(req) });
   delete deps.cfg.modelMap[alias];
   sendJson(res, 200, { aliases: loadModelAliases(db) });
 }
@@ -1643,10 +1649,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         </div>
         <div id="detail-cookie" class="cookie-warn" hidden>
           <div class="cookie-warn-t" id="detail-cookie-t"></div>
-          <div class="cookie-import">
+          <div class="cookie-import" id="detail-cookie-import">
             <button class="oc-btn oc-btn-primary" id="detail-import" data-i18n="importFromBrowser">import from browser</button>
             <input class="oc-input oc-grow oc-min-200" id="detail-cookie-paste" placeholder="auth=..." autocomplete="off">
             <button class="oc-btn" id="detail-paste-save" data-i18n="importCookie">import</button>
+          </div>
+          <div class="cookie-import" id="detail-oauth-row">
+            <button class="oc-btn" id="detail-oauth" data-i18n="oauthInstead">or sign in with OpenCode instead</button>
           </div>
         </div>
         <div id="detail-workspace"></div>
@@ -1689,7 +1698,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       <section id="sec-usage-recent">
         <h1 data-i18n="detailRequests">Detailed requests</h1>
         <div class="req-tools">
-          <input class="oc-input oc-grow" id="req-q" placeholder="search path/status/model/client/ua" autocomplete="off" spellcheck="false">
+          <input class="oc-input oc-grow" id="req-q" placeholder="search path/status/model/client/ua/error" autocomplete="off" spellcheck="false">
           <select class="oc-select oc-shrink" id="req-size" title="page size">
             <option value="20" selected>20</option>
             <option value="50">50</option>
@@ -1726,6 +1735,18 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           <span class="req-info" id="ip-info"></span>
           <button class="oc-btn" id="ip-prev" data-i18n="reqPrev">prev</button>
           <button class="oc-btn" id="ip-next" data-i18n="reqNext">next</button>
+        </div>
+      </section>
+
+      <section id="sec-usage-audit">
+        <h1 data-i18n="auditTitle">Admin audit</h1>
+        <div class="sub" data-i18n="auditSub">who · when · what on the management panel</div>
+        <div class="log">
+          <div class="log-hd">
+            <span data-i18n="hTime">time</span><span data-i18n="auditOp">op</span><span data-i18n="auditResult">result</span>
+            <span data-i18n="auditAccount">account</span><span data-i18n="auditIp">ip</span>
+          </div>
+          <div id="audit-events"><div class="oc-hint" data-i18n="auditEmpty">no admin operations yet</div></div>
         </div>
       </section>
     </div>
@@ -1984,8 +2005,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       oauthPolling: 'polling for approval', oauthStarting: 'starting',
       oauthExpiresIn: 'code expires in', oauthDone: 'account signed in',
       oauthExpired: 'device code expired, retry', oauthDenied: 'sign-in denied, retry',
+      oauthNotFound: 'sign-in session not found, retry',
       oauthFail: 'sign-in failed', oauthNetFail: 'network error',
-      oauthRetry: 'retry',
+      oauthRetry: 'retry', oauthInvalid: 'OAuth credential invalid, sign in again',
+      oauthInstead: 'or sign in with OpenCode instead',
       detail: 'details', back: 'back', subDetail: 'Account detail',
       // 工作区区块（显示当前 workspace + 切换）。
       workspaceTitle: 'Workspace', workspaceSub: 'current console workspace and switching',
@@ -2059,7 +2082,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       ipStatsTitle: 'Top IPs', ipStatsSub: 'traffic aggregated by client IP',
       ipClients: 'clients', ipLast: 'last seen', ipEmpty: 'no traffic yet',
       ipFilterHint: 'filter detailed requests by this IP',
+      // 操作审计（管理面写操作的脱敏留痕）。
+      auditTitle: 'Admin audit', auditSub: 'who · when · what on the management panel',
+      auditOp: 'op', auditResult: 'result', auditAccount: 'account', auditIp: 'ip',
+      auditOk: 'ok', auditFail: 'fail', auditEmpty: 'no admin operations yet',
       subIps: 'Top IPs',
+      subAudit: 'Admin audit',
       aboutEndpointDash: 'dashboard',
       // 模型映射（设置页）。
       subModelMap: 'Model mapping',
@@ -2212,8 +2240,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       oauthPolling: '等待授权中', oauthStarting: '启动中',
       oauthExpiresIn: '设备码过期倒计时', oauthDone: '账号登录成功',
       oauthExpired: '设备码已过期，可重试', oauthDenied: '登录被拒绝，可重试',
+      oauthNotFound: '登录会话不存在，可重试',
       oauthFail: '登录失败', oauthNetFail: '网络错误',
-      oauthRetry: '重试',
+      oauthRetry: '重试', oauthInvalid: 'OAuth 凭据失效，请重新授权',
+      oauthInstead: '或用 OpenCode 登录',
       detail: '详情', back: '返回', subDetail: '账号详情',
       // 工作区区块（显示当前 workspace + 切换）。
       workspaceTitle: '工作区', workspaceSub: '当前控制台工作区与切换',
@@ -2287,7 +2317,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       ipStatsTitle: 'IP 统计', ipStatsSub: '按客户端 IP 聚合的流量',
       ipClients: '客户端', ipLast: '最近', ipEmpty: '暂无流量',
       ipFilterHint: '按该 IP 筛选详细请求',
+      // 操作审计（管理面写操作的脱敏留痕）。
+      auditTitle: '操作审计', auditSub: '管理面板的谁 · 何时 · 做了什么',
+      auditOp: '操作', auditResult: '结果', auditAccount: '账号', auditIp: 'IP',
+      auditOk: '成功', auditFail: '失败', auditEmpty: '暂无操作记录',
       subIps: 'IP 统计',
+      subAudit: '操作审计',
       aboutEndpointDash: '仪表盘',
       // 模型映射（设置页）。
       subModelMap: '模型映射',
@@ -2872,6 +2907,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     fetchOverviewTrend();
     fetchRequests();
     fetchIpStats();
+    fetchAudit();
     // 分发密钥 60s 自动刷新兜底：TTL 过期后 tick 负责续命（总览费用/密钥卡）。
     loadTokens(false);
     // 预览数据（用量/Go）60s 自动刷新兜底：render 指纹不变时 tick 也负责续命。
@@ -3052,7 +3088,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   var SUBS = {
     overview: [['subOverview', 'sec-overview'], ['subStatus', 'sec-status'], ['subHealth', 'sec-health']],
     accounts: [['subAccounts', 'sec-accounts'], ['subCreate', 'sec-create'], ['subOauth', 'sec-oauth']],
-    usage: [['subRequests', 'sec-usage-summary'], ['subKeys', 'sec-usage-keys'], ['subIps', 'sec-usage-ips']],
+    usage: [['subRequests', 'sec-usage-summary'], ['subKeys', 'sec-usage-keys'], ['subIps', 'sec-usage-ips'], ['subAudit', 'sec-usage-audit']],
     tokens: [['subTokens', 'sec-tokens']],
     settings: [
       ['subLanguage', 'sec-settings-lang'], ['subModelMap', 'sec-modelmap'],
@@ -3673,6 +3709,39 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (sec) sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
+  // ── 操作审计（/__admin/api/audit，管理面写操作的脱敏留痕）──
+  // 契约：{ok, data:{items:[{at, op, accountId, accountName, ok, note, ip}]}}。
+  // 只显示最近操作（谁 · 什么时候 · 做了什么）；金额/cookie 等敏感值绝不进库，
+  // op + note 都是脱敏摘要。写操作后 tick 每 2s 轮询刷新。
+  function renderAudit(items) {
+    var el = $('audit-events');
+    if (!el) return;
+    if (!items || !items.length) {
+      el.innerHTML = '<div class="oc-hint">' + T('auditEmpty') + '</div>';
+      return;
+    }
+    el.innerHTML = items.map(function (e) {
+      var acc = e.accountName ? esc(e.accountName)
+        : (e.accountId != null ? '#' + e.accountId : '—');
+      var note = e.note ? '<span class="s-bad">' + esc(e.note) + '</span>' : '';
+      var detail = [acc, e.ip ? esc(e.ip) : '', note].filter(Boolean).join(' · ');
+      return '<div class="lent">' +
+        '<span class="w">' + hhmmss(e.at) + '</span>' +
+        '<span class="grow cut">' + esc(e.op) + '</span>' +
+        '<span class="' + (e.ok ? 's-ok' : 's-bad') + '">' + (e.ok ? T('auditOk') : T('auditFail')) + '</span>' +
+        '<span class="h-client cut">' + detail + '</span>' +
+        '</div>';
+    }).join('');
+  }
+  function fetchAudit() {
+    fetch('/__admin/api/audit?limit=50', { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (d && d.ok !== false && d.data) renderAudit(d.data.items);
+      })
+      .catch(function () {});
+  }
+
   // ── 模型映射（设置页）：GET 列表 + POST 添加/更新 + PUT 修改 + DELETE 删除 ──
   function loadModelAliases() {
     return api('GET', '/__admin/api/model-aliases', null).then(function (r) {
@@ -4103,6 +4172,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     clearInterval(oauthPollTimer);
     var msg = reason === 'expired' ? T('oauthExpired')
       : reason === 'denied' ? T('oauthDenied')
+      : reason === 'not_found' ? T('oauthNotFound')
       : reason === 'net' ? T('oauthNetFail')
       : T('oauthFail');
     var st = $('oauth-status');
@@ -4435,7 +4505,14 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       cw.hidden = true;
     } else {
       cw.hidden = false;
-      $('detail-cookie-t').textContent = cs === 'invalid' ? T('cookieInvalid') : T('cookieMissing');
+      // oauth-invalid：OAuth Bearer 失效（refresh_token 过期/撤销）——恢复路径是
+      // 重新授权，不是更新 cookie；oauth 账号本来就没有 cookie 可换。
+      var oauthOnly = cs === 'oauth-invalid';
+      $('detail-cookie-t').textContent = cs === 'invalid' ? T('cookieInvalid')
+        : oauthOnly ? T('oauthInvalid')
+        : T('cookieMissing');
+      $('detail-cookie-import').hidden = oauthOnly;
+      $('detail-oauth-row').hidden = false;
     }
   }
 
@@ -5276,6 +5353,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   $('detail-back').addEventListener('click', closeAccountDetail);
   $('detail-import').addEventListener('click', importCookie);
   $('detail-paste-save').addEventListener('click', pasteCookie);
+  // cookie 失效横幅里的 OAuth 替代路径：直接复用 OAuth 弹层（startOAuth 会
+  // 自动打开 overlay；done 后 tick 刷新账号列表——新账号或更新 refresh 都可见）。
+  $('detail-oauth').addEventListener('click', startOAuth);
   $('confirm-ok').addEventListener('click', function () {
     if (!confirmState || $('confirm-ok').dataset.busy === '1') return; // in-flight 锁
     lockConfirm();
