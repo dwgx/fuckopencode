@@ -1,13 +1,14 @@
 # 当前状态
 
-更新时间：2026-08-10 05:12（第四轮会话，自我审计进行中）
+更新时间：2026-08-11（第九轮部署，**已上线**，710 tests 全绿）
 
 ## 一句话
 
 OpenAI ↔ Anthropic 协议转换网关（面向 DeepSeek），线上跑在 nbus，前面有一层护盾。
-本轮把 **key 池的可观测面**做出来了：面板现在直接显示「几个号在扛并发分流」、
-每个 key 的状态与原因、冷却倒计时，以及跨重启的累计用量（SQLite）。
-**已部署上线并验证**，线上正在用它观测一次真实的额度耗尽。
+**多账号管理面板已部署上线**（deploy.sh 一条龙）：env 账号（2 key 代理）+ OAuth
+账号 dwgx1337@outlook.com 并存（workspaceId 自动获取、refresh_token 加密落库）。
+启动日志确认 secret auto-generated + accounts env-seeded + 探针新节奏。**本地测试
+服务已全部关闭。**
 
 ## 基线（已验证）
 
@@ -335,14 +336,15 @@ node -e "const{DASHBOARD_HTML}=require('./dist/dashboard.js');new Function(DASHB
 
 ## 下一步
 
-线上已是最新，无阻塞待办。观察项：
+线上已是最新（探活 `bc463bb` 已上线），无阻塞待办。观察项：
 
-- 两个 key 分别在 08:01:51 / 09:22:36 自动恢复，届时面板显示 `2/2`，
-  「最近状态变更」会各多一条 recovered
-- **保留期清理现在真的会跑了**（进程存活 10 分钟后进入窗口）。
-  `data/usage.db` 之前 114KB，留意它是否稳定
-- WAL 一直在 4.1MB 左右属正常（autocheckpoint 阈值 1000 页 × 4096 = 4MB），
-  已设 `journal_size_limit=16MB` 兜住异常膨胀
+- 探活每 30 分钟挑空闲 key 打最小请求，`endpoint='probe'` 与真实流量区分；
+  面板「最近使用」变新说明刚验证过
+- 保留期清理（进程存活 10 分钟后进入窗口）正常推进
+- 文档侧：本轮把 ARCHITECTURE/README/ISSUES/PLAN/CURRENT 与代码现状对齐了，
+  遗留的「metrics 实现与直觉不符」四个观察点（见第六轮节）等用户决定要不要改
+- 测试侧：metrics.ts 盲区已补（36 条）；PLAN.md P3 里还剩 config/errors/
+  upstream/断流/sanitizeInputSchema 五个小盲区，随时可补
 
 ## 冷却策略上面板（2026-08-10 07:45，用户要求，已做完）
 
@@ -389,6 +391,213 @@ base cooldown 5m00s · fail threshold 5 · routing: least in-flight first
 - 指纹末 4 位碰撞（审计 #8）—— 线上 2 个 key 碰撞概率极低，真要修得在
   snapshot 和 byKey 里带上池内索引作为真键，改动面比收益大
 
+## 第五轮后半：盾中文文案 + 面板两个修复（2026-08-10 上午）
+
+上轮之后又上线了 3 个功能 commit（探活、盾文案、面板修复），补记：
+
+| commit | 内容 |
+|---|---|
+| `d13b573` | feat: 盾回给下游的错误文案改成中文，说清是谁的问题、该怎么办（scripts/dwgx/kiro_shield.py，test-shield.py 同步加断言：文案中文、不含内部术语、带重试次数与耗时、无 markdown） |
+| `0f1276c` | fix: 面板不再凭空多出一个 key（未归属请求单独显示「N 条未到达上游」，不再混进 byKey 当幽灵 key）；耗时不再显示成 `2.1kms`（新增 `ms()` 专门格式化耗时，秒用秒表示，`59999ms` 正确进位成 `60.0s`） |
+| `bc463bb` | feat: key 主动探活，30 分钟一轮 |
+
+**探活的设计要点**（bc463bb，值得记）：
+
+- 动机：面板的「可用」只代表**不在冷却期**，不代表验证过能用 —— 实测见过两个
+  key 都显示可用但 40 分钟没人用过，面板是绿的它们到底能不能用没人知道
+- 每 30 分钟挑「健康 + 空闲超 30 分钟 + 本进程从未用过」的 key（`pool.staleKeys`），
+  发 `deepseek-v4-flash` + `max_tokens=1` 的最小请求
+- **刻意不走 `postUpstreamChat`**：它内部 `pool.acquire()` 按 least-loaded 自己
+  挑 key，探活必须打到指定 key；但成功/失败复用 `markSuccess`/`markFailure` +
+  `classifyUpstreamFailure`，探活结论与真实流量完全一致
+- 两条克制原则（额度珍贵）：只探健康的（禁用中的让它自然恢复）、只探空闲的
+  （有真实流量经过就不需要额外证明）
+- 顺手修了一个 keypool 缺陷：`markSuccess` 之前不更新 `lastUsedAt`（只有
+  acquire 更新），探活不经 acquire，成功不刷的话该 key 每轮都被判定空闲、
+  重复探、白烧额度
+- 探活记录落库 `endpoint='probe'`，与真实流量区分；三条 env：
+  `KEY_PROBE_INTERVAL_MS` / `KEY_PROBE_IDLE_MS` / `KEY_PROBE_TIMEOUT_MS`，0 关闭；
+  timer unref 不拖进程退出，`running` 标志防重入
+
+## 第六轮（2026-08-11）：六路并行理解项目 → 文档同步 + metrics 测试盲区
+
+按用户要求派 6 路独立 agent（协议层 / key 池用量层 / 网关骨架 / 测试面 /
+部署运维 / 文档一致性）并行理解项目，关键结论亲自核实后落到文档。**代码零改动**。
+
+### 最大发现：文档整体漂移 —— chat 路径已不再做协议转换
+
+2026-08-09 改造后（`6f4d910`），chat 路径**直发 OpenAI 协议**（server.ts:549-551
+注释明说「不再绕 Anthropic」），只有直通路径做完整双向转换。但 ARCHITECTURE.md
+仍画着旧的 `openAIToAnthropicRequest → postAnthropic` 流程图 —— 这是全仓库
+最误导人的一处。后果：`request.ts`/`response.ts`/`normalize.ts` 等转换模块在
+server 主路径已无引用（只从 stream.ts 用 `sseStringify`、从 sse.ts 用
+`parseOpenAISSE`），是历史转换链，经 `index.ts` 库导出面 + 测试活着。
+
+### 修掉的漂移（全部先核实代码再改）
+
+| 文件 | 修了什么 |
+|---|---|
+| `ARCHITECTURE.md` | 两条路径图重写（chat 直发 / 直通双向转换）；「enabled 走字节透传」的错误说法改掉（实为无条件 `openAIStreamToAnthropic`，server.ts:864-882）；模块职责表标注历史模块；补 keyprobe/usagedb |
+| `README.md` | 三个默认值纠错：`ANTHROPIC_BASE_URL` 实际 `https://opencode.ai/zen/go`（写了 api.anthropic.com）、`MAX_BODY_BYTES` 实际 64MB（写了 10485760）、`MAX_MESSAGE_CHARS` 实际 8000000（写了 200000）；架构图重写（删了不存在的 `anthropic.ts`，补 9 个缺失模块，历史链单独标注）；JSON mode 特性改为「response_format 原样透传」（核实过 8 字段剥离清单里没有它）；端点表 chat 行改「归一化后直发上游」 |
+| `ISSUES.md` | 「292 passed」→ 去掉数字按 CONVENTIONS 约定只留核对日期；I-1/I-3 补充现架构说明（request.ts 不在主路径、chat 路径不再需要剥 Anthropic 专属字段）；I-2/I-4/I-5/I-6/I-7 行号全部修正到当前实现；「count_tokens 会做模型名映射」改为「纯本地估算不打上游」 |
+| `PLAN.md` | P1 验收标准重写（原标准基于旧架构，已作废；新标准聚焦直通路径内部的 DSML 两处接线）；P3 测试缺口列表更新（metrics 已补，补上 parseOpenAISSE 跨包半行、sanitizeInputSchema 两项） |
+| `CURRENT.md` | 本文件：补 5 个 commit 记录、更新下一步 |
+
+### metrics.ts 测试盲区已补（36 条，src 零改动）
+
+metrics.ts 是面板所有数字的来源（p95/UA 解析/IP 优先级/分组聚合），此前只有
+e2e 断言 totalRequests 增量。新 `test/metrics.test.ts` 36 条全绿，
+全量 405/405 + typecheck 干净。
+
+**顺手发现 4 个「实现与直觉不符」的观察点（测试按当前行为如实断言，未改 src，
+要不要修由用户定）：**
+
+1. `metrics.ts:81-84`：真实 iPhone Safari UA 含 `like Mac OS X`，`/Mac OS X/`
+   分支在前，iPhone 被判定为 macOS（mobile 仍 true）—— 苹果移动端 UA 恒偏 macOS
+2. `metrics.ts:187`：p95 是 nearest-rank（`floor(n*0.95)` 下标），20 个样本时
+   p95 = 最大值，不做插值
+3. `metrics.ts:180-181`：`RequestEvent.error` 不进 summary —— status 200 带
+   error 的请求仍算 ok，面板看不到超时/中断这类非状态码失败
+4. `metrics.ts:180`：3xx（含 304）算 ok；`<200`（如 101）两边都不算
+
+### 交付前核实过的事实
+
+- chat 路径直发 OpenAI：server.ts:549-551 注释 + `prepareOpenAIUpstreamRequest`
+  （:716-740，只做模型映射 + 护栏 + 剥 8 个扩展字段）
+- server.ts 对历史转换模块的导入只有 `sseStringify`（stream.ts）和
+  `parseOpenAISSE`（sse.ts）—— `rg "from './"` 逐条看过
+- 直通流式无条件 `openAIStreamToAnthropic`（:864-882），无字节透传分支
+- count_tokens 纯本地估算（:944-947 注释 + `estimateInputTokens` 实现）
+- 默认值：config.ts:153/162/163
+
+## 第七轮（2026-08-11）：多账号管理面板 P0+P1（本地验证，未上线）
+
+用户需求：升级后台为「一个面板管理多个 OpenCode ZEN 账号 + 显示实时额度」，
+UI 参考 opencode 官网设计，面板内部化（对外只展示流量）。语言决策：TS 增量
+（用户「TS 能实现就 TS」，调研证实全部功能 TS 可实现）。
+
+### 前置调研（4 路 agent + 2 轮深挖，全部证据入库）
+
+- **ZEN 服务**：账号只有 GitHub/Google OAuth 浏览器登录；key 只能网页控制台
+  生成（sk-+64 位）；**无公开余额/用量 API**（issue #10448 挂着未合）
+- **实时额度三源合流**：主动探针（POST chat/completions max_tokens=1 按
+  error.type 分流，实测验证）+ 被动 429 事件 + **Cookie 抓 billing 页**
+  （社区 848★ 先例 slkiser/opencode-quota 验证可行：GET
+  opencode.ai/workspace/{id}/billing + Cookie auth= 解析余额，
+  100,000,000 units=$1）
+- **关键实测纠正**：/zen/go/v1/models 对无效 key 也 200（不能判订阅有无）；
+  余额类错误混在 401（必须解析 body）；free 模型匿名 IP 限流不能当探针
+- **Rust vs Go**：调研实测后放弃重写（TS 全部可实现，Go/Rust 无功能收益）
+
+### 实现（契约文档 .claude/docs/MULTI-ACCOUNT.md，分两波 6 路并行）
+
+| 模块 | 内容 |
+|---|---|
+| `src/secrets.ts`（新） | secret.key 0600 自动生成 + GATEWAY_SECRET 覆盖，AES-256-GCM 封装 |
+| `src/usagedb.ts` | accounts 表 DDL + CRUD（写失败 false 降级哲学延续） |
+| `src/accounts.ts`（新） | AccountsStore：加密落库/种子策略/keysForPool/buildAccountsSection |
+| `src/billing.ts`（新） | billing 页抓取+两步解析+15min→2h 退避调度（timer unref） |
+| `src/admin.ts`（新） | ADMIN_HTML（opencode 设计令牌）+ 8 个管理端点 handler |
+| `src/keypool.ts` | PooledKey.accountId + addKey/removeKey 热加载（构造兼容） |
+| `src/errors.ts` | classifyAccountError 全表 + quotaSignals 补 3 个 error.type |
+| `src/keyprobe.ts` | 账户驱动探针（retry_until 闸门 + kind 分流 payg -free） |
+| `src/server.ts` | isAdminRequest + /__admin 路由 + /__metrics accounts 段 |
+| `src/main.ts` | 接线：secret→store→pool→probe→billing，启动日志两行 |
+
+测试 405 → **579**（secrets 12/accounts 17/billing 41/admin 25/e2e +16 等）。
+
+### 实机验证（本地假上游，逐项核对）
+
+- 启动日志：`secret: data/secret.key (auto-generated)` + `accounts: 1 (env-seeded)`
+- 鉴权矩阵：直连 200 / cf 头 401 / cf+key 200 / Origin 跨站 403
+- 创建账号 201 + key 热加载（池 3→5）/ billing 刷新（无 ws 400、fake cookie 502）
+- 探针账户驱动：`[keyprobe] account=env probe ok 200` + 状态写账 + retryInMs 倒计时
+- /__metrics accounts 段仅管理鉴权出现；面板渲染（2 账号卡、设计令牌、无 JS 错误）
+
+### 对抗审查（@reviewer）发现 3 major + 8 minor，**全部修复**（579 绿）
+
+- **M1 DNS rebinding**（默认配置管理面裸奔，已复现）：isDirectLocalRequest 加
+  Host 白名单校验 {127.0.0.1/localhost/::1}，evil Host → 401（实测）
+- **M2 AuthError 双表结论相反**（401 AuthError 被归 rate-limit 3s 短冷却）：
+  classifyUpstreamFailure auth 分支补 AuthError + 一致性测试
+- **M3 billing spike 未做**：解析正则没见过真实页面 —— **待真实 cookie 才能完成**
+- m4 %zz 指纹 500→400 / m5 reset 无上限 clamp 30 天 / m6 跨账户重复 key 400 /
+  m8 公网 accountId 剥离 / m9 billing 端点读 body / m10 BILLING_INTERVAL_MS 支持 0 /
+  m11 updateAccount 存在性校验 / m12 上游原文 stripSecrets 脱敏
+
+### 遗留（上线前必须处理）
+
+1. **billing spike（M3）**：需要真实 cookie 抓一次
+   opencode.ai/workspace/{id}/billing 固化为 fixture（用户操作：浏览器 devtools
+   复制 auth cookie 给我，或用户自己按 §5.4 步骤做），否则余额显示不可信
+2. 未上线、未提交；`scripts/dwgx/kiro_shield.py` 有非本次会话的改动（注入拦截
+   400 归 client 超短窗，合理，保留未动）
+3. 探针 tick 时 keyprobe 日志中文混排（`probe ok 200` 带括号），风格统一待办
+
+## 第八轮（2026-08-11 晚）：UI 重构 + OAuth device flow 登录（本地验证，未上线）
+
+用户要求（deep 模式审阅后确认）：UI 不理想 → 顶部 tab 标签切换、左侧菜单
+（opencode 风格）、下拉菜单按 opencode 设计、**OAuth 登录**（「先启动让我登录，
+你获取成功了之后」）。
+
+### UI 重构（src/admin.ts，两路并行：UI 重构 + OAuth 后端）
+- 顶部 tab：总览/账号/用量/设置（sticky + accent 下划线）；左侧 sidebar 240px
+  （active 加粗 + 2px 竖条，≤48rem 收横滚子导航）；dropdown（160px/border/
+  radius-sm/shadow/data-selected）；用量 tab（summary + key 池 + 最近事件）
+- OAuth 弹层：验证 URL + 设备码 + 倒计时 + 轮询状态 + 错误重试
+
+### OAuth device flow（src/oauth.ts，官方 CLI 同款协议）
+- 端到端实测成功：start（device/code）→ 浏览器授权 → poll（token）→
+  并发拉 orgs+user → 自动建账号（email 命名、Org.id=workspaceId）→
+  refresh_token AES 加密落库
+- **关键协议事实（读 opencode 源码确认，之前 parseOrgs 假设是错的）**：
+  /api/orgs 返回裸数组 [{id,name}]（Org.id 就是 workspace id），email 在
+  /api/user；verification_uri_complete 是相对路径（官方自己拼 server base）
+- 实测日志：`[oauth] account=dwgx1337@outlook.com ws=org_01KZPQ6GSTS0H24ARVQCD8ZNBM created (id=2)`
+
+### 对抗审查（reviewer 二轮）修复
+- M1 验证 URL 劫持钓鱼 → 域名白名单（opencode.ai/opencode.dev，fail-closed）
+- M2 2s 轮询清空编辑表单 → render 指纹比对（排除每秒变的倒计时字段）
+- M3 HTTPS 反代 Origin 403 → hostname+端口归一比较
+- m1 orgs 瞬时失败丢 token → refresh_token 暂存会话 + refresh grant 重试
+- m2 start 无限流 → 会话上限 10；m3 相对路径补 5 组测试；m6 双转义
+- 留待：slow_down 放慢轮询、上游响应体 1MB 上限（低概率）
+
+### 遗留
+1. **billing spike（M3）仍待真实 cookie**：现在 workspaceId 已自动拿到
+   （org_01KZPQ6GSTS0H24ARVQCD8ZNBM），用户从浏览器 devtools 复制 auth cookie
+   到面板即可启用真实余额显示
+2. 未上线未提交；探针 tick 时日志中文混排风格待统一
+3. 面板 OAuth 弹层的「授权完成后自动刷新」在手动 poll 场景已验证（done→账号创建），
+   前端自动轮询路径由单测覆盖
+
+## 第九轮（2026-08-11）：控制台全功能搬入设计（契约文档，未实现）
+
+任务：「把 OpenCode Console 全功能搬进 /__admin 面板」的架构与接口契约设计。
+产出：`.claude/docs/CONSOLE-PORT.md`（给实现 agent 的契约），代码零改动。
+
+关键调研结论（并行 agent 直读控制台源码 `anomalyco/opencode` dev 分支）：
+
+- 控制台数据层全是 SolidStart server functions（cookie 鉴权），**没有
+  keys/billing/members 的 REST API**；只有 /api/user、/api/orgs、/api/config
+  走 Bearer（device flow token）
+- **/api/config（Bearer + x-org-id）能列模型**：`config.provider.*.models`
+  带 cost/limit/status 完整字段，无订阅/余额信息 —— 「账号可用模型」新数据可行
+- server function 协议：`POST /_server` + `X-Server-Id`（形如 `path#fn`，
+  构建期生成，需浏览器抓包）+ `X-Server-Instance` + `x-start-type`；
+  未登录 302；响应 seroval 流
+- billing.get 一次拿全：余额/月限额/自动充值/订阅/支付方式 —— **比现有 SSR
+  页面解析更全更稳**，billing.ts 降级为兜底通道（M3 spike 优先级跟着降）
+
+设计要点：通道矩阵（③ fn 主 / ① Bearer 模型目录 / ② SSR 兜底）、新表
+balance_history + admin_audit（进 prune）、ConsoleClient（读缓存 TTL + 健康态
++ 写冷却）、console-op 写端点统一 confirm/审计/冷却、**否决 iframe**（登录态
+无解，只搬交互语义自绘）、P1 只读 → P2 受控写 → P3 增强。
+
+**上线前 spike（必须用户配合）**：浏览器 devtools 抓 X-Server-Id 清单 +
+五个页面真实响应 fixture（usage/keys 响应含 keyId/明文 key，fixture 手动掩码），
+验证 seroval 能否直接 JSON.parse，抽查 id 跨构建稳定性。
+
 ## 环境须知
 
 - `tsc` / `vitest` 不在 PATH，用 `npx` 或 npm script
@@ -414,3 +623,391 @@ base cooldown 5m00s · fail threshold 5 · routing: least in-flight first
 - 不要只改一条路径的 deepseek 适配（chat 路径与直通路径是两套实现）
 - 不要引入运行时依赖（网关零依赖、盾只用 python stdlib，都是刻意的）
 - commit 不带任何 Claude / Anthropic 署名，文档不用 emoji（见 CLAUDE.md 铁律）
+
+## 第十轮（2026-08-11）：console 数据端点（/__admin/api/console，本地验证）
+
+任务：为网关实现 console 数据端点（读 6 + 写 4 + import-cookie），路由在 server.ts，
+ConsoleClient（src/console.ts，REST 新通道）与 cookie.ts 由并行 agent 实现。
+测试 628 → **697 全绿**，typecheck/build 干净。**未提交、未接线 main.ts、未上线**。
+
+- 端点：GET billing（五路合并 + cookieState）/ usage?range=Nd / members / keys /
+  providers / budgets；POST auto-recharge（confirm:true 强制）/ monthly-limit / keys；
+  DELETE keys/:saId；POST import-cookie（端口 9223 写死，cookie 值不进响应/日志）
+- 注入：createApp 第 6/7 参数 consoleClient?: ConsoleClientLike + importCookie?:
+  CookieImportLike（duck typing，不 import console.ts/cookie.ts，结构类型已验证兼容）
+- 契约对齐：并行 agent 实现的 ConsoleClient 与任务契约**有出入**——读方法返回
+  Promise<unknown|null> 而非 {ok:false,reason}，健康态是 cookieStatus() 而非
+  channelHealth()；已按实际文件对齐（server.ts 的接口 + e2e fake 都以 console.ts
+  实际导出为准）。失败分类：读 null → cookieStatus invalid ? channel_error : upstream_error
+- fixture 对齐（/tmp/fixtures/console-apis.json）：金额是 microCents 字符串（1e8=$1，
+  server 端 microCentsToDollars 换算）；billingStatus 才有余额，billingAccount 只有
+  creditLimitMicroCents（不进响应）；usage 无按日数据（byDay 恒 null）；
+  budgets 无 user 通道（user 恒 null）；autoRecharge 是美元对象直接透传
+- 审计：写操作 console.log `[admin] op=<op> account=<id> by=local`（不建表不记值）
+- REST 与旧方案并存：billing.ts SSR 抓取调度原样不动（继续写 balance 列），
+  console 端点独立走 REST；REST 失败面板仍见旧通道余额，反之亦然
+- 遗留：main.ts 未接线（createApp 没传 consoleClient/importCookie → console 端点
+  502 channel_error，已验证不阻塞代理链路）；admin.ts 面板 UI 由并行 agent 接
+
+## 第九轮后半：部署上线（2026-08-11 06:43，deploy.sh 一条龙）
+
+用户指示「让他跑在远端本地关掉 你自己处理好 反正账号和 key 并存」。
+
+### 部署执行
+- `./scripts/deploy.sh`：typecheck + 710 测试 + build → tar/scp → 远端原子替换
+  （dist → dist.prev）→ systemctl restart → 健康检查（8788 + 经盾 8787 双通）
+- 启动日志验证：`secret: data/secret.key (auto-generated)`（0600）、
+  `accounts: 1 (env-seeded)`、探针新节奏（15m 轮转 / 60m 空闲）、db 迁移
+  （accounts + admin_audit 表建好）
+- 代理链路：真实 /v1/messages 请求 200（2 key 池 healthy）
+- **账号重建**（key 不出机器，全部在远端 curl + 本地浏览器授权）：
+  `[oauth] account=dwgx1337@outlook.com ws=org_01KZPQ6GSTS0H24ARVQCD8ZNBM created (id=2)`
+  refresh_token 加密落库 → **账号（console 数据通道）+ key（代理池）并存**
+- 本地测试服务/假上游/测试 db 全部关闭清理
+
+### 上线后遗留（汇报给用户）
+1. **面板浏览器访问**：线上 DASHBOARD_OPEN=0 → 面板必须 API key，浏览器地址栏
+   带不了 header（401 提示 ssh 隧道——但隧道也不免 key，文案与行为不符）。
+   建议后续加「面板登录表单」（key 输入存 localStorage）或接受 curl/脚本方式
+2. **console cookie**：远端无本机 Chrome，CDP 导入不可用；需用户浏览器 devtools
+   复制 `__Host-console_session` 粘贴到账号（或后续做本地抓取→API 传输辅助）
+3. **写操作 POST 路径未验证**（自动充值等返回 upstream_error）：待用户在控制台
+   页面真实操作时抓包核对
+
+## 第十轮：面板账号密码登录（2026-08-11，713 tests 全绿，已部署）
+
+用户要求：面板登录要账号密码，默认 admin / thankyouopencode（env 可覆盖）。
+
+### 实现
+- `ADMIN_USER`/`ADMIN_PASS` env（默认 admin/thankyouopencode）、
+  `ADMIN_SESSION_TTL_MS`（24h）、`ADMIN_LOGIN_FAIL_LIMIT`/`LOCK_MS`（5 次锁 5 分钟）
+- POST /__admin/api/login：timingSafeEqual 校验 → HttpOnly SameSite=Lax cookie
+  （fc_admin_session，内存 token 32 字节随机，进程重启失效）+ 失败限速（IP 维度）
+- POST /__admin/api/logout：清会话
+- 页面请求（/__admin、/__dash）无凭证 → **登录页**（opencode 风格深色卡片，
+  LOGIN_HTML，含锁定倒计时提示）；API 请求保持 401 JSON
+- 鉴权链：面板会话 cookie → 本机直连免 key（dashboardOpen）→ API key —— 三者并存
+- 面板 header 加「退出」按钮
+
+### 修复过程（一个真实 bug）
+登录限速首版不生效：loginLockRemaining 对未锁定记录（lockedUntil=0）也执行
+delete —— 每次请求开头的检查把上次失败计数清掉，限速永不触发。调试定位后
+改为「只有已过期的锁定记录才清理」，限速测试补齐。
+
+### 验证
+- 本地 curl：登录页 200 / 错密码 401 / 登录 200 + Set-Cookie HttpOnly Max-Age 86400
+- e2e 新增 3 条（完整登录流程 / 限速 / API key 兼容），713 全绿
+- 部署远端：公网 /__admin 登录页 + cookie 数据访问 200
+
+### 遗留
+- **线上还在用默认密码 thankyouopencode——必须改**（写 ADMIN_PASS 进
+  fuckopencode.env 后 restart）
+
+## 第十一轮：线上 OOM 崩溃循环 + 面板失灵（2026-08-11 08:09 修复）
+
+### 症状
+用户报告「面板点击任何功能都没反应，删除账号没反应」。
+
+### 排查链（每步证据）
+1. 面板点击无效 + API 请求 ERR_CONNECTION_RESET × 7 → 服务在崩溃重启循环
+2. `restart counter 22`、`Main process exited code=killed status=6/ABRT`、`FATAL ERROR: Reached heap limit`——**V8 JavaScript heap OOM**
+3. 崩溃 198 次，从 05:56 开始；老进程 4 小时后崩，新进程几秒到 1 分钟崩
+4. 停盾稳定 / 起盾稳定 / curl 轮询稳定 / 本地 Node 22+24+真实 db+254MB 堆+并发大请求全部复现不了
+5. **关键数据**：用户活跃时内存峰值 **392-430M**——**MemoryMax=400M 撞限必崩**（Node 22 按 cgroup 自适应 V8 堆上限仅 ~254MB，大请求（620KB body × 并发）+ 面板轮询 + 400 重试循环的峰值超过）
+6. **修复**：MemoryMax 400M → **640M**（机器可用 1.2G，余量安全；V8 堆上限自适应升到 ~400M）
+7. 修复后：用户持续活跃 5+ 分钟，内存 400-430M 稳态波动（非无限泄漏），零崩溃，请求全 200
+
+### 根因
+不是代码泄漏，是**部署环境内存上限与真实流量峰值不匹配**：大 body（Claude Code 620KB+ 请求）并发处理的内存峰值 ~400M，400M cgroup 下 V8 堆上限 254M 必然 OOM。系统设计时 MemoryMax=400M 是防挤 xray 的，但没算到多账号版的面板轮询 + 大请求组合。
+
+### 遗留
+- 面板 2 秒轮询在 Node 22 上每请求 ~50KB 缓慢增长（本地观察 +3MB/60s，GC 可回收）——640M 余量下无碍，后续可优化（如 tick 节流/指纹已有）
+- 用户设 MAX_MESSAGE_CHARS=0/MAX_BODY_BYTES=0（不限）是 kirostudio 大请求的刻意配置，保持
+
+## 第十二轮：面板可读性 + key 昵称 + 登录标准表单（本地验证，未提交）
+
+用户反馈：面板「看不懂」（状态全是 UNKNOWN、健康度没解释）、key 只有指纹想加昵称、
+登录后浏览器不保存密码。737 tests 全绿，typecheck 干净。**未提交、未上线。**
+
+- 状态徽标：8 个枚举 → en/zh 友好文案（stUnknown/stOk/stInvalid/stInsufficient/stLimit/
+  stCooldown/stRegion/stError），徽标语义色不变；unknown 补「等待首次探测」副标题
+- 健康度：总览改「X/Y 账号健康」（Y = 有 key 的账号数），下方小字「健康 = 最近探针正常」，
+  未探测的有 key 账号计入「等待首次探测」计数；「最近探针 从未」→「等待首次探测」
+- 账号名 max-width 截断 + title 悬浮全文（卡片与详情面包屑）
+- key 昵称：PATCH /__admin/api/accounts/:id/keys/:fp（{nickname: string|null}，≤30），
+  指纹 → 明文走 store.keysOf + keyFingerprint（进程内，明文不进响应）；面板 key 行
+  昵称优先 + 指纹小字，hover 出「改名」（confirm 弹层内联输入框）；i18n 词条齐
+- 登录改标准表单：form action/method + input name（浏览器保存密码的前提），删 fetch；
+  服务端按 accept 头双模式——application/json → 200/401/429 JSON（脚本兼容），
+  其余 302：成功 /__admin（Set-Cookie）、错密码 /__admin?login_error=1、
+  限速 /__admin?login_locked=<秒数>；请求体兼容 urlencoded 与 JSON
+- 踩坑：块注释里的 `*/`（如 "*/*"）会提前闭合注释——server.ts 和 e2e 各踩一次，
+  用 tsc 7 的错误定位 + od 查字节发现的，教训是注释里别写字面量 */*
+
+并行 agent 的 accounts.ts（setKeyNickname / keyNicknameMap / AccountKeyView.nickname）
+已落树，契约无出入。遗留：未提交未上线，密码管理器实测待浏览器验证。
+
+## 第十二轮后半：签名会话 + OOM 复发处理 + 用户决策（2026-08-11）
+
+### 签名会话（用户「每次都要输入密码」）
+- 登录会话从内存 token 改为**无状态签名 cookie**（HMAC-SHA256，密钥与账户加密同源：
+  GATEWAY_SECRET 或 data/secret.key 派生）——服务重启会话不失效，登录一次 24h 免输密码
+- 登出用内存黑名单（重启清空，可接受）；e2e token 格式断言同步更新（sig.expiry）
+
+### OOM 复发（启动后 9 秒 394MB 堆满崩溃）
+- MemoryMax 640M 下 Node 22 自适应 V8 堆上限 ~400M，峰值撞穿
+- **修复**：systemd ExecStart 加 `--max-old-space-size=520`（640M cgroup 内，余量 30%）
+- 观察：无流量时 21.5M 稳定；真实流量下的峰值稳定性待用户活跃时确认
+- 另发现：线上 API_KEYS 带引号（env 配置），curl 提取需去引号；真实客户端不受影响
+
+### OAuth/Bearer 通道结论（用户决策：放弃，以后再说）
+- 实测 4 轮：opencode refresh_token 生命周期极短且每次使用即轮换，Bearer 自动通道线上不可靠
+- 探针（OAuth 会话验证）稳定工作；cookie 通道（365 天）最稳
+- **用户决策：控制台数据全自动方案放弃，以后由我帮用户上号配置**
+
+### 流通验证（最终）
+- 公网代理全链路 200（cloudflared→盾→网关→DeepSeek，thinking+text 正常）
+- 服务 3 个 active；签名登录 302 + cookie 正常
+
+## 第十三轮：favicon 噪音 + 面板排查（2026-08-11）
+
+### 修复
+- 浏览器自动请求的静态资源（favicon.ico/apple-touch-icon*.png/robots.txt 等 11 个路径）
+  直接 404 不鉴权不记录 —— 之前 401 刷屏 /__metrics events（115 条噪音占满面板最近请求）
+- 验证：favicon 404 直返、events 零污染
+
+### 面板现状（用户问「两个后台」）
+- /__dash（监控）：DASHBOARD_PUBLIC=1 公网公开（流量统计——「对外只展示流量」设计）✓
+- /__admin（管理）：登录页 + 签名会话（登录一次 24h 免输密码）✓
+- 两个面板数据源 events 已干净
+
+### 遗留
+- OAuth/Bearer 通道挂起（用户决策）；cookie 通道最稳（以后帮用户上号）
+- OOM：--max-old-space-size=520 缓解，真实流量峰值稳定性待观察
+
+## 第十四轮：大规模实现 + 关键修复（2026-08-11 深夜）
+
+### 完成（765 测试全绿 + 部署）
+1. **前台 dashboard 简洁化**：浅蓝长方形=Chrome 合成器残影（sparkline 全 0 平线触发）——三层防御（全等不画线/viewBox 只在宽度变化时写/contain:paint）；key 昵称显示（/__metrics pool.keys 带 nickname）；状态变更精简为 6 条
+2. **后台 admin**：语言下拉修复（.dd inline-block + left 对齐 + 字距）；用量 tab 容器化（卡片网格+key 池 panel+请求明细两行式）；账号不可用隐藏空容器（未连接单行提示）
+3. **自定义模型映射**：model_aliases 表 + modelmap.ts + API（GET/POST/DELETE）+ 设置页 UI（参考 new-api）+ 运行时生效（cfg.modelMap 原地改）
+4. **tool_choice 400 修复**（190 条）：DeepSeek payg 不支持 tool_choice——转换时剥除（默认 auto 语义一致）
+5. **OAuth Bearer 通道打通**（用户核心需求）：
+   - 实测发现：refresh_token 轮换写回后链可持续（5 跳）、access_token 30 天寿命
+   - in-flight 单飞消除并发 refresh 踩踏（之前 400 死链根因）
+   - 验证：余额真实返回（balance 0）、并发 3 连测全 ok
+6. **盾网络退避**：5s 起 30s 上限（原 1s/12s 导致崩溃死亡螺旋 119 次循环）
+7. **堆上限 520→550M**
+8. **计费研究**（A5）：Go 订阅三窗口（5h 滚动/周固定/月锚定）+ 倍率烧额度；combinedAvailableMicroCents 为展示总额；usage summary 是 token 成本非订阅额度
+
+### 遗留问题（待处理）
+- **公网 502：FurCDN 层故障**——fuckopencode.dwgx.top 的 DNS CNAME 指向 furcdn.top（cdn.taipei），healthz 200 但所有业务路径 502（API/面板全挂）。VPS 本地无 FurCDN 配置（纯云端）。**网关/盾/cloudflared 全部正常**（本机带 Host+XFF 全 200）。怀疑 FurCDN 配额/配置问题——**需用户确认 FurCDN 控制台，或把 DNS 切回 Cloudflare 隧道**（cloudflared 还在跑，配置正确）
+- OAuth 探针 token 死（60min 重试节奏 OK）；prv2 key 失效（面板可删）
+
+## 第十四轮后半：FurCDN 公网恢复（2026-08-11 深夜）
+
+### 根因
+fuckopencode.dwgx.top 的 DNS 指向 FurCDN（cdn.taipei），FurCDN 源站直连 VPS 的盾（8787）——但盾只监听 127.0.0.1（云端连不上）→ 业务路径全 502（healthz 例外是 FurCDN 健康检查白名单）。
+
+### 修复
+- 盾 SHIELD_HOST 127.0.0.1 → **0.0.0.0**（公网可达，FurCDN 源站直连）
+- 验证：公网 __dash/__admin/healthz 全 200；公网代理 POST /v1/messages 200（9.7s）
+
+### 安全注意（待用户决定）
+- 公网 8787 现在**直接暴露**（原来 cloudflared 在盾前面）——任何人都能打盾
+- 盾有拦截机制（错误吞掉重试 + 预算），但建议：防火墙限 FurCDN IP（103.38.82.0/24）+ 本机，或加其他保护
+
+## 第十五轮：旧版控制台（opencode.ai）key 通道后端（2026-08-11 晚，本地验证，未提交）
+
+任务：旧版 workspace（wrk_ 前缀）API key 的读取与管控后端。**协议全部浏览器实测**
+（CDP 9223 真实抓包 + 真实创建/删除 + 重新 GET 复核 key 消失），零猜测：
+
+- **读**：GET /workspace/{id}/keys + cookie → HTML，key 列表在 SSR 水合
+  `$R[n]={id:"key_...",name:"...",key:"<完整明文>",timeUsed:...,userID:"...",
+  email:"...",keyDisplay:"sk-XXXX...XXXX"}`（4 个 key 全量水合；key 明文只在
+  解析层用于掩码兜底，**绝不出模块**）
+- **创建**：POST /_server + X-Server-Id `44482507...` + urlencoded
+  `name=<名>&workspaceID=<ws>`（= 弹窗 form action id）
+- **删除**：POST /_server + X-Server-Id `48baebd3...` + `id=<keyId>&workspaceID=<ws>`
+  —— **任务给的删除 hash（c22cd964）是旧构建**，实测当前构建从 SSR 删除表单
+  action 解析（跨构建稳定），解析不到才兜底常量
+
+改动：src/legacy.ts（新）、usagedb.ts（accounts 加 legacy_workspace_id 幂等 ALTER）、
+accounts.ts（legacyWorkspaceIdOf/setLegacyWorkspaceId）、server.ts
+（/__admin/api/legacy 三端点，duck-typed LegacyClientLike 第 8 参注入）、
+test/legacy.test.ts（新 23 条）、test/usagedb.test.ts（+2 迁移）、e2e +10 条。
+**803 tests 全绿 + typecheck/build 干净。**
+
+遗留（未提交、未接线 main.ts —— 端点现返回 502 channel_error，同 console 现状）：
+1. main.ts 接线（baseUrl 建议取 cfg.oauthConsoleUrl）
+2. admin.ts 面板 UI（并行 agent 在接）
+3. 账号需在面板配 legacy workspace id（wrk_ 前缀）+ opencode.ai 的 auth cookie
+   （不是 __Host-console_session —— 端点对 __Host- 前缀给明确报错）
+
+## 第十六轮：OpenCode Go 订阅后端（读取 + 开关，本地验证，未提交）
+
+任务：Go 订阅功能后端（src/legacy.ts + src/server.ts + main.ts 适配 + 测试）。
+**协议全部浏览器实测**（CDP 9223 目标 F444D52714DB74199D8A18EFD5A33CA4 真抓包 +
+开关实点两轮并恢复原状，页面状态已还原）：
+
+- **读**：GET /workspace/{id}/go → HTML，数据在 SSR 水合：
+  - `lite.subscription.get["wrk_..."]`：已订阅 = {mine,useBalance,region:[...],
+    rollingUsage/weeklyUsage/monthlyUsage:{status,resetInSec,usagePercent}}；
+    **未订阅 = 裸 null**（对照 Default workspace 实测确认，且未订阅页无开关区）
+  - 中国模型开关**不在水合**，在 SSR checkbox 的 checked 属性
+- **写**：POST /_server + X-Server-Id + urlencoded（表单增强提交实测）：
+  - useBalance：id `0c8d84b0a700eb0de440ca4c9105b42d6c9ede971d6bf592fa4f91bbeaaa1e6b`，
+    body `workspaceID=<ws>&useBalance=true|false`（提交值 = 开关目标值）
+  - 中国模型：id `57e61af1bc9c8fa15e0c1a880a2a6754484afdd4a3bc4426b3fc02e3a7ff4d69`，
+    body `workspaceID=<ws>&useChinaProviders=true|false`
+- 「管理订阅」= Stripe customer portal 跳转（纯前端，后端不做）
+- 踩坑：SolidStart 序列化布尔是 `!0`=true / `!1`=false，首版解析写反，
+  靠真实抓包 HTML 回归验证抓出（fixture 是仿造的抓不到这层）
+
+改动：legacy.ts（fetchLegacyGoStatus/parseLegacyGoHtml/setLegacyGoToggle +
+两个 X-Server-Id 常量）、server.ts（LegacyClientLike +2 方法、GET
+account/:id/go、POST go/use-balance、go/china-models，走 runLegacyWrite
+统一流程 + 审计 op=legacy.go.*）、main.ts 适配。测试 +26
+（legacy.test.ts 17 / e2e 9）。**829 tests 全绿 + typecheck 干净。**
+未提交、未上线（同 console/legacy 现状：面板 UI 由并行 agent 接）。
+
+## 第十七轮：全面对抗审查 + 修复（2026-08-12 凌晨，858 tests 全绿）
+
+### 四路审查发现（reviewer×3 + 线上 explore）
+**代理链路**（BLOCKER）：B1 120s 硬超时静默截断长流（DeepSeek 长生成>2min 被掐、客户端无错误事件、key 被误标 transient）；B2 客户端断开不中止上游（req.on('close') 时机 bug——死连接占 key 槽位）。MAJOR：M1 上游 key 明文回显泄漏、M2 流中合法 JSON 错误体静默吞、M3 并发下换 key 重试撞同一坏 key。
+**管理面**（BLOCKER）：B1 线上仍用默认密码（已改 lozX0OSUMqFcaI2）；M1 会话密钥兜底可预测（fc-session-端口→伪造会话）、M2 登录限速伪造转发头绕过+Map 无限膨胀、M3 账户 CRUD 无审计。
+**后台设施**（MAJOR）：M1 探针输掉 refresh 轮换竞态误判会话失效 60min、M2 探活记录污染面板累计、M3 console 硬编码 client_id、M4 history 全表聚合仍阻塞、M5 billing SSR 通道互相覆盖余额。
+**线上**：22:12 后零崩溃（550M+盾退避生效）；billing 持续 parse failed（SSR 对 SPA 恒失败）；VPS IP 被 free 模型日窗限流（200 请求/天 UTC 零点）；OOM 根因 worker 大消息未定位（记 ISSUES 待观察）。
+
+### 修复（全部部署验证）
+- 代理链路：两段式超时（头 120s + body idle 90s watchdog）、res.on('close') 中止、错误脱敏 stripSecrets、JSON 脏行检测、acquire(excludeKey)
+- 管理面：随机会话密钥兜底、loginFails 上限 10k、账户 CRUD 全审计、Secure cookie、控制符清洗、/__admin/ 登录页
+- 后台：探针竞态重试、probe 排除出累计、client_id 用 cfg、billing SSR 循环停用（console 已接管）
+- **free 限流**：fable-5 改映射 deepseek-v4-flash（订阅端点，Go 订阅额度）；FreeUsageLimitError 冷却到 UTC 零点
+- **密码**：默认密码已改（ADMIN_PASS=lozX0OSUMqFcaI2 写入 env）
+
+### 验证
+858 tests 全绿；代理直连/公网全 200（订阅模型 8-15s）；面板登录新密码 302；服务稳定。
+
+## 第十八轮：预览 UI + 用量前端化 + 数据采集 + 代码优化（2026-08-12 凌晨，865 tests 全绿）
+
+### 预览 UI（Agent B 实现，已部署）
+- 账号列表卡片容器化：5 容器（头/余额/用量摘要/Go 三窗口迷你条/key 列表）
+- **用量前端化**：列表页直接显示请求数/输出 tokens/成本 + Go 三窗口（滚动/每周/每月 + 百分比）——不点详情即可见
+- previewCache 60s TTL（2s 轮询不重拉）；失败隐藏容器
+
+### 数据采集（Agent A 实测，33 端点全 200）
+- P0 待接入：/api/usage/cost-by-day（byDay 恒 null 缺口）、/api/usage/models（模型维度）、/api/usage/users（成员消费）、/api/budgets/users/status、/api/v2/config（60 模型定价表）
+- 旧版水合：workspace 页有 balance/pay_ 历史/自动充值（legacy 未读）；members/usage 明细可加
+
+### 代码优化（Agent C 审查，H 级已修）
+- H1 删除 legacy key 永远失败（前端传 name 后端要 id）→ 改用 keyId ✓
+- H2 健康态死锁（新 cookie 后 invalid 标记不重置）→ noteCredentialChanged（PATCH/import-cookie 后调用）✓
+- H3 空 workspace 无法建首个 key（解析把空列表当失败）→ 待修（下轮）
+- H4 renderGo null 窗口崩溃 → 渲染「—」+ 未订阅提示 ✓
+- M2 前端 creator → creatorEmail ✓；M6 go-err 元素 ✓
+- 测试修复：fake timers 残留（M2 测试的占位启用 fake timers → B1 测试挂起）→ 删除 ✓；MAX_LOGIN_FAIL_KEYS 10k→1k（8GB 机器并行性能）
+
+### 验证
+865 全绿；API 层验证（列表/用量/Go 三窗口 24%/54%/64%）；浏览器验证受阻（共享 Chrome 被其他会话占用）——用户 Safari 可看
+
+## 第十九轮 C：m12 隐私 + 改写/剥除/压缩观测 + OOM 根因定位（2026-08-12，989 tests 全绿）
+
+任务三件：m12（公网 /__metrics 剥 device.ip）、MetricsCtx 三计数（rewritten/stripped/compressed）上 /__metrics（管理鉴权）、OOM（worker 大消息）根因排查。**typecheck 干净 + 989/989 全绿（并行 agent 的 compact 功能同期落地，测试数从 935 涨到 989）。**
+
+### m12（已完成）
+`/__metrics` 组装处：`adminOk = isAdminRequest(req, cfg)` 为 false 时（公网匿名），events 复制后剥 `device.ip`（events 是环形缓冲共享引用，不能原地改），summary 同时剥三个计数键。公网响应结构不变（缺 ip/计数键），管理鉴权完整。
+
+### 观测（已完成）
+- `MetricsCtx` 加 `rewritten`（错误改写）/`stripped`（context_management 剥除）/`compressed`（被动压缩触发），进 `RequestEvent` 由 `summary` 窗口求和，/__metrics 仅管理鉴权可见（与 accounts 段同门槛）。
+- 挂点：rewriteContextOverflow 拆出带 `{text, rewrote}` 的内部实现（对外契约不变）；context_management 在 handleMessagesPassThrough 调用 normalizeAnthropicRequest 前按 body 字段判定（deepseek.ts 无 ctx）；compressed 在 server.ts 调用处镜像 compactMessages 的触发条件（compact.ts:9 注释本来就写着「压缩计数由 MetricsCtx 观测（波 2）」——就是本轮）。
+- e2e 新增 5 条接线测试（匿名无 ip / 带 key 有 ip / 三计数管理面门槛 / 改写 +1 / 剥除 +1 / 压缩 +1 且上游真收到截断文本）；metrics.test.ts +2 条聚合测试。
+
+### OOM 根因（已定位，证据链完整，未改代码）
+**结论：不是 worker_threads。`node::worker::Message::Deserialize` 是 Node 22 全局 `structuredClone()` 的内部实现（Node 复用 MessagePort 的传输管线），堆栈里的 "worker" 是红鲱鱼。**
+
+证据链：
+1. 代码：全仓唯一序列化点是 `deepseek.ts:106 normalizeAnthropicRequest` 的 `structuredClone(raw)`（首个 commit 就有）；零 worker_threads/postMessage/MessagePort/BroadcastChannel；零 npm 依赖。
+2. 线上堆栈（8/11 05:56:37）：frame 38 `node::worker::Message::Deserialize` + frame 10-36 `ValueDeserializer::ReadDenseJSArray` 深层递归，分配失败在 NewRawOneByteString（反序列化物化字符串时）。
+3. **复现**：在线上同一 Node v22.20.0 上 `structuredClone(大对象)` 压小堆复现，崩溃堆栈逐地址一致（0x17575af/0x1758585/0x175882f/0x1757e5c/0x17582de/0x1756a0a/0x1757603/0x175896b/0x120dfc7/0xfdfe3b/0xfe1d85/0x1d195e2）。
+4. 第二条签名（8/12 04:34:55）：`JsonParser::MakeString` —— 同一批巨大请求体的 JSON.parse，同根因不同分配点。
+5. 时间线：**693 次 OOM（8/11 05:56 → 8/12 04:34），按用户活跃时段聚簇（06 时 160 次、11 时 187 次、12 时 102 次、21 时 83 次、22 时 40 次、8/12 04 时 17 次）**。04:55 部署后当前进程稳定 1h+（226M）零崩溃，但根因仍在：`MAX_BODY_BYTES=0/MAX_MESSAGE_CHARS=0`（用户刻意配置）下每次 /v1/messages 请求都对整个请求体做一次 structuredClone（≈2-3 倍体量瞬时内存），大 body 并发即撞堆上限。
+
+修复建议（下轮）：请求体来自 JSON.parse 是请求私有对象，网关路径（handleMessagesPassThrough 调用点）可直接让 normalizeAnthropicRequest 跳过/浅拷贝（deepseek.test.ts 有「不污染入参」契约钉着，改库函数要动测试）；或调用方改为 body 不克隆、按需局部复制。**注意 compact（COMPACT_ENABLED）在 structuredClone 之后执行，救不了克隆峰值。**
+
+### 被动压缩（研究，并行 agent 已实现落地）
+wave-1 agent B 的 compact 功能已落树（src/compact.ts + config COMPACT_ENABLED 默认关 + deepseek.ts 挂点 + deepseek.test.ts 单测）：无损层（空白折叠 + 超长单条截断带 `…[truncated]` 标记），有损历史裁剪（tool 配对风险）二期。压缩计数已按波 2 约定接上（见上）。
+
+## 第十九轮：遗留修复 + 实验性功能（2026-08-12，999 tests 全绿，已部署）
+
+### 完成
+1. **H3**：空 legacy workspace 可建首个 key（isKeysPage 弱信号锚定，空列表返回 ok keys:[]）
+2. **m12**：/__metrics 公网模式剥 device.ip（管理鉴权保留）
+3. **OOM 根因修复**（重大）：structuredClone（Node 22 走 MessagePort 反序列化管线——崩溃堆栈 "worker" 是红鲱鱼）——大 body（>512KB）跳过克隆（入参来自 JSON.parse 私有对象），并发大请求不再撞堆；小请求保留库安全契约
+4. **P0 数据接入**：cost-by-day 趋势（byDay 不再恒 null）/ usage-models 模型消费 / usage-users 成员消费 / budgets-users-status 成员预算 / models-pricing 模型定价（10min 缓存）——面板全展示
+5. **实验性功能**（默认关，设置页可见 + 只读 config 端点）：
+   - usage 缩放（SCALE_CLIENT_TOKENS=0.6657，诱导 CC 提前 compact）
+   - 被动压缩（COMPACT_ENABLED，4MiB 触发，8000 字符截断，无损层）
+   - 观测三计数（rewritten/stripped/compressed——/__metrics 管理端 + 面板「兼容修复」卡）
+6. **legacy billing**：旧版余额/自动充值/支付历史（实测 $5 lite 支付真实数据）
+
+### 验证
+999 测试全绿；线上：legacy billing 真实数据 ✓、config 端点 ✓、观测计数在位、内存 41.4M 稳定
+
+## 第二十轮：批次 1 —— settings 热配置层 + 分发密钥系统（2026-08-12，本地验证，未提交）
+
+用户任务（分两批，本批是后端全量，批次 2 接面板 UI）：① 一切配置热改（env 默认、
+settings 覆盖、运行时不重启）；② 分发密钥系统（可增删改禁、按 OpenCode 计费口径看用量、
+走共享池不绑定账号）。
+
+**验收：typecheck 干净 + 1043/1043 全绿（999 + 新 44）+ build 干净 + 真服务冒烟全对。**
+
+| 模块 | 内容 |
+|---|---|
+| `src/settings.ts`（新） | SETTINGS_META（8 字段默认值+校验）、SettingsStore（settings 表，setMany 单事务）、applySettingsToConfig（apiKeys 数组引用替换 → verifyAuth 下次读取即生效） |
+| `src/tokens.ts`（新） | generateToken（tk-+64hex）、指纹=sha256 前 24 hex（明文不落库，verify 无解密）、TokensStore CRUD + verify + usage |
+| `src/usagedb.ts` | settings/tokens 表；requests 补 token_fp 列（旧库幂等）；tokenUsageAll（10s 缓存聚合） |
+| `src/security/auth.ts` | verifyAuth 第三参 tokensStore（duck-typed）；API_KEYS 未命中兜底分发 token；AuthResult.tokenFp |
+| `src/server.ts` | /__admin/api/settings GET/PATCH、/__admin/api/tokens CRUD + /tokens/stats；ctx.tokenFp 落库；createApp 第 9 参 |
+| `src/main.ts` | 启动合并 settings（覆盖 env 默认）+ TokensStore 接线 + 启动日志 tokens 行 |
+
+**契约要点（批次 2 面板读 server.ts 端点注释块）**：GET settings 的 adminPass value/default
+恒 ''（密码不回显）、apiKeys 只回掩码数组（****XXXX）；GET/PATCH settings 与全部 tokens
+端点都过 Origin 校验；token 明文只在 POST /tokens 创建响应出现一次；管理面（isAdminRequest）
+刻意不接受分发 token（有测试钉住）；改 adminPass 不清旧签名会话（24h 内仍有效，文档注明）；
+PATCH apiKeys 是替换语义可自锁（文档注明）。
+
+**对抗审查**（reviewer 独立验证 typecheck+全量绿后报告）：M1 PATCH 多键部分写失败分叉 →
+setMany 单事务修复；M2 apiKeys 明文回显 / adminPass 默认值泄露活密码 / GET 无 Origin →
+掩码 + 默认值回空 + Origin 补上，测试同步更新钉住；m1 note:null 400 与错误消息矛盾 →
+放行；m2 状态收敛与 verify 一致；m4 熵值注释 128→256-bit；垃圾文件 `3000` 已删。
+测试盲区：管理面拒分发 token 不变量、旧库迁移 token_fp 断言、setMany 原子性（只读文件注入）、
+SETTINGS_META 全覆盖 apply，全部补齐。
+
+**遗留**：未提交、未上线（工作区含历轮未提交改动，提交范围待用户确认）；批次 2 面板 UI 未接。
+
+## 第二十轮：超级大计划（分发密钥 + 热配置 + 主页健康度，2026-08-12，1069 tests 全绿，已部署）
+
+### 用户决策
+- 计费：不自己定价——按 OpenCode 计费口径（costMicroCents，1e8=$1，透传显示）
+- 分发密钥：共享池（不绑定账号）
+- 配置：全部热配置（settings 表，env 默认 + settings 覆盖）
+- 主页：统计卡 + 趋势 + 状态
+
+### 批次 1（后端）
+- **settings 热配置层**：settings 表 + SettingsStore + applySettingsToConfig（apiKeys 数组引用替换/密码/实验开关原地改——运行时生效）+ GET/PATCH 端点（掩码/回空隐私口径 + Origin 校验 + 审计 + setMany 事务）
+- **分发密钥系统**：tokens 表（明文不落库——只存 sha256 前 24 hex 指纹）+ 生成/CRUD/禁用 + verify（指纹查表，无解密）+ 用量统计（按 token_fp 聚合 requests/输入输出 tokens/costMicroCents——10s 缓存）+ 鉴权集成（verifyAuth 第三参——分发 token 不能进管理面）+ token_fp 落库
+- **参考研究**：new-api 令牌形态（掩码/状态徽章/用量进度条/批量创建）+ sub2api（生成/状态机/后扣）+ opencode 计费口径确认（microCents=cents×1e6、按模型单价×token 计、billingSource=balance 才真扣钱）
+
+### 批次 2（前端）
+- 密钥 tab：列表（名称/状态徽章/掩码/用量/操作）+ 创建弹层（Name+批量 1-10+明文仅此一次+复制）+ 编辑/禁用/删除
+- 主页健康度：统计卡组（总请求/成功率/密钥费用/分发密钥数 + SVG sparkline 12 桶）+ 状态列表（网关/上游池/账号/分发密钥/兼容修复计数）
+- 设置页热改：账号密码（留空不提交+旧会话 24h 提示）+ API_KEYS 管理（localStorage 明文缓存兜底）+ 实验开关（toggle）+ 来源标记（env/面板）
+- 余额标注：账号卡「余额（org）」
+
+### 批次 3（对抗审查 + 修复）
+- 无 BLOCKER；2 MAJOR + 7 MINOR 全修：M1 掩码提交锁死（apiKeys 拒绝 **** 前缀——实测修复）M2 默认密码（用户指定 13141516——保留+文档统一）m1 明文 DOM 清理（关闭即清）m2 密码 min 8 m3-m7（掩码信息量/默认语义/401 落库/错误形状/密码不 trim——密码不 trim 已修）
+
+### 验证（线上全链路）
+创建 token → 公网请求 200 → 用量统计（请求 1/费用 $0）→ 禁用 401 → 删除 ✓
+1069 测试全绿；settings 热改（密码/API_KEYS 即时生效）测试钉住

@@ -14,7 +14,8 @@ OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。
   - `thinking: disabled` 时剥除响应流中多余的 thinking 事件
   - `reasoning_content` ↔ `thinking` 块双向映射
   - `reasoning_effort` 透传
-- JSON mode 真实现：`response_format` 经工具强制后转回 `content`，`finish_reason=stop` 与 OpenAI 原生对齐
+- JSON mode：`response_format` 原样透传给上游（OpenAI 端点原生支持，
+  不再经工具强制转换）
 - 流式转换逐事件打磨：`reasoning_content` 增量、usage 独立尾 chunk、背压、`[DONE]`
 - 多轮工具稳定：`tool_use` / `tool_result` id 一一对应（FIFO）
 - 生产级安全：常量时间鉴权、提示词注入检测、SSRF 防护（含 IPv6）、CSRF、背压、内部错误不泄漏
@@ -66,7 +67,7 @@ claude
 
 | 路径 | 协议 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | OpenAI | 转换 → DeepSeek，流式/非流式 |
+| `POST /v1/chat/completions` | OpenAI | 归一化后直发上游（OpenAI 协议），流式/非流式 |
 | `POST /v1/messages` | Anthropic | 直通 + DeepSeek 归一化，流式/非流式 |
 | `POST /v1/messages/count_tokens` | Anthropic | Claude Code 记账 |
 | `GET /v1/models` | OpenAI | 模型发现 |
@@ -82,14 +83,14 @@ claude
 | `HOST` | `127.0.0.1` | 监听地址 |
 | `API_KEYS` | 空 | 调用方鉴权 key，逗号分隔；空则 fail-closed 拒绝 |
 | `ANTHROPIC_API_KEY` | 空 | 上游 DeepSeek/Anthropic key |
-| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | 上游 base URL |
+| `ANTHROPIC_BASE_URL` | `https://opencode.ai/zen/go` | 上游 base URL（订阅端点） |
 | `MODEL_MAP` | 空 | 模型名映射，如 `gpt-4o:deepseek-v4-flash` |
 | `DEFAULT_MODEL` | `deepseek-v4-flash` | 未命中映射的兜底模型 |
 | `INJECTION_MODE` | `block` | 注入检测：`block`/`log`/`off` |
 | `ALLOW_UNAUTHENTICATED` | `0` | 仅本地绑定时可开（fail-closed） |
 | `TRUST_CLAUDE_CODE_HEADERS` | `0` | 是否透传 `x-claude-code-*` 会话头 |
-| `MAX_BODY_BYTES` | `10485760` | 请求体上限 |
-| `MAX_MESSAGE_CHARS` | `200000` | 单条消息文本上限 |
+| `MAX_BODY_BYTES` | `64MB` | 请求体上限 |
+| `MAX_MESSAGE_CHARS` | `8000000` | 单条消息文本上限 |
 | `STRIP_CONTROL_CHARS` | `1` | 剥离日志/转发内容里的控制符 |
 | `USAGE_DB_PATH` | `data/usage.db` | 用量库路径（相对工作目录）。设为空串关闭持久化 |
 | `USAGE_DB_RETENTION_DAYS` | `30` | 用量记录保留天数，`0` = 不清理 |
@@ -106,25 +107,29 @@ Node 20 上该模块不存在，此时自动降级：只记一条 warn，面板�
 ```
 src/
 ├── index.ts            # 库导出入口
-├── request.ts          # OpenAI 请求 → Anthropic 请求（核心转换）
-├── normalize.ts        # 消息规整：交替/tool_result 紧跟/thinking 注入/id FIFO
-├── response.ts         # Anthropic 响应 → OpenAI 响应（含 json_mode 转 content）
-├── stream.ts           # Anthropic SSE → OpenAI chunk（流式转换器）
-├── sse.ts              # Anthropic SSE 行解析
-├── deepseek.ts         # DeepSeek 归一化（thinking/effort/过滤/注入）
-├── tool.ts             # 工具结构转换 + schema 消毒
-├── image.ts            # 图片块转换 + SSRF 防护
-├── usage.ts            # usage 换算
-├── stopReason.ts       # stop_reason ↔ finish_reason
-├── errors.ts           # 错误映射 + 控制符剥离
-├── anthropic.ts        # 上游转发（超时/header）
-├── config.ts           # 环境配置
-├── server.ts           # HTTP 服务 + 路由 + 安全装配
+├── main.ts             # 服务入口（装配 config/server/key 池/探活）
+├── server.ts           # HTTP 服务 + 路由 + 安全装配 + 用量落库
+├── config.ts           # 环境配置（白名单化解析）
+├── errors.ts           # 错误映射 + 控制符剥离 + 上游失败分级
+├── upstream.ts         # OpenAI 上游客户端（key 池集成 + 幂等 release）
+├── keypool.ts          # 多 key 池（失败分级冷却、指纹脱敏）
+├── keyprobe.ts         # 空闲 key 主动探活（30 分钟一轮）
+├── usagedb.ts          # 用量持久化（node:sqlite，零依赖）
+├── deepseek.ts         # DeepSeek 归一化（直通路径适配层）
+├── toOpenAI.ts         # Anthropic 请求 → OpenAI 请求
+├── toAnthropic.ts      # OpenAI 响应/流 → Anthropic 事件
+├── dsml.ts             # 工具调用泄漏兜底解析
+├── sse.ts              # OpenAI SSE 行解析（parseOpenAISSE）
+├── metrics.ts          # 请求事件环形缓冲（喂面板）
+├── dashboard.ts        # 自带状态面板（HTML 内联，零依赖）
+├── types.ts            # 两套协议的类型定义
 ├── security/
 │   ├── auth.ts         # 鉴权（timingSafeEqual, fail-closed）
 │   ├── validate.ts     # schema 校验 + 长度上限
 │   └── injection.ts    # 提示词注入检测 + system 护栏
-└── main.ts             # 服务入口
+└── 历史转换链（2026-08-09 改造前遗留，经 index.ts 导出，主路径不再调用）：
+    request.ts  normalize.ts  response.ts  stream.ts
+    tool.ts  image.ts  usage.ts  stopReason.ts
 ```
 
 维护者文档（架构决策、DeepSeek 怪癖清单、已知问题、计划）在 `.claude/docs/`，

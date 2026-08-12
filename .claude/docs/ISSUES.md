@@ -3,7 +3,7 @@
 状态：`确认` 有复现路径 / `可疑` 只是读代码推断 / `已修` 本轮修掉 / `设计取舍` 不是 bug
 / `已证伪` 曾被记为缺陷，但查证后不存在
 
-最后核对：2026-08-09，基线 `npm test` 292 passed、`tsc --noEmit` 干净。
+最后核对：2026-08-11，`npm test` 全绿、`tsc --noEmit` 干净。
 
 ## 已证伪（2026-08-09 第二轮核查）
 
@@ -85,6 +85,12 @@ opencode Zen 只认内容块数组。Claude Code 发 `content: "hi"` 字符串�
 - 修法：[request.ts:98](../../src/request.ts) 改为写 `output_config: {effort}`
 - 同步更新了 `test/request.test.ts` 里断言旧行为的用例
 
+现状（2026-08-09 改造后）：chat 路径直发 OpenAI 协议，`reasoning_effort`
+原样透传、不再需要转换；直通路径的映射在
+[deepseek.ts:136-143](../../src/deepseek.ts)（`output_config.effort`，
+disabled 时连 effort 一起删）。本条作为「双路径适配漏一边就出单边 bug」
+的历史教训保留。
+
 ### I-2 流式漏发 finish_reason — 已修
 
 上游只发 `message_stop` 而没有 `message_delta` 时，`stream.ts` 直接 return，
@@ -94,7 +100,7 @@ OpenAI 客户端永远收不到 `finish_reason`，可能一直等或报错。
 - 复现：喂 `[content_block_delta, message_stop]` 给 `anthropicStreamToOpenAI`，
   所有 chunk 的 `finish_reason` 都是 null
 - 修法：加 `emittedFinish` 状态位，`message_stop` 和迭代结束时兜底补发
-  （[stream.ts:195](../../src/stream.ts)）
+  （[stream.ts:205-208](../../src/stream.ts)）
 
 ## 确认（未修）
 
@@ -115,10 +121,17 @@ chat 路径因为 `normalizeMessages` 恰好已产出块数组而免疫 —— �
 - 建议：把 deepseek 归一化提成一道统一的出口收尾，两条路径转换完都过一遍
 - 优先级：高，属于架构债，不修就会继续出同类 bug
 
+2026-08-11 更新：改造后 chat 路径直发 OpenAI 协议，适配面已不对称——
+直通路径的适配集中在 `normalizeAnthropicRequest`（deepseek.ts），chat 路径只剩
+「模型映射 + 剥扩展字段」；上面「chat 路径没有的适配」清单（`context_management`/
+`strict` 等 Anthropic 专属字段）对现架构已无意义，OpenAI 请求里不会出现。
+残余的双路径债主要在直通路径内部（归一化 vs toOpenAI/toAnthropic 各管一层，
+DSML 兜底非流式/流式两处接线）。见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
 ### I-4 max_tokens 下限保护违反客户端意图
 
 thinking 非 disabled 时，`max_tokens` 会被静默抬到 4096
-（[deepseek.ts:112](../../src/deepseek.ts)）。客户端显式要 200 却按 4096 计费，
+（[deepseek.ts:198-206](../../src/deepseek.ts)）。客户端显式要 200 却按 4096 计费，
 且响应里没有任何提示。
 
 - 这是刻意取舍（空回复 vs 超预算），但客户端无从得知
@@ -126,7 +139,7 @@ thinking 非 disabled 时，`max_tokens` 会被静默抬到 4096
 
 ### I-5 /v1/messages 不加 system 护栏
 
-`buildSystemGuard` 只在 chat 路径调用（[server.ts:263](../../src/server.ts)）。
+`buildSystemGuard` 只在 chat 路径调用（[server.ts:729-731](../../src/server.ts)）。
 直通路径的 system 原样转发，L4 防护对 Claude Code 完全不生效。
 
 - 复现：`POST /v1/messages` 带 `system`，上游收到的 system 不含护栏文本
@@ -138,7 +151,8 @@ thinking 非 disabled 时，`max_tokens` 会被静默抬到 4096
 
 ### I-6 SSE 解析缓冲区无上界
 
-[sse.ts:36](../../src/sse.ts) 的 `buffer` 只在遇到 `\n` 时才切分。
+`sse.ts` 的 `buffer`（parseOpenAISSE 在 [sse.ts:100](../../src/sse.ts)，
+历史的 parseAnthropicSSE 在 [sse.ts:35](../../src/sse.ts)）只在遇到 `\n` 时才切分。
 上游若发一个超长无换行的流，buffer 无限增长。
 
 - 上游是可信的 DeepSeek，实际风险低
@@ -146,7 +160,7 @@ thinking 非 disabled 时，`max_tokens` 会被静默抬到 4096
 
 ### I-7 writeChunk 的监听器可能累积
 
-[server.ts:46](../../src/server.ts) 每次背压都 `res.once('drain'|'close'|'error')`。
+[server.ts:63-73](../../src/server.ts) 每次背压都 `res.once('drain'|'close'|'error')`。
 resolve 后另外两个监听器不会被摘掉。长流 + 频繁背压下监听器会累积，
 可能触发 MaxListenersExceededWarning。
 
@@ -171,4 +185,4 @@ resolve 后另外两个监听器不会被摘掉。长流 + 频繁背压下监听
 - 工具名消毒在定义和历史 `tool_use` 两侧一致（`normalize.ts` 已调 `sanitizeToolName`）
 - `error` 事件后 `[DONE]` 仍会发出（`openAIStreamToSSE` 的 finally 语义保证）
 - 以 `assistant(tool_use)` 开头的历史被丢弃时，孤立 `tool_result` 也会被丢，不会残留
-- `count_tokens` 会做模型名映射
+- `count_tokens` 纯本地估算（字符数 / 4），不打上游，不涉及模型映射

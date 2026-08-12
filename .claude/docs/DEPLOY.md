@@ -85,6 +85,16 @@
 | `KEY_PROBE_INTERVAL_MS` | 不设 = 1800000（30 分钟）。`0` = 关闭探活 |
 | `KEY_PROBE_IDLE_MS` | 不设 = 1800000。key 空闲超过这个时长才探 |
 | `KEY_PROBE_TIMEOUT_MS` | 不设 = 30000 |
+| `ADMIN_USER` | 面板登录账号，不设 = `admin` |
+| `ADMIN_PASS` | 面板登录密码，不设 = `thankyouopencode`（**上线必改**） |
+| `ADMIN_SESSION_TTL_MS` | 面板会话 cookie 有效期，不设 = 24h |
+| `ADMIN_LOGIN_FAIL_LIMIT` / `ADMIN_LOGIN_LOCK_MS` | 登录失败限速（默认 5 次锁 5 分钟） |
+
+面板访问（2026-08-11 起）：浏览器打开 `/__admin` 或 `/__dash` 无凭证时显示
+**账号密码登录页**（默认 admin/thankyouopencode，`ADMIN_PASS` 可改）。登录成功
+签发 HttpOnly 会话 cookie（内存 token，进程重启即失效需重登）。API key
+（`x-api-key` 头）仍然有效，curl/脚本不受影响。**线上必须改默认密码**：
+`ADMIN_PASS` 写进 fuckopencode.env（600 权限），改完 `systemctl restart`。
 
 改 env 后要 `systemctl restart`（`EnvironmentFile` 只在启动时读）。
 
@@ -123,6 +133,30 @@ IP 和 UA 只在内存窗口里（200 条），长期留存反而是负担。
 
 改 env 的正确姿势：**不要把凭证写进命令行**（`ps` 可见，也会进 shell 历史）。
 scp 一个临时文件上去，远端处理完 `shred -u` 删掉。
+
+## 多账号管理面（2026-08-11 起）
+
+管理面板在 `/__admin`（只本机直连或带 API key 可访问，公网永不豁免）。
+启动日志两行能直接看出状态：
+
+```
+[proxy] secret: data/secret.key (auto-generated | from file | from env)   # 正常
+[proxy] secret: unavailable                                                # 降级
+[proxy] accounts: 1 (env-seeded | from db)                                 # 正常
+[proxy] accounts: off (secret unavailable)                                 # 降级
+```
+
+- **`data/secret.key` 与 usage.db 同在 `data/`**，已 gitignore、不随部署覆盖。
+  **备份必须含 `data/` 目录。** secret.key 丢失 = 账户 keys/cookie 全部无法解密
+  （env 种子会重建默认账户，但自定义账户与 cookie 需重新录入）。
+- 凭证口径升级：账户 key 与 billing cookie 以 AES-256-GCM 密文落库
+  （`GATEWAY_SECRET` env 可替代文件密钥），明文绝不入响应/日志/面板。
+- billing 余额抓取走 `https://opencode.ai/workspace/{id}/billing` 页面
+  （cookie 来自用户浏览器 devtools），**实验性**：解析器未对真实页面验证
+  （需真实 cookie spike 固化成 fixture），失败按 15min→2h 退避且只记状态码。
+  真实余额显示不出来时，先查 `[proxy] billing` 日志。
+- 探针改为账户驱动（每 tick 挑到期账户，`retry_until` 闸门），
+  `KEY_PROBE_INTERVAL_MS` 默认 15min、`KEY_PROBE_IDLE_MS` 默认 60min。
 
 ## 验证清单
 

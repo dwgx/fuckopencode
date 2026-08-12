@@ -6,12 +6,17 @@
 
 `I-3`：deepseek 归一化写了两遍，漏一边就出单边 bug。
 
-做法：把归一化提成统一出口收尾，两条路径转换完都过同一道。
-需要先想清楚 `normalizeAnthropicRequest` 现在混了两件事
-（协议归一化 + 模型名映射），拆开再复用。
+2026-08-11 更新：改造后 chat 路径直发 OpenAI 协议，这个债的形态变了——不再
+是「chat 路径 vs 直通路径」的对称重复，而是集中在直通路径内部：
+`normalizeAnthropicRequest`（deepseek.ts）与 `toOpenAI`/`toAnthropic`
+（协议转换）各管一层，DSML 兜底在非流式/流式两处接线。原验收标准
+（「chat 路径也剥 `context_management` / 工具 `strict`」）基于旧架构，已作废。
 
-验收：chat 路径也剥 `context_management` / 工具 `strict`；
-两条路径的 deepseek 行为有对照测试，改一边不改另一边测试就红。
+做法：直通路径的 deepseek 归一化收敛到 `normalizeAnthropicRequest` 一处，
+`toOpenAI`/`toAnthropic` 不再各自内联 deepseek 适配。
+
+验收：直通路径的非流式/流式两处输出行为有对照测试（同输入同输出），
+DSML 兜底逻辑只有一处实现，改归一化逻辑时测试能覆盖两条输出分支。
 
 ## 优先级 2：定 I-5 的方向
 
@@ -20,15 +25,17 @@
 
 ## 优先级 3：补测试缺口
 
-当前 292 个测试，缺的是：
+缺的是：
 
 - `config.ts` 的环境变量解析（`MODEL_MAP` 畸形输入、数字解析失败回落、
   `ALLOW_UNAUTHENTICATED` + 非回环 host 的组合）
-- `errors.ts` 的 `anthropicErrorToOpenAI` 全表映射
+- `errors.ts` 的 `anthropicErrorToOpenAI` 全表映射、`parseResetDelayMs` 边界
 - `upstream.ts` 的超时与 signal 组合行为
 - 流式路径的客户端提前断开（`res.destroyed` 分支）
-- `sse.ts` 的跨包半行、`\r\n`、多行 data 拼接
+- `tool.ts` 的 `sanitizeInputSchema`（$ref 降级、白名单剥离）
+- `sse.ts` 的 `parseOpenAISSE` 跨包半行、`\r\n`、多行 data 拼接
   （脏行检测已覆盖，见 `test/stream.test.ts` 的 `parseOpenAISSE 脏行检测`）
+  （`metrics.ts` 已补：2026-08-11 加 36 条，覆盖 p95/UA 解析/IP 优先级/环形缓冲）
 
 ## 优先级 4：小修
 
