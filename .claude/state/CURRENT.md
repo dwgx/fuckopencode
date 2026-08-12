@@ -1011,3 +1011,23 @@ SETTINGS_META 全覆盖 apply，全部补齐。
 ### 验证（线上全链路）
 创建 token → 公网请求 200 → 用量统计（请求 1/费用 $0）→ 禁用 401 → 删除 ✓
 1069 测试全绿；settings 热改（密码/API_KEYS 即时生效）测试钉住
+
+## 第二十一轮：服务端归因与协议转换 7 项修复（2026-08-13，本地验证，未提交）
+
+对抗式全面审查发现的 7 个 MAJOR（均有反例验证），逐项修复 + 回归测试，**1166 tests 全绿** + typecheck/build 干净。
+
+| # | 问题 | 修复 | 回归测试（去掉修复会红） |
+|---|---|---|---|
+| 1 | 非流式上游 body 读失败（200+非法 JSON / idle 掐断）被 markSuccess | data===null 先 markFailure('transient')+noteUpstreamError 再 502，只有非 null 才 markSuccess（chat+直通两处） | e2e「非流式上游 body 非法」2 条（chat/直通） |
+| 2 | 客户端断开（res close→abort→AbortError）把健康 key 记成 transient | 抽 `isClientAbort(controller,res)`（signal.aborted && res.destroyed），断开不 markFailure；只有 idle/网络错误才记 | e2e B2 测试加 failCount 前后断言 |
+| 3 | chat 路径脏流静默截断（无 [DONE] 无错误） | 镜像直通：脏行补 error chunk + markFailure('transient') + ctx.error 落库 | e2e「脏数据时中止，发错误 chunk」更新（原钉「无 [DONE] 是正确行为」已改） |
+| 4 | >512KB 跳过克隆时 normalize 原地改 body.model，响应 model 回显分叉 | normalize 前快照 `requestedModel`，ctx.model/两处回显全用快照 | e2e「大 body」2 条（非流式/流式回显客户端模型名） |
+| 5 | 上游先 content 后 reasoning 时收尾 text_delta 打进仍开着的 thinking 块 | 收尾段 `openTextBlock.kind !== 'text'` 先 close 再新开 text 块（同循环 234 行） | toAnthropic「content 先于 reasoning_content」1 条 |
+| 6 | chat 换 key 重试第二个 key 失败从不 markFailure（B 永不降权） | `failureReported` 标志：统一错误出口只对未上报过的 key 补 markFailure | e2e「第二个 key 的失败也上报」1 条（两 key failCount 各 +1） |
+| 7 | 直通流式 input_tokens 恒 0（message_start 硬编码 0、message_delta 只带 output） | message_delta.usage 补 `input_tokens`（真实未缩放，不受 SCALE_CLIENT_TOKENS 污染），server 取用 | toAnthropic 2 条更新 + e2e「流式 input_tokens 进 ctx」1 条 |
+
+注意点：
+- 改动面：`src/server.ts`、`src/toAnthropic.ts`、`src/types.ts`、`test/e2e.test.ts`、`test/toAnthropic.test.ts`。
+  `src/admin.ts`/`test/admin.test.ts` 的改动是并行 agent 的，未碰。
+- 每项修复都验证过「去掉修复该测试变红」（临时 revert 单项 + 跑定向测试确认红，再还原）。
+- 遗留：未提交、未上线；线上 memory 约束 / billing spike 等旧遗留不变。
