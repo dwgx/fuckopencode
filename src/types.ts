@@ -196,6 +196,11 @@ export interface OpenAIChatResponse {
     finish_reason: OpenAIFinishReason;
   }>;
   usage: OpenAIUsage;
+  /**
+   * 上游记账的 cost（opencode Zen 响应带，microCents，实测字符串如 "0"；
+   * 订阅端点恒 0，按量端点真实）。可选 —— 普通兼容端不返回它。
+   */
+  cost?: string;
 }
 
 // ─── 流式类型 ────────────────────────────────────────────────────
@@ -231,6 +236,11 @@ export interface OpenAIStreamChunk {
   object: 'chat.completion.chunk';
   created: number;
   model: string;
+  /**
+   * 上游错误体混进流时的错误载荷（OpenAI `{error:{...}}` 形态）。
+   * 正常 chunk 没有该字段；转换器遇它必须中止流（见 toAnthropic.openAIStreamToAnthropic）。
+   */
+  error?: { message?: string; type?: string };
   choices: Array<{
     index: number;
     delta: {
@@ -246,6 +256,11 @@ export interface OpenAIStreamChunk {
     finish_reason: OpenAIFinishReason | null;
   }>;
   usage?: OpenAIUsage;
+  /**
+   * 上游记账 chunk 的 cost（`{"choices":[],"cost":"0"}` 形态，microCents 字符串）。
+   * server 层抓它落库（网关实际用量），不转发给客户端。
+   */
+  cost?: string;
 }
 
 // ─── 转换选项 ────────────────────────────────────────────────────
