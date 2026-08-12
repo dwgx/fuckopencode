@@ -844,6 +844,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             k: v for k, v in self.headers.items()
             if k.lower() not in HOP_BY_HOP
         }
+        # 安全（全面审查 B1/M3）：盾是唯一可信边界——
+        # 1) 注入「经盾转发」标记：网关对带此头的请求不做「本机直连」免凭据豁免
+        #    （否则公网直连 8787 伪造 Host: 127.0.0.1 即免凭据接管整个管理面）。
+        # 2) 覆写 cf-connecting-ip 为真实对端，剥离客户端自带的转发头：
+        #    登录限速按真实 IP 计数，否则攻击者轮换 X-Forwarded-For 无限爆破。
+        headers["X-Shield-Forwarded"] = "1"
+        peer = getattr(self, "client_address", (None, None))[0] or ""
+        if peer:
+            headers["cf-connecting-ip"] = peer
+        for k in ("x-real-ip", "x-forwarded-for", "cf-ray"):
+            headers.pop(k, None)
         return headers, body
 
     def _wants_stream(self, body):
@@ -1405,8 +1416,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "tunable": {k: list(v) for k, v in TUNABLE.items()},
         }, 200 if applied or not errors else 400)
 
+    def _check_host(self):
+        """拒绝 Host 指向本地回环的转发（安全：攻击者用 Host: 127.0.0.1
+        骗过网关的「本机直连」免凭据豁免）。回环 Host 只可能来自本机进程
+        （隧道/盾自身），公网进来的请求带这种 Host 一律 403。"""
+        host = self.headers.get("Host", "") or ""
+        hl = host.lower()
+        if hl.startswith(("127.0.0.1", "localhost", "[::1]", "::1")):
+            self._collect_request()  # 读掉 body 再回，避免 RST 吞掉 403
+            self._fail(403, "forbidden")
+            return False
+        return True
+
     def do_POST(self):
         if self._shield_route():
+            return
+        if not self._check_host():
             return
         if not Server._concurrency.acquire(blocking=False):
             self._reject_busy()
@@ -1418,6 +1443,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self._shield_route():
+            return
+        if not self._check_host():
             return
         if not Server._concurrency.acquire(blocking=False):
             self._reject_busy()

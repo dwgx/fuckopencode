@@ -463,7 +463,9 @@ async function handleAdminLogin(
     res.end();
     return;
   }
-  const body = await readBody(req, cfg.maxBodyBytes);
+  // 登录是预鉴权、公网可达的唯一 POST 面：固定 64KB 上限（全面审查 M5——
+  // 生产 MAX_BODY_BYTES=0 时大 body 整读进堆，配合 OOM 史是内存 DoS 面）。
+  const body = await readBody(req, LOGIN_BODY_MAX_BYTES);
   let user = '';
   let pass = '';
   if (body.ok) {
@@ -679,6 +681,7 @@ async function handleOverviewTrend(req: IncomingMessage, res: ServerResponse, db
 //      API key 鉴权会立即失效（fallback 是会话 cookie / 本机直连）。
 
 /** settings 写操作请求体上限（值都很小，宽松防滥用）。 */
+const LOGIN_BODY_MAX_BYTES = 64 * 1024;
 const SETTINGS_BODY_MAX_BYTES = 64 * 1024;
 
 /** 从 cfg 取某个可热改字段的当前值（SETTINGS_META 的键 → AppConfig 字段）。 */
@@ -2090,6 +2093,21 @@ export function createApp(
   });
 }
 
+/**
+ * 判定流/body 消费失败是否源于**客户端主动断开**（而非上游问题）。
+ *
+ * 客户端断开 → res 触发 close → 两处挂载的 `res.on('close', () => controller.abort())`
+ * 把网关侧 controller abort 掉 → 上游 fetch 的 body 读随之中止。此时
+ * `controller.signal.aborted === true` 且 `res.destroyed === true`。
+ *
+ * 这类失败**不能上报 keypool**：Claude Code 停生成是常态，客户端取消 5 次就把
+ * 健康 key 禁 5 分钟。只有 idle watchdog 掐断（上游挂死）或上游网络错误
+ * （controller 未 abort）才记 transient。
+ */
+function isClientAbort(controller: AbortController, res: ServerResponse): boolean {
+  return controller.signal.aborted && res.destroyed;
+}
+
 async function handleChatCompletion(
   req: IncomingMessage,
   res: ServerResponse,
@@ -2175,6 +2193,10 @@ async function handleChatCompletion(
   // 下面那个统一错误出口原本会再 `.json()` 一次，在「没换 key」的路径上
   // 必然拿到空，于是连回给客户端的错误文案都退化成按状态码生成的通用句子。
   let firstErrBody: unknown = null;
+  // 当前 `upstream` 的失败是否已上报 keypool。首个 key 的 markFailure 在换 key
+  // 判断块里做；换出的第二个 key 失败时统一错误出口必须补报 —— 否则第二个 key
+  // 持续失败时每个请求都白撞它一次再 503，它还永远 healthy（坏 key 永不降权）。
+  let failureReported = false;
 
   // 非流式：上游返回错误状态时，若尚未写响应字节，可换 key 重试一次。
   if (!upstream.response.ok && !res.headersSent) {
@@ -2188,6 +2210,7 @@ async function handleChatCompletion(
     firstErrBody = errBody;
     const kind = classifyUpstreamFailure(upstream.response.status, errBody);
     upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+    failureReported = true;
     // 在这里记：body 只能读一次，下面那个统一错误出口再 .json() 会拿到空。
     // 记下的是「第一个 key 上到底出了什么」—— 恰是换 key 重试会掩盖掉的证据。
     noteUpstreamError(ctx, upstream.response.status, errBody);
@@ -2202,6 +2225,8 @@ async function handleChatCompletion(
         ctx.keyFingerprint = keyFingerprint(upstream.key);
         // 换了 key 就是一个全新的响应：上一个 key 的错误体不能再用来描述它。
         firstErrBody = null;
+        // 新 key 的失败还没上报过，统一错误出口要补（见 failureReported 注释）。
+        failureReported = false;
         // 重试成功就不该在这条 200 记录上留着上一个 key 的错误文案。
         if (upstream.response.ok) ctx.error = null;
       } catch (err) {
@@ -2230,6 +2255,12 @@ async function handleChatCompletion(
       }
     }
     noteUpstreamError(ctx, upstream.response.status, errBody);
+    // 统一错误出口：首 key 的失败已在换 key 判断块上报过（failureReported=true），
+    // 只有换出来的第二个 key 失败（或重试前上游就 !ok 的路径）需要在这里补报。
+    if (!failureReported) {
+      const kind = classifyUpstreamFailure(upstream.response.status, errBody);
+      upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+    }
     const err = anthropicErrorToOpenAI(upstream.response.status, errBody);
     const retryAfter = upstream.response.headers.get('retry-after');
     if (retryAfter) res.setHeader('retry-after', retryAfter);
@@ -2273,6 +2304,14 @@ async function handleChatCompletion(
         if (dirtySample !== null) {
           // 脏样本可能回显上游 Authorization 头，落日志前先脱敏。
           console.error(`[proxy] chat stream aborted on dirty line: ${stripSecrets(stripControl(dirtySample))}`);
+          // 镜像直通路径：脏行不再静默断流 —— 补一个错误 chunk + 上报 keypool +
+          // 记 ctx.error。否则客户端看到「无 [DONE] 无错误」的响应（挂起/通用
+          // Failed to parse JSON），面板也没有任何失败痕迹。
+          upstream.markFailure('transient');
+          ctx.error = 'upstream dirty stream';
+          if (!res.writableEnded && !res.destroyed) {
+            await writeChunk(res, `data: ${JSON.stringify({ error: INTERNAL_SERVER_ERROR })}\n\n`);
+          }
           break;
         }
         if (!chunk.choices?.length && !chunk.usage) continue;
@@ -2285,7 +2324,11 @@ async function handleChatCompletion(
     } catch (err) {
       const message = err instanceof Error ? err.message : 'stream error';
       console.error(`[proxy] stream error: ${stripControl(message)}`);
-      upstream.markFailure('transient');
+      // 客户端中途断开（res close → controller.abort）不是上游故障：取消流不能
+      // 上报 keypool，否则 Claude Code 停生成 5 次就把健康 key 禁 5 分钟。
+      if (!isClientAbort(controller, res)) {
+        upstream.markFailure('transient');
+      }
       if (!res.writableEnded && !res.destroyed) {
         res.write(`data: ${JSON.stringify({ error: INTERNAL_SERVER_ERROR })}\n\n`);
       }
@@ -2297,12 +2340,18 @@ async function handleChatCompletion(
   }
 
   const data = (await upstream.response.json().catch(() => null)) as OpenAIChatResponse | null;
-  upstream.markSuccess();
   upstream.release();
   if (data === null) {
+    // 上游 200 但 body 非法（或 body 阶段被 idle watchdog 掐断）：记失败不记成功，
+    // 否则坏 key 永不降权、requests.error 恒空。客户端主动断开触发的 abort 除外。
+    if (!isClientAbort(controller, res)) {
+      upstream.markFailure('transient');
+      noteUpstreamError(ctx, 200, null);
+    }
     sendJson(res, 502, { error: { message: 'upstream returned malformed body', type: 'server_error' } });
     return;
   }
+  upstream.markSuccess();
   // 回显客户端请求的模型名，而非上游实际模型名。
   if (requestedModel) data.model = requestedModel;
   ctx.inputTokens = data.usage?.prompt_tokens ?? 0;
@@ -2369,6 +2418,12 @@ async function handleMessagesPassThrough(
     return;
   }
   const body = parsed.body as Record<string, unknown>;
+
+  // 客户端请求的模型名快照，必须在 normalize 之前取：大 body（>512KB）时
+  // normalizeAnthropicRequest 跳过 structuredClone、原地改写入参（body.model 被
+  // 映射成 deepseek 名，见 OOM 修复注释），这里再读 body.model 会拿到改后值 ——
+  // 大请求与小请求的响应 model 回显会分叉。快照对 <512KB 也一致（原样回显客户端模型名）。
+  const requestedModel = typeof body.model === 'string' ? body.model : undefined;
 
   const v = validateAnthropicRequest(body, cfg);
   if (!v.ok) {
@@ -2440,7 +2495,7 @@ async function handleMessagesPassThrough(
   // （返回空 content + stop_reason:null），OpenAI 端点才可用，见 DEEPSEEK-QUIRKS.md。
   const openAIReq = anthropicToOpenAIRequest(normalized as unknown as Parameters<typeof anthropicToOpenAIRequest>[0]);
   ctx.requestBytes = Buffer.byteLength(read.text);
-  ctx.model = typeof body.model === 'string' ? body.model : '';
+  ctx.model = requestedModel ?? '';
   ctx.upstreamModel = openAIReq.model;
   ctx.endpoint = openAIReq.model.endsWith('-free') ? 'payg' : 'subscription';
   ctx.stream = normalized.stream === true;
@@ -2514,7 +2569,6 @@ async function handleMessagesPassThrough(
     // 上游是 OpenAI 流：解析 chunk → 转成 Anthropic 事件序列（自带完整骨架）。
     // thinking 显式 disabled 时剥掉 thinking 块事件（Claude Code 会因多余 thinking 报错）。
     const keepThinking = (normalized.thinking as { type?: string } | undefined)?.type !== 'disabled';
-    const requestedModel = typeof body.model === 'string' ? body.model : undefined;
     // 上游在流中途插入脏数据（非 SSE 行/坏 JSON）时：中止流并发明确 error 事件，
     // 否则客户端只会看到一个「断流」的响应，报出通用的 Failed to parse JSON。
     // 行本身仍被 parseOpenAISSE 丢弃（不透传），这里只是让「断流」可解释。
@@ -2554,7 +2608,14 @@ async function handleMessagesPassThrough(
         upstream.touch();
         // 脏行检测放在写出**之前**：收到脏行时不再写给客户端后续事件。
         if (dirtySample !== null) break;
-        if (ev.type === 'message_delta' && ev.usage) ctx.outputTokens = ev.usage.output_tokens;
+        if (ev.type === 'message_delta' && ev.usage) {
+          ctx.outputTokens = ev.usage.output_tokens;
+          // 流式 input_tokens 恒 0 的修复：真实 prompt_tokens 由 toAnthropic 经
+          // message_delta.usage.input_tokens 传出（Anthropic 允许该字段），
+          // server 侧取用记账 —— 否则主流量（messages + stream）的 input 侧
+          // 用量账本失真，SCALE_CLIENT_TOKENS 缩放也永远作用不到 input 侧。
+          if (ev.usage.input_tokens != null) ctx.inputTokens = ev.usage.input_tokens;
+        }
         await writeChunk(res, anthropicEventToSSE(ev));
       }
       // 循环结束后再查一次：openAIStreamToAnthropic 会缓冲整个 text 块到流末尾
@@ -2568,7 +2629,11 @@ async function handleMessagesPassThrough(
     } catch (err) {
       const message = err instanceof Error ? err.message : 'passthrough stream error';
       console.error(`[proxy] passthrough stream error: ${stripControl(message)}`);
-      upstream.markFailure('transient');
+      // 客户端中途断开（res close → controller.abort）不是上游故障：取消流不能
+      // 上报 keypool，否则 Claude Code 停生成 5 次就把健康 key 禁 5 分钟。
+      if (!isClientAbort(controller, res)) {
+        upstream.markFailure('transient');
+      }
     } finally {
       upstream.release();
       res.end();
@@ -2578,14 +2643,19 @@ async function handleMessagesPassThrough(
 
   // 非流式：上游 OpenAI 响应 → Anthropic 响应。
   const data = (await upstream.response.json().catch(() => null)) as OpenAIChatResponse | null;
-  upstream.markSuccess();
   upstream.release();
   if (data === null) {
+    // 上游 200 但 body 非法（或 body 阶段被 idle watchdog 掐断）：记失败不记成功，
+    // 否则坏 key 永不降权、requests.error 恒空。客户端主动断开触发的 abort 除外。
+    if (!isClientAbort(controller, res)) {
+      upstream.markFailure('transient');
+      noteUpstreamError(ctx, 200, null);
+    }
     sendJson(res, 502, { error: { message: 'upstream returned malformed body', type: 'server_error' } });
     return;
   }
+  upstream.markSuccess();
   // 回显客户端请求的模型名（映射前的名字），而非上游实际模型。
-  const requestedModel = typeof body.model === 'string' ? body.model : undefined;
   // 实验性 usage 缩放（SCALE_CLIENT_TOKENS）：返回给客户端的用量失真。
   // 注意：下方 ctx 计数取的是缩放后值，真实用量由波 2 的 MetricsCtx 观测接管。
   const anthropicRes = openAIToAnthropicResponse(data, {
