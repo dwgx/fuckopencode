@@ -274,6 +274,14 @@ export async function* openAIStreamToAnthropic(
 
   // 解析缓冲的文本：DSML → tool_use 块；普通文本 → 补发 text 块。
   if (bufferedText) {
+    // 收尾时 thinking 块可能还开着：上游先吐 content 再吐 reasoning_content 时，
+    // content 已缓冲、随后 reasoning 开了 thinking 块，这里 text_delta 不能发进
+    // thinking 块（协议非法，Claude Code 报错/丢弃）。与循环内 234 行同逻辑：
+    // 非 text 块先 content_block_stop 再走下面的分支新开独立 text 块。
+    if (openTextBlock && openTextBlock.kind !== 'text') {
+      yield { type: 'content_block_stop', index: openTextBlock.index };
+      openTextBlock = null;
+    }
     const dsml = extractDsmlToolCalls(bufferedText);
     if (dsml) {
       // DSML 解析成功：残余文本先发 text 块，再逐个发 tool_use 块。
@@ -375,7 +383,14 @@ export async function* openAIStreamToAnthropic(
         : (openAIFinishReasonToAnthropic(finishReason) ?? 'end_turn'),
       stop_sequence: null,
     },
-    usage: { output_tokens: anthropicUsage.output_tokens },
+    // 真实 input_tokens（未缩放）经 message_delta 传给 server 记账：message_start
+    // 里恒 0，不放这里流式 input 用量就是 0。Anthropic 允许 message_delta.usage
+    // 带 input_tokens。output_tokens 走 scale（SCALE_CLIENT_TOKENS 是给客户端看
+    // 的失真值），input 侧保持真实 —— 否则实验开关污染网关自身记账。
+    usage: {
+      output_tokens: anthropicUsage.output_tokens,
+      input_tokens: openAIUsageToAnthropic(usage, undefined).input_tokens,
+    },
   };
   yield { type: 'message_stop' };
 }

@@ -199,6 +199,11 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
             },
           }),
         );
+      } else if (messagesJson.includes('malformed-body测试')) {
+        // 测试钩子：上游返回 200 + 非法 JSON（HTML 错误页形态）——
+        // 网关必须把这次 body 读失败记成失败（markFailure）而不是成功。
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('<html>502 Bad Gateway</html>');
       } else {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(
@@ -290,6 +295,14 @@ describe('v1 代理端到端', () => {
       },
       body: JSON.stringify(body),
     });
+  }
+
+  /** 读取池内唯一 key 的连续失败计数（/__metrics，池仅 1 把 key）。 */
+  async function poolFailCount(): Promise<number> {
+    const json = (await (await fetch(`${baseUrl}/__metrics`, { headers: { authorization: 'Bearer test-key' } })).json()) as {
+      pool: { keys: Array<{ fingerprint: string; failCount: number }> };
+    };
+    return json.pool.keys[0]!.failCount;
   }
 
   it('无 key 返回 401', async () => {
@@ -454,10 +467,12 @@ describe('v1 代理端到端', () => {
     expect(last.choices).toEqual([]);
   });
 
-  it('流式：上游流中途插入脏数据时中止，不再发 [DONE]', async () => {
+  it('流式：上游流中途插入脏数据时中止，发错误 chunk 并上报 keypool', async () => {
     // 回归：脏行过去被 parseOpenAISSE 静默丢弃、但 [DONE] 照发，客户端只会看到
-    // 一个「内容缺失但正常结束」的响应。现在收到脏行立即中止（不补 [DONE]），
-    // 让客户端明确知道流坏了。
+    // 一个「内容缺失但正常结束」的响应。现在收到脏行立即中止（不补 [DONE]）、
+    // 补发明确 error chunk 并上报 keypool —— 让客户端与面板都能看到流坏了
+    // （坏流 = 上游问题，与直通路径的行为一致，不能静默）。
+    const before = await poolFailCount();
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
@@ -471,12 +486,16 @@ describe('v1 代理端到端', () => {
     const text = await res.text();
     // 脏行后没有 [DONE]（收到脏行 → 立即 break，不补收尾）。
     expect(text).not.toContain('[DONE]');
+    // 新增：补发 OpenAI 形态的 error chunk，客户端不再看到无解释的断流。
+    expect(text).toContain('"error"');
     // 脏行前的正常 chunk 还在。
     expect(text).toContain('你');
     // 脏行的裸文本没有被透传。
     expect(text).not.toContain('Bad Gateway');
     // 脏行之后的 chunk（'好'）也不该出现（流已中止）。
     expect(text).not.toContain('好');
+    // 脏流记成 transient 失败（去掉修复这行会红：failCount 不变）。
+    expect(await poolFailCount()).toBe(before + 1);
   });
 
   it('流式：/v1/messages 直通路径收到脏数据时中止并发 error 事件', async () => {
@@ -550,6 +569,9 @@ describe('v1 代理端到端', () => {
     // 等上游第一个 chunk 经网关转回来（此时挂起流已建立）。
     await new Promise<void>((resolve) => res.once('data', () => resolve()));
     const entry = fake.hangEntries.at(-1)!;
+    // 客户端取消（Claude Code 停生成是常态）不应上报 keypool：5 次取消把健康
+    // key 禁 5 分钟是误伤。记录断开前的 failCount，断开后必须原样。
+    const before = await poolFailCount();
     // 客户端中途掐断连接。
     res.destroy();
     // 网关应在 3 秒内中止上游请求：上游连接未正常 end 就 close。
@@ -558,6 +580,103 @@ describe('v1 代理端到端', () => {
       await new Promise((r) => setTimeout(r, 50));
     }
     expect(entry.closed).toBe(true);
+    // 给网关的 catch/finally 留出执行时间，再核对 failCount 未被这次取消改动
+    // （去掉 isClientAbort 守卫这行会红：取消被记成 transient 失败）。
+    await new Promise((r) => setTimeout(r, 150));
+    expect(await poolFailCount()).toBe(before);
+  });
+});
+
+describe('非流式上游 body 非法（第 1 项回归）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  const malCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['test-key'],
+    anthropicApiKey: 'sk-ant-fake',
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    malCfg.anthropicBaseUrl = fake.baseUrl;
+    proxy = createApp(malCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  async function failCount(): Promise<number> {
+    const json = (await (await fetch(`${baseUrl}/__metrics`, { headers: { authorization: 'Bearer test-key' } })).json()) as {
+      pool: { keys: Array<{ fingerprint: string; failCount: number }> };
+    };
+    return json.pool.keys[0]!.failCount;
+  }
+
+  it('chat 路径：上游 200 + 非法 body 记失败不记成功', async () => {
+    // 回归：body 读失败（json() 拒绝）曾无条件 markSuccess —— 坏 key 永不降权、
+    // requests.error 恒空。现在 data===null 必须先 markFailure('transient') 再 502。
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'malformed-body测试' }] }),
+    });
+    expect(res.status).toBe(502);
+    expect(await failCount()).toBe(1);
+  });
+
+  it('/v1/messages 直通路径：上游 200 + 非法 body 记失败不记成功', async () => {
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        stream: false,
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'malformed-body测试' }],
+      }),
+    });
+    expect(res.status).toBe(502);
+    expect(await failCount()).toBe(2);
   });
 });
 
@@ -1089,6 +1208,116 @@ describe('观测计数接线（真实请求 -> /__metrics summary）', () => {
       compactTriggerBytes: 256,
       compactMaxMessageChars: 8,
     });
+  });
+
+  it('流式直通：真实 input_tokens 经 message_delta 进 ctx（不再恒 0）', async () => {
+    // 回归：直通流式路径 input_tokens 恒 0（message_start 硬编码 0、message_delta
+    // 只带 output_tokens）—— 用量账本失真。fake 上游的 usage chunk 是
+    // prompt_tokens=5 / completion_tokens=2，流式收尾应把 5 记进 ctx。
+    const res = await postMessages({ stream: true, messages: [{ role: 'user', content: '流式记账测试' }] });
+    expect(res.status).toBe(200);
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    const json = (await (await fetch(`${baseUrl}/__metrics`)).json()) as {
+      events: Array<{ path: string; stream: boolean; inputTokens: number; outputTokens: number }>;
+    };
+    const ev = json.events[0]!;
+    expect(ev.path).toBe('/v1/messages');
+    expect(ev.stream).toBe(true);
+    expect(ev.inputTokens).toBe(5);
+    expect(ev.outputTokens).toBe(2);
+  });
+});
+
+describe('大 body（>512KB 跳过克隆）：不污染入参的模型名（第 4 项回归）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  // maxMessageChars 抬高到 1.5M：请求体要 >512KB 才能触发 OOM 修复的「跳过
+  // structuredClone、原地归一化」分支，而单测默认 200K 会先被 validate 拦下。
+  const bigCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['test-key'],
+    anthropicApiKey: 'sk-ant-fake',
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 8 * 1024 * 1024,
+    maxMessageChars: 1_500_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    bigCfg.anthropicBaseUrl = fake.baseUrl;
+    proxy = createApp(bigCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  // claude-sonnet-4-6 不在白名单 → 会映射成 fallback deepseek-v4-flash。
+  const BIG = { model: 'claude-sonnet-4-6', max_tokens: 16 };
+
+  it('非流式：>512KB 请求响应回显客户端模型名（不是被映射的名字）', async () => {
+    const bigText = 'x'.repeat(700 * 1024);
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ ...BIG, messages: [{ role: 'user', content: bigText }] }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { model: string };
+    // 回显客户端请求的模型名（快照），而非 normalize 原地改写后的映射名。
+    expect(json.model).toBe('claude-sonnet-4-6');
+    // 映射逻辑没被跳过：上游确实收到 deepseek 名。
+    expect(fake.received.at(-1)!.model).toBe('deepseek-v4-flash');
+  });
+
+  it('流式：>512KB 请求 message_start.model 回显客户端模型名', async () => {
+    const bigText = 'x'.repeat(700 * 1024);
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ ...BIG, stream: true, messages: [{ role: 'user', content: bigText }] }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"model":"claude-sonnet-4-6"');
+    expect(fake.received.at(-1)!.model).toBe('deepseek-v4-flash');
   });
 });
 
@@ -4780,6 +5009,29 @@ describe('上游 key 泄漏防护（M1）', () => {
     expect(new Set([lastTwo[0]!.auth, lastTwo[1]!.auth])).toEqual(
       new Set(['Bearer sk-leak-1', 'Bearer sk-leak-2']),
     );
+  });
+
+  it('/v1/chat/completions 换 key 重试：第二个 key 的失败也上报 keypool', async () => {
+    // 回归：换 key 重试里第二个 key 的失败从不 markFailure —— key B 持续失败时
+    // 每个请求都白撞 B 一次再 503，B 永远 healthy、永不降权。直通路径有 markFailure，
+    // chat 路径没有。这里断言两把 key 的 failCount 各 +1（delta 方式，不依赖顺序）。
+    const failCounts = async (): Promise<Map<string, number>> => {
+      const json = (await (await fetch(`${baseUrl}/__metrics`, { headers: { authorization: 'Bearer test-key' } })).json()) as {
+        pool: { keys: Array<{ fingerprint: string; failCount: number }> };
+      };
+      return new Map(json.pool.keys.map((k) => [k.fingerprint, k.failCount]));
+    };
+    const before = await failCounts();
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'key泄漏测试' }] }),
+    });
+    expect(res.status).toBe(500);
+    const after = await failCounts();
+    const deltas = [...after.entries()].map(([fp, n]) => n - (before.get(fp) ?? 0));
+    // 首 key + 换出的第二个 key 各撞一次 500，失败都应上报（去掉修复：只有一把 +1）。
+    expect(deltas.filter((d) => d === 1)).toHaveLength(2);
   });
 
   it('/v1/messages 直通路径：透传的错误体同样脱敏', async () => {

@@ -386,7 +386,36 @@ describe('openAIStreamToAnthropic', () => {
     const delta = events.find(
       (e): e is Extract<AnthropicStreamEvent, { type: 'message_delta' }> => e.type === 'message_delta',
     )!;
-    expect(delta.usage).toEqual({ output_tokens: 9 });
+    // input_tokens 恒 0 修复：真实 prompt_tokens 经 message_delta.usage.input_tokens
+    // 传给 server 记账（message_start 里恒 0，不放这里流式 input 用量就是 0）。
+    expect(delta.usage).toEqual({ output_tokens: 9, input_tokens: 5 });
+  });
+
+  it('content 先于 reasoning_content 时，收尾文本不发进 thinking 块', async () => {
+    // 回归：上游先 content 后 reasoning_content 时，收尾段曾把缓冲文本以
+    // text_delta 发进仍开着的 thinking 块（协议非法，Claude Code 报错/丢弃）。
+    const events = await collect(
+      openAIStreamToAnthropic(
+        chunks([chunk({ content: '答' }), chunk({ reasoning_content: '想' }), chunk({}, 'stop')]),
+      ),
+    );
+    const starts = events.filter(
+      (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_start' }> => e.type === 'content_block_start',
+    );
+    // thinking 块先开，text 块单独新开（收尾先闭合 thinking）。
+    expect(starts).toHaveLength(2);
+    expect(starts[0]!.content_block.type).toBe('thinking');
+    expect(starts[1]!.content_block.type).toBe('text');
+    // 文本 text_delta 必须落在 text 块 index 上，绝不能落进 thinking 块。
+    const textDelta = events.find(
+      (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_delta' }> =>
+        e.type === 'content_block_delta' && 'text' in e.delta,
+    )!;
+    expect(textDelta.index).toBe(starts[1]!.index);
+    expect(textDelta.delta).toEqual({ type: 'text_delta', text: '答' });
+    // 所有块都有闭合（没有泄漏未闭合的 thinking 块）。
+    const stops = events.filter((e) => e.type === 'content_block_stop');
+    expect(stops.map((s) => s.index).sort((a, b) => a - b)).toEqual([0, 1]);
   });
 
   it('空流也补出自洽骨架，不让客户端挂死', async () => {
@@ -685,6 +714,11 @@ describe('openAIUsageToAnthropic 缩放（实验性 SCALE_CLIENT_TOKENS）', () 
       ),
     );
     const delta = events.find((e) => e.type === 'message_delta');
-    expect(delta?.type === 'message_delta' && delta.usage).toEqual({ output_tokens: Math.round(1000 * 0.6657) });
+    // output_tokens 走 scale（给客户端看的失真值）；input_tokens 保持真实未缩放
+    // （SCALE_CLIENT_TOKENS 不能污染网关自身的记账）。
+    expect(delta?.type === 'message_delta' && delta.usage).toEqual({
+      output_tokens: Math.round(1000 * 0.6657),
+      input_tokens: 255000,
+    });
   });
 });
