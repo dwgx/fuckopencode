@@ -70,6 +70,25 @@ describe('面板关键渲染入口没有被误删', () => {
   });
 });
 
+describe('面板渲染修复钉住（本轮 bug 回归防线）', () => {
+  it('sparkline 全等数据不画线（否则 1px 平线会被合成器拉伸成全宽蓝条残影）', () => {
+    const code = inlineScript();
+    expect(code).toMatch(/if \(max === min\) \{ el\.innerHTML = ''; return; \}/);
+  });
+
+  it('key 卡昵称优先 + 指纹小字（/__metrics pool.keys 的 nickname）', () => {
+    const code = inlineScript();
+    expect(code).toContain('esc(k.nickname || k.fingerprint)');
+    expect(code).toContain('fp-sub');
+  });
+
+  it('最近状态变更只渲染前 6 条（20 条刷屏无人读）', () => {
+    const code = inlineScript();
+    expect(code).toContain('evs.slice(0, 6)');
+    expect(code).toMatch(/var recent = evs\.slice\(0, 6\);/);
+  });
+});
+
 describe('i18n 词条 en/zh 对齐', () => {
   /**
    * 缺词条不会报错，只会在界面上显示成 key 名（`T()` 回退到原字符串），
@@ -174,6 +193,40 @@ describe('耗时格式化', () => {
       expect(ms(v)).not.toContain('NaN');
     }
     expect(ms(0)).toBe('0ms');
+  });
+});
+
+describe('倒计时格式化 hms()', () => {
+  function loadHms(): (n: unknown) => string {
+    const m = inlineScript().match(/var hms = function[\s\S]*?\n {2}\};/);
+    if (!m) throw new Error('内联 JS 里找不到 hms() 定义');
+    // eslint-disable-next-line no-new-func
+    return new Function(m[0] + '; return hms;')() as (n: unknown) => string;
+  }
+
+  it('字段缺失不渲染成 NaNs', () => {
+    const hms = loadHms();
+    // Math.max(0, undefined) 是 NaN，会一路渲染成「NaNs」摆到面板上。
+    for (const v of [NaN, undefined, null, 'x', {}]) {
+      expect(hms(v)).not.toContain('NaN');
+    }
+    expect(hms(NaN)).toBe('0s');
+    expect(hms(undefined)).toBe('0s');
+  });
+
+  it('超过一天用天表示（30 天冷却不该显示 720h）', () => {
+    const hms = loadHms();
+    expect(hms(30 * 86400_000)).toBe('30d00h00m');
+    expect(hms(3 * 86400_000)).toBe('3d00h00m');
+    expect(hms(30 * 86400_000)).not.toMatch(/^\d{3,}h/);
+  });
+
+  it('常规区间不受影响', () => {
+    const hms = loadHms();
+    expect(hms(0)).toBe('0s');
+    expect(hms(-5)).toBe('0s');
+    expect(hms(60_000)).toBe('1m00s');
+    expect(hms(3_600_000)).toBe('1h00m00s');
   });
 });
 

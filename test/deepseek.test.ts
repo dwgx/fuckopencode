@@ -5,10 +5,9 @@ import {
   filterThinkingFromStream,
   DEFAULT_FALLBACK_MODEL,
   ALLOWED_MODELS,
-  MODEL_ALIASES,
-  MODEL_ALIAS_REVERSE,
   resolveUpstreamBaseUrl,
 } from '../src/deepseek.js';
+import { compactMessages } from '../src/compact.js';
 import type { AnthropicStreamEvent } from '../src/types.js';
 
 const EMPTY_MAP: Record<string, string> = {};
@@ -335,10 +334,17 @@ describe('filterThinkingFromStream', () => {
   });
 });
 
-describe('对外模型别名', () => {
-  it('别名映射到对应的真实模型', () => {
+describe('对外模型别名（配置化后走 modelMap）', () => {
+  it('别名配置进 modelMap 后映射到真实模型', () => {
+    const map = { 'claude-mythos-5': 'deepseek-v4-flash', 'claude-fable-5': 'deepseek-v4-flash' };
+    expect(resolveModelName('claude-mythos-5', map, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    expect(resolveModelName('claude-fable-5', map, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+  });
+
+  it('别名未配置（db 无映射）时回落 fallback，语义与旧内置一致', () => {
+    // seed 前/用户删除映射后：别名按普通未知模型处理，落到 fallback（flash）。
     expect(resolveModelName('claude-mythos-5', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
-    expect(resolveModelName('claude-fable-5', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash-free');
+    expect(resolveModelName('claude-fable-5', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
   });
 
   it('真名照样可用，别名不影响', () => {
@@ -346,25 +352,134 @@ describe('对外模型别名', () => {
     expect(resolveModelName('deepseek-v4-flash-free', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash-free');
   });
 
-  it('别名不与真实 Anthropic 模型重名 —— 否则 Claude Code 的默认模型会被误判', () => {
+  it('未配置的别名不与真实 Anthropic 模型重名 —— 否则 Claude Code 的默认模型会被误判', () => {
     const real = ['claude-opus-5', 'claude-sonnet-5', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-8'];
     for (const r of real) {
-      expect(Object.keys(MODEL_ALIASES)).not.toContain(r);
-      // 这些真名应走回落，而不是被当成别名解析。
+      // 空 modelMap 下这些真名只能走回落，不会被当成别名解析。
       expect(resolveModelName(r, {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
     }
   });
 
-  it('反向表可由真名查回别名', () => {
-    expect(MODEL_ALIAS_REVERSE['deepseek-v4-flash']).toBe('claude-mythos-5');
-    expect(MODEL_ALIAS_REVERSE['deepseek-v4-flash-free']).toBe('claude-fable-5');
+  it('别名映射的目标走订阅端点（与真名一致）', () => {
+    const SUB = 'https://opencode.ai/zen/go', PAYG = 'https://opencode.ai/zen';
+    const mythos = resolveModelName('claude-mythos-5', { 'claude-mythos-5': 'deepseek-v4-flash' }, 'deepseek-v4-flash');
+    const fable = resolveModelName('claude-fable-5', { 'claude-fable-5': 'deepseek-v4-flash' }, 'deepseek-v4-flash');
+    expect(resolveUpstreamBaseUrl(mythos, SUB, PAYG)).toBe(SUB);
+    expect(resolveUpstreamBaseUrl(fable, SUB, PAYG)).toBe(SUB);
+  });
+});
+
+describe('normalizeAnthropicRequest 被动压缩（实验性 COMPACT_ENABLED）', () => {
+  const COMPACT = (bodyBytes: number, maxMessageChars = 8000) => ({
+    bodyBytes,
+    triggerBytes: 4 * 1024 * 1024,
+    maxMessageChars,
   });
 
-  it('别名走的端点与真名一致（free 别名走按量）', () => {
-    const SUB = 'https://opencode.ai/zen/go', PAYG = 'https://opencode.ai/zen';
-    const mythos = resolveModelName('claude-mythos-5', {}, 'deepseek-v4-flash');
-    const fable = resolveModelName('claude-fable-5', {}, 'deepseek-v4-flash');
-    expect(resolveUpstreamBaseUrl(mythos, SUB, PAYG)).toBe(SUB);
-    expect(resolveUpstreamBaseUrl(fable, SUB, PAYG)).toBe(PAYG);
+  it('不传 compact 参数：完全不做压缩（默认路径）', () => {
+    const input = {
+      model: 'm',
+      messages: [
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'a   b\n\n  c' }] },
+      ],
+    };
+    const out = normalizeAnthropicRequest(input, EMPTY_MAP, DEFAULT_FALLBACK_MODEL);
+    const content = (out.messages as { content: { content: string }[] }[])[0]!.content[0]!;
+    expect(content.content).toBe('a   b\n\n  c');
+  });
+
+  it('未超阈值不触发压缩', () => {
+    const input = {
+      model: 'm',
+      messages: [
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'a   b' }] },
+      ],
+    };
+    const out = normalizeAnthropicRequest(input, EMPTY_MAP, DEFAULT_FALLBACK_MODEL, COMPACT(1024));
+    const content = (out.messages as { content: { content: string }[] }[])[0]!.content[0]!;
+    expect(content.content).toBe('a   b');
+  });
+
+  it('超阈值：tool_result 文本空白折叠 + 超长截断（省略标记）', () => {
+    const input = {
+      model: 'm',
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 't1', content: `a   b\n\n  c ${'word '.repeat(3000)}` }],
+        },
+      ],
+    };
+    const out = normalizeAnthropicRequest(
+      input,
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+      COMPACT(5 * 1024 * 1024, 100),
+    );
+    const content = (out.messages as { content: { content: string }[] }[])[0]!.content[0]!.content;
+    // 折叠后为 'a b c ' + 'word '.repeat(3000)；截断取前 100 字符 + 省略标记。
+    const collapsed = `a b c ${'word '.repeat(3000)}`;
+    expect(content).toBe(collapsed.slice(0, 100) + '…[truncated]');
+  });
+
+  it('text 块同样折叠截断，字符串 content 消息也处理', () => {
+    const input = {
+      model: 'm',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'x  y  z' }] },
+        { role: 'assistant', content: '  a   b  ' },
+      ],
+    };
+    const out = normalizeAnthropicRequest(input, EMPTY_MAP, DEFAULT_FALLBACK_MODEL, COMPACT(5 * 1024 * 1024));
+    const messages = out.messages as { role: string; content: { type: string; text: string }[] }[];
+    expect(messages[0]!.content[0]).toEqual({ type: 'text', text: 'x y z' });
+    // assistant 消息会被注入空 thinking 块（第 7 步），折叠后的 text 在其后。
+    expect(messages[1]!.content[1]).toEqual({ type: 'text', text: ' a b ' });
+  });
+
+  it('不碰结构：thinking/image/tool_use 块与工具定义原样', () => {
+    const input = {
+      model: 'm',
+      thinking: { type: 'enabled' },
+      tools: [{ name: 'ls', input_schema: { type: 'object' } }],
+      messages: [
+        { role: 'user', content: 'q  u' },
+        { role: 'assistant', content: [
+          { type: 'thinking', thinking: 'step   one', signature: 'sig' },
+          { type: 'text', text: 'ok' },
+          { type: 'tool_use', id: 't1', name: 'ls', input: { path: 'a  b' } },
+        ] },
+        { role: 'user', content: [
+          { type: 'tool_result', tool_use_id: 't1', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA  BBBB' } }] },
+        ] },
+      ],
+    };
+    const out = normalizeAnthropicRequest(input, EMPTY_MAP, DEFAULT_FALLBACK_MODEL, COMPACT(5 * 1024 * 1024));
+    const messages = out.messages as { role: string; content: Record<string, unknown>[] }[];
+    // thinking 块文本不动
+    expect(messages[1]!.content[0]).toEqual({ type: 'thinking', thinking: 'step   one', signature: 'sig' });
+    // tool_use 的 input JSON 不动
+    expect(messages[1]!.content[2]).toEqual({ type: 'tool_use', id: 't1', name: 'ls', input: { path: 'a  b' } });
+    // tool_result 内的 image 块不动
+    expect(messages[2]!.content[0]).toEqual({
+      type: 'tool_result',
+      tool_use_id: 't1',
+      content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA  BBBB' } }],
+    });
+    // 工具定义不动
+    expect(out.tools).toEqual([{ name: 'ls', input_schema: { type: 'object' } }]);
+    // 压缩后其他字段不受影响（模型映射照常）
+    expect(out.model).toBe('deepseek-v4-flash');
+  });
+
+  it('compactMessages 直接调用：返回 compressed 标志，短文本不折叠不截断', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'hello world' }] },
+    ] as unknown[];
+    const r1 = compactMessages(messages, 8000);
+    expect(r1.compressed).toBe(false);
+    const r2 = compactMessages([{ role: 'user', content: 'a  b' }] as unknown[], 8000);
+    expect(r2.compressed).toBe(true);
+    expect(r2.messages[0]).toEqual({ role: 'user', content: 'a b' });
   });
 });

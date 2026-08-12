@@ -29,18 +29,28 @@ export function openAIFinishReasonToAnthropic(
   }
 }
 
-/** OpenAI usage → Anthropic usage。 */
-export function openAIUsageToAnthropic(usage: OpenAIChatResponse['usage'] | undefined): AnthropicUsage {
+/**
+ * OpenAI usage → Anthropic usage。
+ *
+ * `scale`（实验性 SCALE_CLIENT_TOKENS）传入时对 input/output/cache/thinking
+ * 统一缩放（Math.round）—— 返回给客户端的用量是失真值，用于诱导 Claude Code
+ * 按「假用量」提前本地 compact；真实用量以网关侧 MetricsCtx 计数为准。
+ */
+export function openAIUsageToAnthropic(
+  usage: OpenAIChatResponse['usage'] | undefined,
+  scale?: number,
+): AnthropicUsage {
   const prompt = usage?.prompt_tokens ?? 0;
   const cached = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+  const apply = (n: number): number => (scale != null ? Math.round(n * scale) : n);
   const out: AnthropicUsage = {
     // Anthropic 的 input_tokens 是「非缓存」部分，缓存单列。
-    input_tokens: Math.max(0, prompt - cached),
-    output_tokens: usage?.completion_tokens ?? 0,
+    input_tokens: apply(Math.max(0, prompt - cached)),
+    output_tokens: apply(usage?.completion_tokens ?? 0),
   };
-  if (cached > 0) out.cache_read_input_tokens = cached;
+  if (cached > 0) out.cache_read_input_tokens = apply(cached);
   const reasoning = usage?.completion_tokens_details?.reasoning_tokens;
-  if (reasoning != null) out.output_tokens_details = { thinking_tokens: reasoning };
+  if (reasoning != null) out.output_tokens_details = { thinking_tokens: apply(reasoning) };
   return out;
 }
 
@@ -54,7 +64,7 @@ export function openAIUsageToAnthropic(usage: OpenAIChatResponse['usage'] | unde
  */
 export function openAIToAnthropicResponse(
   res: OpenAIChatResponse,
-  options: { model?: string; id?: string } = {},
+  options: { model?: string; id?: string; scale?: number } = {},
 ): AnthropicResponse {
   const choice = res.choices?.[0];
   const message = choice?.message;
@@ -109,7 +119,7 @@ export function openAIToAnthropicResponse(
     content,
     stop_reason: recoveredToolUse ? 'tool_use' : openAIFinishReasonToAnthropic(choice?.finish_reason),
     stop_sequence: null,
-    usage: openAIUsageToAnthropic(res.usage),
+    usage: openAIUsageToAnthropic(res.usage, options.scale),
   };
 }
 
@@ -131,7 +141,7 @@ interface BlockState {
  */
 export async function* openAIStreamToAnthropic(
   chunks: AsyncIterable<OpenAIStreamChunk>,
-  options: { model?: string; id?: string } = {},
+  options: { model?: string; id?: string; scale?: number } = {},
 ): AsyncGenerator<AnthropicStreamEvent> {
   let started = false;
   let nextIndex = 0;
@@ -180,6 +190,12 @@ export async function* openAIStreamToAnthropic(
   };
 
   for await (const chunk of chunks) {
+    // 上游错误体（OpenAI `{error:{...}}`）混进流：转换器产不出有效的事件序列，
+    // 直接中止流，由 server 层 catch 后发 error 事件。异常消息不带上游内容
+    // （错误文案可能回显 Authorization 头，拼进来 key 会随日志泄漏）。
+    if (chunk.error != null) {
+      throw new Error('upstream returned error chunk in stream');
+    }
     if (!messageId && chunk.id) messageId = chunk.id;
     if (!model && chunk.model) model = chunk.model;
     if (chunk.usage) usage = chunk.usage;
@@ -350,7 +366,7 @@ export async function* openAIStreamToAnthropic(
     yield { type: 'content_block_stop', index: block.index };
   }
 
-  const anthropicUsage = openAIUsageToAnthropic(usage);
+  const anthropicUsage = openAIUsageToAnthropic(usage, options.scale);
   yield {
     type: 'message_delta',
     delta: {

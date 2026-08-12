@@ -3,9 +3,56 @@ export interface OpenAIApiError {
   body: { error: { message: string; type: string; code?: string } };
 }
 
+/** 账户级状态枚举（多账号面板徽标用）。由探针结果写入，见 MULTI-ACCOUNT.md §4.1。 */
+export type AccountStatus =
+  | 'unknown'
+  | 'ok'
+  | 'invalid'
+  | 'insufficient'
+  | 'limit'
+  | 'cooldown'
+  | 'region'
+  | 'error';
+
+// ─── classifyAccountError 的重试常量（MULTI-ACCOUNT.md §4.2 表） ───────────
+/** 探针重试下限：15 分钟 = 一个探针 tick 粒度（§4.5 失败重试节奏）。 */
+const ACCOUNT_RETRY_FLOOR_MS = 15 * 60_000;
+/** 周/月额度解析不出重置时间时的兜底：24 小时。 */
+const ACCOUNT_RESET_FALLBACK_24H_MS = 24 * 3_600_000;
+/** 日额度（Go）解析不出重置时间时的兜底：1 小时，与 keypool 的 quota 兜底同源。 */
+const ACCOUNT_RESET_FALLBACK_1H_MS = 3_600_000;
+/** 上游重置时间 + 60s 余量，与 keypool.markFailure 的 quota 分支同口径。 */
+const ACCOUNT_RESET_MARGIN_MS = 60_000;
+/** 区域限制的冷却：24 小时（区域解禁以天计）。 */
+const ACCOUNT_REGION_COOLDOWN_MS = ACCOUNT_RESET_FALLBACK_24H_MS;
+
+/**
+ * 上游重置时间的解析上限：30 天。上游可信但单点无防御 —— 恶意/异常错误消息里的
+ * 超大数字（实测 "Resets in 999999999999 hours" → 3.6e18 ms）会把 keypool 的
+ * disabledUntil 推到 11 万年后、账户 retry_until 溢出超过 MAX_SAFE_INTEGER。
+ * 30 天够覆盖所有已知限额窗口（Go 订阅月限额 30 天）+ 余量，超出按上限算。
+ */
+export const RESET_CLAMP_MS = 30 * 86_400_000;
+
 /** 去掉可能造成日志伪造/终端注入的控制符。 */
 export function stripControl(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/g, '');
+}
+
+/**
+ * 对可能回显凭证的上游错误原文做脱敏，防 key 落日志/数据库/面板。
+ *
+ * 上游错误体可能把请求头原样回显（实测形态：Authorization 头里的
+ * `Bearer sk-xxx` 被包进 error.message 返回），key 一旦落库就会显示在
+ * 面板上。覆盖三种形态：OpenAI 风格 sk- 前缀、Bearer 头、auth=Fe26.
+ * 签名 token（Dwolla 风格，实测形态 `auth=Fe26.2**<签名>`，`**` 是 token
+ * 内嵌分隔符，字符类必须含 `*`，否则签名段会漏出去）。
+ */
+export function stripSecrets(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9_.-]+/g, 'Bearer ***')
+    .replace(/\bsk-[A-Za-z0-9_-]+/g, 'sk-***')
+    .replace(/\bauth=Fe26\.[A-Za-z0-9_*.=-]+/g, 'auth=***');
 }
 
 /** 内部错误的固定响应文案：只进日志，绝不向调用方回显内部异常/配置细节。 */
@@ -39,6 +86,11 @@ export function anthropicErrorToOpenAI(status: number, body: unknown): OpenAIApi
     const err = (body as { error?: { type?: string; message?: string } }).error;
     if (err) {
       if (typeof err.message === 'string' && err.message) message = err.message;
+      // 上下文超限改写（对 Claude Code 兼容）：chat 路径也把 DeepSeek 措辞
+      // 改写成 "prompt is too long" 前缀——CC 的自动恢复链只认这个措辞。
+      if (/maximum context length|context_length_exceeded|context length is/i.test(message)) {
+        message = `prompt is too long: ${message}`;
+      }
       if (typeof err.type === 'string' && err.type) type = TYPE_MAP[err.type] ?? err.type;
       code = err.type;
     }
@@ -48,7 +100,9 @@ export function anthropicErrorToOpenAI(status: number, body: unknown): OpenAIApi
     status,
     body: {
       error: {
-        message: stripControl(message),
+        // 上游错误消息可能回显 Authorization 头（Bearer sk-xxx），回给客户端
+        // 前先脱敏（stripControl 只剥控制符，剥不掉 key 明文）。
+        message: stripSecrets(stripControl(message)),
         type,
         ...(code ? { code } : {}),
       },
@@ -66,7 +120,9 @@ export function resetDelayFrom(body: unknown): number | null {
   const n = Number(m[1]);
   if (!Number.isFinite(n) || n < 0) return null;
   const unit = m[2]!.toLowerCase();
-  return unit.startsWith('h') ? n * 3_600_000 : n * 60_000;
+  return unit.startsWith('h')
+    ? Math.min(n * 3_600_000, RESET_CLAMP_MS)
+    : Math.min(n * 60_000, RESET_CLAMP_MS);
 }
 
 /**
@@ -114,7 +170,8 @@ export function parseResetDelayMs(message: string): number | null {
   if (min) { ms += Number(min[1]) * 60_000; hit = true; }
   const d = /(\d+)\s*day/i.exec(span);
   if (d) { ms += Number(d[1]) * 86_400_000; hit = true; }
-  return hit ? ms : null;
+  // clamp：超大数字见 RESET_CLAMP_MS 注释，不能照单全收。
+  return hit ? Math.min(ms, RESET_CLAMP_MS) : null;
 }
 
 /** 从上游错误体提取 error.type（兼容 Anthropic `{error:{type}}` 与 OpenAI `{error:{type}}`）。 */
@@ -146,6 +203,9 @@ export function classifyUpstreamFailure(
   // "message":"Weekly usage limit reached. Resets in 19hr 22min."}
   const quotaSignals =
     errorType === 'GoUsageLimitError' ||
+    errorType === 'MonthlyLimitError' ||
+    errorType === 'UserLimitError' ||
+    errorType === 'BlackUsageLimitError' ||
     /usage[_ ]?limit|quota[_ ]?exceeded|quota[_ ]?reached|out[_ ]of[_ ]credits/i.test(errorType ?? '') ||
     /usage limit reached|quota exceeded|insufficient (?:balance|credit)/i.test(errorMessage);
   if (quotaSignals) return 'quota-exhausted';
@@ -164,8 +224,91 @@ export function classifyUpstreamFailure(
   }
 
   if (status === 401 || status === 403) {
-    return errorType === 'authentication_error' ? 'auth' : 'rate-limit';
+    // AuthError 与 authentication_error 同义（订阅端点实测形态），两种都要
+    // 判 auth，否则 AuthError 会落进 rate-limit 短冷却（3s），死 key 每个
+    // 请求先 401 一次再换号。与 classifyAccountError 的 auth 分支同口径。
+    return errorType === 'authentication_error' || errorType === 'AuthError' ? 'auth' : 'rate-limit';
   }
 
   return 'transient';
+}
+
+/**
+ * 账户级错误分流（探针结论），返回账户状态 + 距下次探针的时间。
+ *
+ * 与 [`classifyUpstreamFailure`] 共用同一个错误体解析，两张分类表必须一致
+ * （MULTI-ACCOUNT.md §4.2，测试钉住）：同一 error.type 不能一边判长冷却、
+ * 一边判短冷却。唯一的刻意偏差是 RegionError —— pool 只有 4 种 kind，
+ * 区域错误由账户徽标承担展示（§8 取舍）。
+ *
+ * @param cooldownMs key 池基础冷却（keyCooldownMs），凭据无效用其 12 倍。
+ */
+export function classifyAccountError(
+  status: number,
+  body: unknown,
+  cooldownMs: number,
+): { status: AccountStatus; retryMs: number } {
+  const errorType = extractUpstreamErrorType(body);
+  const resetMs = parseResetDelayMs(extractUpstreamErrorMessage(body));
+  const resetOr = (fallback: number) => (resetMs != null && resetMs > 0 ? resetMs : fallback);
+
+  // 凭据无效：与 pool 的 auth 分支同口径（12 × cooldownMs，之后自动恢复）。
+  if (
+    (status === 401 || status === 403) &&
+    (errorType === 'AuthError' || errorType === 'authentication_error')
+  ) {
+    return { status: 'invalid', retryMs: cooldownMs * 12 };
+  }
+
+  // 余额不足：充值即恢复，15 分钟重探。
+  if (
+    errorType === 'CreditsError' ||
+    errorType === 'billing_error' ||
+    errorType === 'insufficient_balance'
+  ) {
+    return { status: 'insufficient', retryMs: ACCOUNT_RETRY_FLOOR_MS };
+  }
+
+  // 周/月配额：按上游重置时间，解析不出 24 小时兜底。
+  if (errorType === 'MonthlyLimitError' || errorType === 'UserLimitError') {
+    return { status: 'limit', retryMs: resetOr(ACCOUNT_RESET_FALLBACK_24H_MS) };
+  }
+
+  // 日额度：重置 + 60s 余量；Go 兜底 1 小时、Black 兜底 24 小时。
+  if (errorType === 'GoUsageLimitError') {
+    return {
+      status: 'cooldown',
+      retryMs: resetOr(ACCOUNT_RESET_FALLBACK_1H_MS) + ACCOUNT_RESET_MARGIN_MS,
+    };
+  }
+  if (errorType === 'BlackUsageLimitError') {
+    return {
+      status: 'cooldown',
+      retryMs: resetOr(ACCOUNT_RESET_FALLBACK_24H_MS) + ACCOUNT_RESET_MARGIN_MS,
+    };
+  }
+
+  // free 模型 IP 日窗限流（实测形态：429 + FreeUsageLimitError，200 请求/天
+  // 按 IP 计、UTC 零点重置）：换 key 没用（IP 维度）——冷却到 UTC 零点，
+  // 避免「1h 冷却 → 重试还 429 → 又 1h」的循环（VPS IP 被限时全池 503）。
+  // 时长 = 到 UTC 零点的毫秒数（最少 1h，最多 24h）。
+  if (errorType === 'FreeUsageLimitError') {
+    const now = Date.now();
+    const utcMidnight = Math.ceil(now / 86_400_000) * 86_400_000;
+    return { status: 'cooldown', retryMs: Math.max(3600_000, utcMidnight - now) + ACCOUNT_RESET_MARGIN_MS };
+  }
+
+  // 区域限制：24 小时。必须在「裸 429」判定之前 —— RegionError 常以 429/403 形态出现，
+  // 按 error.type 精确分流（§4.2 表），不能落进裸 429 的短重试。
+  if (errorType === 'RegionError') {
+    return { status: 'region', retryMs: ACCOUNT_REGION_COOLDOWN_MS };
+  }
+
+  // 限流：15 分钟重探（探针节流下限，见 §4.5）。
+  if (status === 429 || errorType === 'RateLimitError') {
+    return { status: 'cooldown', retryMs: ACCOUNT_RETRY_FLOOR_MS };
+  }
+
+  // 其他 / 网络层失败：15 分钟重探。
+  return { status: 'error', retryMs: ACCOUNT_RETRY_FLOOR_MS };
 }

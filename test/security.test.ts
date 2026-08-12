@@ -26,15 +26,28 @@ const cfg: AppConfig = {
   allowUnauthenticated: false,
   maxBodyBytes: 10 * 1024 * 1024,
   maxMessageChars: 200_000,
+  maxMessages: 4_000,
   stripControlChars: true,
   trustClaudeCodeHeaders: false,
   dashboardOpen: false,
   dashboardPublic: false,
   usageDbPath: '',  // 单测不落盘
   usageDbRetentionDays: 30,
-    keyProbeIntervalMs: 0,
-    keyProbeIdleMs: 1_800_000,
-    keyProbeTimeoutMs: 5_000,
+  keyProbeIntervalMs: 0,
+  keyProbeIdleMs: 1_800_000,
+  keyProbeTimeoutMs: 5_000,
+  gatewaySecret: null,
+  secretFilePath: 'data/secret.key',
+  billingIntervalMs: 1_800_000,
+  billingTimeoutMs: 20_000,
+  oauthClientId: 'opencode-cli',
+  oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
 };
 
 describe('detectInjection', () => {
@@ -250,10 +263,13 @@ describe('validateAnthropicRequest', () => {
     expect(r.ok).toBe(true);
   });
 
-  it('messages 超过上限拒绝', () => {
+  it('messages 超过上限拒绝（cfg.maxMessages=2000 场景）', () => {
     const messages = Array.from({ length: 2001 }, () => ({ role: 'user' as const, content: 'x' }));
-    const r = validateAnthropicRequest({ model: 'm', max_tokens: 10, messages }, cfg);
+    const r = validateAnthropicRequest({ model: 'm', max_tokens: 10, messages }, { ...cfg, maxMessages: 2000 });
     expect(r.ok).toBe(false);
+    // 默认上限（4000）内通过
+    const ok = validateAnthropicRequest({ model: 'm', max_tokens: 10, messages }, cfg);
+    expect(ok.ok).toBe(true);
   });
 
   it('content 超长拒绝（含嵌套 tool_result 文本）', () => {
@@ -334,10 +350,12 @@ describe('isPrivateUrl', () => {
 });
 
 describe('validateChatRequest 上限与 tool_choice', () => {
-  it('messages 超过 2000 条拒绝', () => {
+  it('messages 超过上限拒绝（cfg.maxMessages 生效）', () => {
     const messages = Array.from({ length: 2001 }, () => ({ role: 'user' as const, content: 'x' }));
-    const r = validateChatRequest({ model: 'm', messages }, cfg);
+    const r = validateChatRequest({ model: 'm', messages }, { ...cfg, maxMessages: 2000 });
     expect(r.ok).toBe(false);
+    const ok = validateChatRequest({ model: 'm', messages }, cfg);
+    expect(ok.ok).toBe(true);
   });
 
   it('system 超长拒绝', () => {

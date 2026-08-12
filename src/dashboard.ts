@@ -116,7 +116,10 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .cell .v i { font-style: normal; font-size: 13px; color: var(--fg-weak); }
   .cell .d { color: var(--fg-weak); font-size: 12px; margin-top: 4px; }
   .cell .d b { font-weight: 400; color: var(--fg-base); }
-  .spark { width: 100%; height: 26px; display: block; margin-top: 9px; }
+  /* contain: paint 把 sparkline 的绘制限制在 SVG 自身边界内——面板实测过
+     合成器把 sparkline 的 path 渲染成页面层上的全宽残影（浅蓝横条），
+     这是防御那道 bug 的最后一道闸。 */
+  .spark { width: 100%; height: 26px; display: block; margin-top: 9px; contain: paint; }
 
   /* ── pipeline ───────────────────────────────────── */
   .pipe { display: flex; align-items: stretch; border: 1px solid var(--line-weak); }
@@ -173,7 +176,9 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   .kc { background: var(--bg); padding: 12px 14px; min-width: 0; }
   .kc.off { background: var(--bg-strong); }
   .kc .hd { display: flex; align-items: baseline; gap: 8px; }
-  .kc .fp { color: var(--fg); font-size: 13px; }
+  .kc .fp { color: var(--fg); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 有昵称时指纹退成小字（昵称优先，指纹只作对号用）。 */
+  .kc .fp-sub { color: var(--fg-weaker); font-size: 11px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .kc .badge { margin-left: auto; font-size: 12px; white-space: nowrap; }
   .kc dl { display: grid; grid-template-columns: 64px 1fr; gap: 3px 10px; margin-top: 8px; font-size: 12px; }
   .kc dt { color: var(--fg-weaker); }
@@ -531,10 +536,19 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   /** 阶梯折线 sparkline：无渐变无填充，只有 1px 线，贴合终端审美。 */
   function spark(el, data) {
     var w = el.clientWidth || 200, h = 26;
-    el.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    // viewBox 只在宽度变化时写：每 2s 轮询都重设相同值会让合成器反复
+    // 重光栅化 SVG 层（面板实测出现过 sparkline 区域的全宽浅蓝横条残影，
+    // 与 SVG 层光栅化残留一致）。值不变就不碰属性。
+    var vb = '0 0 ' + w + ' ' + h;
+    if (el.getAttribute('viewBox') !== vb) el.setAttribute('viewBox', vb);
     if (data.length < 2) { el.innerHTML = ''; return; }
     var max = Math.max.apply(null, data), min = Math.min.apply(null, data);
-    var span = (max - min) || 1, step = w / (data.length - 1);
+    // 数据全相等时画出来是一条纯水平线：既没有任何信息量，还在部分合成器
+    // 实现下把 1px stroke 渲染成横贯全屏的浅蓝横条残影（面板刚打开、四项
+    // 指标全是 0 时 sparkline 区域出现过 2px 高全宽蓝线，删掉 sparkline 即
+    // 消失）。无波动就留空，比一条误导性的平线诚实。
+    if (max === min) { el.innerHTML = ''; return; }
+    var span = max - min, step = w / (data.length - 1);
     var d = data.map(function (v, i) {
       return (i ? 'L' : 'M') + (i * step).toFixed(1) + ',' + (h - 2 - ((v - min) / span) * (h - 5)).toFixed(1);
     }).join('');
@@ -599,9 +613,14 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 
   /** 冷却倒计时用的 h/m/s。upt() 是给运行时长的（会省掉秒），倒计时要看到秒。 */
   var hms = function (ms) {
-    var s = Math.floor(Math.max(0, ms) / 1000);
-    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    /* Number() 兜底：字段缺失时 Math.max(0, undefined) 是 NaN，会渲染成「NaNs」。 */
+    var n = Number(ms);
+    var s = Math.floor(Math.max(0, isFinite(n) ? n : 0) / 1000);
+    var d = Math.floor(s / 86400);
+    var h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    var p = function (v) { return (v < 10 ? '0' : '') + v; };
+    /* 超过一天用「天」：额度耗尽的冷却能到几十小时，720h00m00s 读不出是 30 天。 */
+    if (d) return d + 'd' + p(h) + 'h' + p(m) + 'm';
     if (h) return h + 'h' + p(m) + 'm' + p(s % 60) + 's';
     if (m) return m + 'm' + p(s % 60) + 's';
     return (s % 60) + 's';
@@ -679,7 +698,8 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         ? new Array(Math.min(k.inFlight, 24) + 1).join('#') + (k.inFlight > 24 ? '+' : '')
         : '<em>idle</em>';
       return '<div class="kc' + (k.healthy ? '' : ' off') + '">' +
-        '<div class="hd"><span class="fp">' + esc(k.fingerprint) + '</span>' +
+        '<div class="hd"><span class="fp">' + esc(k.nickname || k.fingerprint) + '</span>' +
+        (k.nickname ? '<span class="fp-sub">' + esc(k.fingerprint) + '</span>' : '') +
         '<span class="badge ' + (k.healthy ? 's-ok' : 's-bad') + '">' +
         (k.healthy ? '[ok]' : '[!]') + '</span></div>' +
         '<div class="glyph">' + glyph + '</div>' +
@@ -703,6 +723,9 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       $('kevs').innerHTML = '<div class="kev"><span class="w" style="grid-column:1/-1">' + T('noKeyEvents') + '</span></div>';
       return;
     }
+    // 只列最近 6 条：20 条刷屏时没有一条会被记住，反而把整块区域拉长。
+    // 头部那行已有「累计自 + 总数」，想看全量去 /__admin（后台不公开）。
+    var recent = evs.slice(0, 6);
     /* 未归属请求（还没选到 key 就被拒的 400/401/池空 503）单独说一句。
        它们不在逐 key 卡片里，不说明的话 byKey 求和会对不上总数。 */
     var unattr = Number(lifetime.unattributedRequests) || 0;
@@ -712,7 +735,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       ' · ' + fmt(lifetime.totalRequests) + ' ' + T('reqShort') +
       (unattr ? ' · ' + fmt(unattr) + ' ' + T('unattributed') : '') +
       '</span></div>';
-    $('kevs').innerHTML = head + evs.map(function (e) {
+    $('kevs').innerHTML = head + recent.map(function (e) {
       var dis = e.type === 'disabled';
       return '<div class="kev">' +
         '<span class="w">' + hhmmss(e.at) + '</span>' +

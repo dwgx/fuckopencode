@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { anthropicStreamToOpenAI, openAIStreamToSSE, sseStringify } from '../src/stream.js';
+import { openAIStreamToAnthropic } from '../src/toAnthropic.js';
 import { parseAnthropicSSE, parseOpenAISSE } from '../src/sse.js';
 import type { AnthropicStreamEvent, OpenAIStreamChunk } from '../src/types.js';
 import { iter, textStreamEvents, toolStreamEvents } from './fixtures.js';
@@ -303,6 +304,51 @@ describe('parseOpenAISSE 脏行检测', () => {
     const chunks: OpenAIStreamChunk[] = [];
     for await (const c of parseOpenAISSE(sseBody(okChunk + 'data: garbage\n\n'))) chunks.push(c);
     expect(chunks.length).toBe(1);
+  });
+
+  it('合法 JSON 错误体（{error:...}）按脏数据上报并丢弃，前后 chunk 不受影响', async () => {
+    const { chunks, samples } = await dirty(
+      okChunk + 'data: {"error":{"message":"rate limited","type":"server_error"}}\n\n' + okChunk,
+    );
+    expect(chunks.length).toBe(2);
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toContain('"error"');
+  });
+
+  it('收尾记账 chunk（{"choices":[],"cost":"0"}）不误报为脏', async () => {
+    const { chunks, samples } = await dirty(okChunk + 'data: {"choices":[],"cost":"0"}\n\n' + okChunk);
+    expect(chunks.length).toBe(3); // 记账 chunk 保留（usage 可能在里面，由转换器判断）
+    expect(samples).toHaveLength(0);
+  });
+
+  it('顶层非标准字段的合法 JSON chunk（如 {message:...}）按脏数据上报', async () => {
+    const { chunks, samples } = await dirty(okChunk + 'data: {"message":"quota exceeded"}\n\n');
+    expect(chunks.length).toBe(1);
+    expect(samples).toHaveLength(1);
+  });
+});
+
+describe('openAIStreamToAnthropic 错误 chunk（M2）', () => {
+  it('带 error 的 chunk 中止流：抛错而非静默拼接', async () => {
+    const errorChunk = { error: { message: 'boom', type: 'server_error' } } as unknown as OpenAIStreamChunk;
+    const gen = openAIStreamToAnthropic(
+      iter([
+        {
+          id: 'x',
+          object: 'chat.completion.chunk',
+          created: 0,
+          model: 'm',
+          choices: [{ index: 0, delta: { content: 'a' }, finish_reason: null }],
+        },
+        errorChunk,
+      ]),
+    );
+    const events: AnthropicStreamEvent[] = [];
+    await expect(async () => {
+      for await (const ev of gen) events.push(ev);
+    }).rejects.toThrow('upstream returned error chunk in stream');
+    // 错误 chunk 前的合法内容已产出（message_start 骨架），不丢。
+    expect(events.some((e) => e.type === 'message_start')).toBe(true);
   });
 });
 

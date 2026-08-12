@@ -5,6 +5,7 @@
  * - 多个上游 key 分摊并发（least-loaded），避免单 key 吃满限流。
  * - 失效 key（401/403 凭据无效、连续失败超阈值）自动禁用，冷却后恢复。
  * - 请求失败时换下一个可用 key 重试一次，避免单 key 故障拖垮所有请求。
+ * - key 可归属账户（accountId），供面板按账户聚合；增删 key 热生效（不重启）。
  *
  * 状态机（每个 key）：
  * - `disabledUntil`：禁用截止时间戳（0 = 未禁用）。由失败计数/凭据错误触发。
@@ -16,6 +17,8 @@
 
 interface PooledKey {
   key: string;
+  /** 所属账户 id；0 = 未归属（仅 env 配置，未进账户表）。 */
+  accountId: number;
   disabledUntil: number;
   failCount: number;
   inFlight: number;
@@ -45,6 +48,8 @@ interface PooledKey {
 export interface PoolKeySnapshot {
   /** key 指纹（末 4 位），如 `****ZOBb`。 */
   fingerprint: string;
+  /** 所属账户 id；0 = 未归属（仅 env 配置，未进账户表）。 */
+  accountId: number;
   /** 当前是否可用（冷却已过）。 */
   healthy: boolean;
   /** 当前活跃请求数 —— 「几个号在扛并发分流」的直接答案。 */
@@ -149,7 +154,11 @@ export class KeyPool {
   /** 单调递增的选中序号，驱动公平轮转（见 PooledKey.lastUsedSeq）。 */
   private seq = 0;
 
-  constructor(rawKeys: string[], options: KeyPoolOptions) {
+  constructor(
+    rawKeys: string[],
+    options: KeyPoolOptions,
+    accountIds?: ReadonlyMap<string, number>,
+  ) {
     const seen = new Set<string>();
     this.keys = [];
     for (const raw of rawKeys) {
@@ -158,6 +167,8 @@ export class KeyPool {
       seen.add(key);
       this.keys.push({
         key,
+        // 账户映射可选：未给或没命中一律 0（env keys 兜底）。重复 key 取第一个命中。
+        accountId: accountIds?.get(key) ?? 0,
         disabledUntil: 0,
         failCount: 0,
         inFlight: 0,
@@ -252,6 +263,7 @@ export class KeyPool {
       const healthy = k.disabledUntil <= now;
       return {
         fingerprint: keyFingerprint(k.key),
+        accountId: k.accountId,
         healthy,
         inFlight: k.inFlight,
         failCount: k.failCount,
@@ -299,11 +311,14 @@ export class KeyPool {
    * 选择一个 key 并递增 inFlight。同步完成（无 await），保证原子性。
    * least-loaded：优先选 inFlight 最少的健康 key；全 0 时按 lastUsedAt 最旧优先轮转。
    * 所有 key 都禁用时抛 PoolEmptyError。
+   *
+   * @param excludeKey 本次不参与选路的 key（换 key 重试用：刚失败的 key 刚 release，
+   *   inFlight 归 0 会被 least-loaded 立即重选，白撞一次错误再换号）。
    */
-  acquire(): string {
+  acquire(excludeKey?: string): string {
     const now = this.now();
     this.reapRecovered(now);
-    const healthy = this.keys.filter((k) => this.isAvailable(k));
+    const healthy = this.keys.filter((k) => this.isAvailable(k) && k.key !== excludeKey);
     if (healthy.length === 0) {
       // 池空：抛 typed error，server 层转 503。
       throw new PoolEmptyError();
@@ -448,6 +463,43 @@ export class KeyPool {
     k.failCount = 0;
     k.lastFailAt = -1;
     delete k.disabledReason;
+  }
+
+  /**
+   * 热加载新增一个 key（面板加号用）。与构造同口径：trim、去空、去重。
+   * 新 key 的 lastUsedAt=0 → 下一轮探针会自动探它（staleKeys 语义白拿）。
+   */
+  addKey(key: string, accountId: number): boolean {
+    const trimmed = key.trim();
+    if (!trimmed || this.keys.some((p) => p.key === trimmed)) return false;
+    this.keys.push({
+      key: trimmed,
+      accountId,
+      disabledUntil: 0,
+      failCount: 0,
+      inFlight: 0,
+      lastUsedAt: 0,
+      lastUsedSeq: 0,
+      lastFailAt: -1,
+      totalAcquired: 0,
+    });
+    return true;
+  }
+
+  /**
+   * 热加载删除一个 key（面板删除用）。在飞请求安全：删掉后
+   * release/markFailure/markSuccess 的 find 守卫直接 return，不崩。
+   */
+  removeKey(key: string): boolean {
+    const idx = this.keys.findIndex((p) => p.key === key.trim());
+    if (idx === -1) return false;
+    this.keys.splice(idx, 1);
+    return true;
+  }
+
+  /** key 所属账户 id；未知 key 返回 0（未归属）。 */
+  accountIdOf(key: string): number {
+    return this.keys.find((p) => p.key === key.trim())?.accountId ?? 0;
   }
 
   /**
