@@ -225,7 +225,10 @@ export type AnthropicStreamEvent =
   | {
       type: 'message_delta';
       delta: { stop_reason: AnthropicStopReason | null; stop_sequence: string | null };
-      usage?: { output_tokens: number };
+      // input_tokens 由网关补传真实 prompt_tokens（Anthropic 允许 message_delta
+      // 带 input_tokens）：流式下 message_start 里恒 0，不放这里 server 侧
+      // 拿不到 input 用量（见 toAnthropic.openAIStreamToAnthropic 收尾段）。
+      usage?: { output_tokens: number; input_tokens?: number };
     }
   | { type: 'message_stop' }
   | { type: 'ping' }
