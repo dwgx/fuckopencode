@@ -5,8 +5,8 @@ export type ValidationResult = { ok: true } | { ok: false; error: string };
 const ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 const PART_TYPES = new Set(['text', 'image_url']);
 
-/** chat 直通端点与 anthropic 直通端点共享的消息条数上限。 */
-const MAX_MESSAGES = 2000;
+/** chat 直通端点与 anthropic 直通端点共享的消息条数上限（默认 4000，env 可调）。 */
+const MAX_MESSAGES = 4000;
 /** OpenAI chat max_tokens 上限（Anthropic 侧同样封顶，防 DoS）。 */
 const MAX_CHAT_MAX_TOKENS = 200_000;
 
@@ -54,8 +54,9 @@ export function validateChatRequest(body: unknown, cfg: AppConfig): ValidationRe
   if (!Array.isArray(messages) || messages.length === 0) {
     return { ok: false, error: 'messages must be a non-empty array' };
   }
-  if (messages.length > MAX_MESSAGES) {
-    return { ok: false, error: `messages must not exceed ${MAX_MESSAGES} entries` };
+  const limit = cfg.maxMessages > 0 ? cfg.maxMessages : Number.MAX_SAFE_INTEGER;
+  if (messages.length > limit) {
+    return { ok: false, error: `messages must not exceed ${limit} entries` };
   }
 
   for (let i = 0; i < messages.length; i++) {
@@ -186,8 +187,9 @@ export function validateAnthropicRequest(body: unknown, cfg: AppConfig): Validat
     return { ok: false, error: 'stream must be a boolean' };
   }
   if (!Array.isArray(req.messages)) return { ok: false, error: 'messages must be an array' };
-  if (req.messages.length > MAX_ANTHROPIC_MESSAGES) {
-    return { ok: false, error: `messages must not exceed ${MAX_ANTHROPIC_MESSAGES} entries` };
+  const alimit = cfg.maxMessages > 0 ? cfg.maxMessages : Number.MAX_SAFE_INTEGER;
+  if (req.messages.length > alimit) {
+    return { ok: false, error: `messages must not exceed ${alimit} entries` };
   }
   for (let i = 0; i < req.messages.length; i++) {
     const m = req.messages[i];

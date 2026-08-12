@@ -58,8 +58,12 @@ export function anthropicToOpenAIRequest(req: AnthropicRequest): OpenAIChatReque
   if (req.stop_sequences?.length) out.stop = req.stop_sequences;
   if (req.tools?.length) out.tools = anthropicToolsToOpenAI(req.tools);
 
-  const toolChoice = anthropicToolChoiceToOpenAI(req.tool_choice);
-  if (toolChoice) out.tool_choice = toolChoice;
+  // tool_choice 刻意不输出：DeepSeek 的 payg 端点（-free 模型）对 tool_choice
+  // 直接 400（实测 190+ 条 "Thinking mode does not support this tool_choice"）。
+  // 剥掉 = OpenAI 默认 auto，与 Claude Code 的默认行为一致；显式指定单工具的
+  // 罕见场景退化为 auto（可接受，400 是实际伤害）。anthropicToolChoiceToOpenAI
+  // 保留导出（测试/未来端点支持时可用）。
+  void anthropicToolChoiceToOpenAI(req.tool_choice);
 
   // reasoning_effort：Anthropic 侧可能在顶层或 output_config.effort。
   const effort =
@@ -113,7 +117,12 @@ function pushAssistant(messages: OpenAIMessage[], content: AnthropicContentBlock
     if (block.type === 'text') {
       if (block.text) textParts.push(block.text);
     } else if (block.type === 'thinking') {
-      if (block.thinking) thinkingParts.push(block.thinking);
+      // 空 thinking 块也要输出 reasoning_content（哪怕空串）：DeepSeek 要求
+      // thinking 模式下 assistant 历史必须带 reasoning_content 字段，缺失 400
+      // （实测 "The `reasoning_content` in the thinking mode must be passed back"）。
+      // injectMissingThinkingBlocks 注入的空块（thinking:''）如果在这里被丢弃，
+      // 注入就白做了 —— 上游仍收不到该字段，间歇性 400。
+      thinkingParts.push(typeof block.thinking === 'string' ? block.thinking : '');
     } else if (block.type === 'tool_use') {
       toolCalls.push({
         id: block.id,

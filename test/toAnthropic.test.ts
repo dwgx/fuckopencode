@@ -92,6 +92,27 @@ describe('anthropicToOpenAIRequest', () => {
     ]);
   });
 
+  it('空 thinking 块也要输出 reasoning_content（空串）—— DeepSeek 要求字段存在', () => {
+    const out = anthropicToOpenAIRequest({
+      ...base,
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: '', signature: '' },
+            { type: 'text', text: '好' },
+          ],
+        },
+      ],
+    });
+    const asst = out.messages[1]!;
+    // 字段必须存在（缺失 = 上游 400 reasoning_content must be passed back）。
+    expect(Object.prototype.hasOwnProperty.call(asst, 'reasoning_content')).toBe(true);
+    expect(asst.reasoning_content).toBe('');
+    expect(asst.content).toBe('好');
+  });
+
   it('tool_result 拆成独立的 role:tool 消息', () => {
     const out = anthropicToOpenAIRequest({
       ...base,
@@ -116,7 +137,7 @@ describe('anthropicToOpenAIRequest', () => {
     );
   });
 
-  it('tools 与 tool_choice 转 OpenAI 形态', () => {
+  it('tools 转 OpenAI 形态；tool_choice 不输出（DeepSeek payg 对 tool_choice 400）', () => {
     const out = anthropicToOpenAIRequest({
       ...base,
       messages: [{ role: 'user', content: 'hi' }],
@@ -126,15 +147,9 @@ describe('anthropicToOpenAIRequest', () => {
     expect(out.tools).toEqual([
       { type: 'function', function: { name: 'f', description: 'd', parameters: { type: 'object' } } },
     ]);
-    expect(out.tool_choice).toEqual({ type: 'function', function: { name: 'f' } });
-  });
-
-  it('tool_choice any → required，none → none', () => {
-    const mk = (tc: AnthropicRequest['tool_choice']) =>
-      anthropicToOpenAIRequest({ ...base, messages: [{ role: 'user', content: 'x' }], tool_choice: tc }).tool_choice;
-    expect(mk({ type: 'any' })).toBe('required');
-    expect(mk({ type: 'none' })).toBe('none');
-    expect(mk({ type: 'auto' })).toBe('auto');
+    // tool_choice 刻意不输出：DeepSeek payg 端点对 tool_choice 直接 400，
+    // 剥掉 = 默认 auto（与 Claude Code 默认行为一致）。
+    expect('tool_choice' in out).toBe(false);
   });
 
   it('output_config.effort 与顶层 reasoning_effort 都能映射', () => {
@@ -602,5 +617,74 @@ describe('DSML 残缺标记剥离（抽不出 invoke 时不能泄漏标记）', 
     expect(text).not.toContain('DSML');
     expect(text).not.toContain('function_calls');
     expect(text.trim()).toBe('好的，');
+  });
+});
+
+describe('openAIUsageToAnthropic 缩放（实验性 SCALE_CLIENT_TOKENS）', () => {
+  it('不传 scale 时原样（默认路径行为不变）', () => {
+    const usage = {
+      prompt_tokens: 255000,
+      completion_tokens: 1000,
+      prompt_tokens_details: { cached_tokens: 100000 },
+      completion_tokens_details: { reasoning_tokens: 400 },
+      total_tokens: 256000,
+    };
+    expect(openAIUsageToAnthropic(usage)).toEqual({
+      input_tokens: 155000,
+      output_tokens: 1000,
+      cache_read_input_tokens: 100000,
+      output_tokens_details: { thinking_tokens: 400 },
+    });
+  });
+
+  it('scale=0.6657 时 input/output/cache/thinking 统一缩放并 Math.round', () => {
+    const usage = {
+      prompt_tokens: 255000,
+      completion_tokens: 1000,
+      prompt_tokens_details: { cached_tokens: 100000 },
+      completion_tokens_details: { reasoning_tokens: 400 },
+      total_tokens: 256000,
+    };
+    const out = openAIUsageToAnthropic(usage, 0.6657);
+    expect(out.input_tokens).toBe(Math.round(155000 * 0.6657)); // 103184
+    expect(out.output_tokens).toBe(Math.round(1000 * 0.6657)); // 666
+    expect(out.cache_read_input_tokens).toBe(Math.round(100000 * 0.6657)); // 66570
+    expect(out.output_tokens_details?.thinking_tokens).toBe(Math.round(400 * 0.6657)); // 266
+  });
+
+  it('scale=1 时结果不变', () => {
+    const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
+    expect(openAIUsageToAnthropic(usage, 1)).toEqual({ input_tokens: 10, output_tokens: 5 });
+  });
+
+  it('非流式响应 options.scale 生效', () => {
+    const res = {
+      id: 'r',
+      model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 255000, completion_tokens: 1000, total_tokens: 256000 },
+    };
+    const out = openAIToAnthropicResponse(res as never, { scale: 0.6657 });
+    expect(out.usage.output_tokens).toBe(Math.round(1000 * 0.6657));
+    expect(out.usage.input_tokens).toBe(Math.round(255000 * 0.6657));
+  });
+
+  it('流式 message_delta usage 随 scale 缩放', async () => {
+    const usageChunk = {
+      choices: [],
+      usage: { prompt_tokens: 255000, completion_tokens: 1000, total_tokens: 256000 },
+    } as never;
+    const events = await collect(
+      openAIStreamToAnthropic(
+        chunks([
+          chunk({ content: 'x' }),
+          chunk({}, 'stop'),
+          usageChunk,
+        ]),
+        { model: 'm', scale: 0.6657 },
+      ),
+    );
+    const delta = events.find((e) => e.type === 'message_delta');
+    expect(delta?.type === 'message_delta' && delta.usage).toEqual({ output_tokens: Math.round(1000 * 0.6657) });
   });
 });

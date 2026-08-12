@@ -1,4 +1,5 @@
 import type { AnthropicStreamEvent } from './types.js';
+import { compactMessages, type CompactOptions } from './compact.js';
 
 /**
  * DeepSeek / opencodezen 上游的 Anthropic 协议归一化。
@@ -39,30 +40,20 @@ export const ALLOWED_MODELS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * 对外别名：给两个 DeepSeek 变体套一层 Anthropic 风格的名字。
+ * 对外别名：已从代码移除，改为 db 配置清单（model_aliases 表 + 后台设置页）。
  *
- * 纯展示层的玩法 —— 客户端可以用别名点，网关照样发真名给上游，响应回显
- * 客户端用的那个名字。别名和真名都能用，互不影响。
+ * 原本 claude-mythos-5 / claude-fable-5 两个 Anthropic 风格名字内置在代码里，
+ * 现在由 main.ts 启动时种子进 db（表空才 seed，保持默认行为不变），之后完全
+ * 由设置页管理 —— 用户改了目标模型立即生效，无需发版。
  *
  * 注意这些名字**刻意不与真实 Anthropic 模型重名**（不叫 claude-opus-5 之类），
  * 否则 Claude Code 发它自己的默认模型名时会被误当成别名，语义就乱了。
- */
-export const MODEL_ALIASES: Readonly<Record<string, string>> = {
-  'claude-mythos-5': 'deepseek-v4-flash',
-  'claude-fable-5': 'deepseek-v4-flash-free',
-};
-
-/** 真名 → 别名（回显与 /v1/models 用）。 */
-export const MODEL_ALIAS_REVERSE: Readonly<Record<string, string>> = Object.fromEntries(
-  Object.entries(MODEL_ALIASES).map(([alias, real]) => [real, alias]),
-);
-
-/**
- * 模型名解析：别名 → MODEL_MAP → 白名单直传 → 回落 fallback。
  *
- * 只有 ALLOWED_MODELS 里的名字能真正发给上游（别名与 MODEL_MAP 的结果都要过
- * 白名单），其余全部回落 —— Claude Code 会发 claude-sonnet-4-6 这类真实
- * Anthropic 名字，正好被这条吃掉并落到 fallback 上。
+ * 模型名解析：MODEL_MAP（env + 后台运行时映射）→ 白名单直传 → 回落 fallback。
+ *
+ * 只有 ALLOWED_MODELS 里的名字能真正发给上游（映射的结果要过白名单），
+ * 其余全部回落 —— Claude Code 会发 claude-sonnet-4-6 这类真实 Anthropic 名字，
+ * 正好被这条吃掉并落到 fallback 上。
  */
 export function resolveModelName(
   model: string,
@@ -70,15 +61,13 @@ export function resolveModelName(
   fallbackModel: string,
   _knownModels?: ReadonlySet<string>,
 ): string {
-  // 1. 对外别名优先（claude-mythos-5 / claude-fable-5）。
-  const aliased = MODEL_ALIASES[model];
-  if (aliased && ALLOWED_MODELS.has(aliased)) return aliased;
-  // 2. 运维配置的 MODEL_MAP；映射结果也必须在白名单里，否则配错就能绕过限制。
+  // 1. 显式映射优先（env MODEL_MAP + 后台设置合并进来的运行时映射，运行时 > env；
+  //    seed 的默认别名也在其中 —— 未配置的别名自然走回落，行为与旧内置一致）。
   const mapped = modelMap[model];
   if (mapped && ALLOWED_MODELS.has(mapped)) return mapped;
-  // 3. 直接用真名。
+  // 2. 直接用真名。
   if (ALLOWED_MODELS.has(model)) return model;
-  // 4. 白名单外（含 claude-*/gpt-* 等）一律回落；fallback 非法则强制到 flash。
+  // 3. 白名单外（含 claude-*/gpt-* 等）一律回落；fallback 非法则强制到 flash。
   return ALLOWED_MODELS.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL;
 }
 
@@ -100,16 +89,31 @@ export function resolveUpstreamBaseUrl(
 /**
  * 对 Anthropic 请求做深拷贝 + 归一化，返回新的对象（不污染入参）。
  * 只做协议字段调整，不动 messages 语义。
+ *
+ * `compact`（实验性 COMPACT_ENABLED）非空且请求体超阈值时，对消息文本做
+ * 被动压缩（空白折叠 + 超长截断，见 compact.ts）。调用方负责用原始请求体
+ * 字节估算 bodyBytes。
  */
 export function normalizeAnthropicRequest(
   raw: unknown,
   modelMap: Record<string, string>,
   fallbackModel: string,
+  compact?: CompactOptions | null,
 ): Record<string, unknown> {
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('invalid anthropic request body');
   }
-  const body = structuredClone(raw) as Record<string, unknown>;
+  // OOM 根因（2026-08-12 定位）：structuredClone 在 Node 22 走 MessagePort
+  // 反序列化管线（崩溃堆栈 node::worker::Message::Deserialize——"worker" 是
+  // 红鲱鱼，不是 worker_threads），大 body（1M+ tokens 的请求体）克隆 = 2-3 倍
+  // 瞬时内存，并发即撞 V8 堆上限（白天 693 次 OOM 的根因）。
+  // 修复：compact 配置带 bodyBytes 且超过 512KB 时跳过克隆——此时入参来自
+  // JSON.parse 是请求私有对象（server 不会复用），normalize 的原地修改无害。
+  // 小请求保留克隆（库函数「不污染入参」的契约不变）。
+  const body =
+    compact != null && typeof compact.bodyBytes === 'number' && compact.bodyBytes > 512 * 1024
+      ? (raw as Record<string, unknown>)
+      : (structuredClone(raw) as Record<string, unknown>);
 
   // 1. 模型名映射。
   if (typeof body.model === 'string') {
@@ -190,6 +194,15 @@ export function normalizeAnthropicRequest(
   //    收到 `content:"hi"` 会报 "Empty input messages"（实测直连上游确认）。
   //    Anthropic 官方两种都支持，Claude Code 会发字符串形式，必须转换。
   normalizeMessageContent(body);
+
+  // 6.5 实验性被动压缩：请求体超阈值时折叠空白 + 截断超长单条消息。
+  //     放在 normalizeMessageContent 之后（content 已规整成块数组，字符串分支
+  //     不再出现）；压缩不动块结构，thinking 注入（第 7 步）不受影响。
+  // 压缩只在开关开启（triggerBytes/maxMessageChars 已提供）时执行——bodyBytes
+  // 单独传（OOM 修复的克隆跳过）不该触发压缩。
+  if (compact != null && compact.triggerBytes != null && compact.bodyBytes > compact.triggerBytes && Array.isArray(body.messages)) {
+    compactMessages(body.messages, compact.maxMessageChars ?? 8000);
+  }
 
   // 7. thinking enabled + 带工具的多轮：assistant 历史缺 thinking 块则注入空块，
   //    否则 deepseek 次轮 400（reasoning_content 缺失）。

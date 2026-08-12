@@ -71,6 +71,39 @@ describe('KeyPool least-loaded 分流', () => {
   });
 });
 
+describe('KeyPool acquire(excludeKey)（换 key 重试防撞同一把坏 key）', () => {
+  it('被排除的 key 不被选中', () => {
+    const pool = new KeyPool(['a', 'b', 'c'], OPTS);
+    expect(pool.acquire('b')).not.toBe('b');
+    expect(pool.acquire('a')).not.toBe('a');
+    expect(pool.acquire('c')).not.toBe('c');
+  });
+
+  it('exclude 后只剩一个健康 key 时选中它', () => {
+    const pool = new KeyPool(['a', 'b'], OPTS);
+    expect(pool.acquire('a')).toBe('b');
+  });
+
+  it('exclude 后无可用 key 抛 PoolEmptyError（换 key 重试不白撞坏 key）', () => {
+    const pool = new KeyPool(['a'], OPTS);
+    expect(() => pool.acquire('a')).toThrow(PoolEmptyError);
+  });
+
+  it('并发下 exclude 不破坏 least-loaded 语义：排除最闲的 key 时选次闲', () => {
+    const pool = new KeyPool(['a', 'b'], OPTS);
+    const first = pool.acquire(); // inFlight 1
+    // a 在飞、b 空闲；排除 a 后应选 b，而不是把 a 再抓回来。
+    expect(pool.acquire('a')).toBe('b');
+    pool.release(first);
+  });
+
+  it('exclude 不影响后续正常 acquire', () => {
+    const pool = new KeyPool(['a', 'b'], OPTS);
+    pool.acquire('a');
+    expect(pool.acquire()).not.toBe('b'); // 轮转语义仍生效
+  });
+});
+
 describe('KeyPool 失败分级与禁用', () => {
   it('auth 失败立即禁用，冷却 12 倍', () => {
     const clock = fakeClock();
@@ -640,5 +673,73 @@ describe('markFailure 只延长冷却，不缩短（迟到的失败上报不能�
     const s = pool.snapshot()[0]!;
     expect(s.healthy).toBe(false);
     expect(s.disabledReason).toBe('auth');
+  });
+});
+
+describe('KeyPool 账户归属（多账号面板）', () => {
+  it('构造带 accountIds 映射：snapshot 逐 key 带 accountId', () => {
+    const ids = new Map([['sk-aaa-1', 1], ['sk-bbb-2', 2]]);
+    const pool = new KeyPool(['sk-aaa-1', 'sk-bbb-2', 'sk-ccc-9'], OPTS, ids);
+    const snap = pool.snapshot();
+    expect(snap.map((s) => s.accountId)).toEqual([1, 2, 0]);
+    // accountIdOf 与 snapshot 同一真源。
+    expect(pool.accountIdOf('sk-aaa-1')).toBe(1);
+    expect(pool.accountIdOf('sk-bbb-2')).toBe(2);
+    expect(pool.accountIdOf('sk-ccc-9')).toBe(0);
+    expect(pool.accountIdOf('nonexistent')).toBe(0);
+  });
+
+  it('不带 accountIds 时全部归 0（env keys 兜底，旧调用点兼容）', () => {
+    const pool = new KeyPool(['sk-aaa-1', 'sk-bbb-2'], OPTS);
+    expect(pool.snapshot().every((s) => s.accountId === 0)).toBe(true);
+  });
+
+  it('重复 key 去重后 accountId 取第一个命中', () => {
+    const pool = new KeyPool(['sk-dup', ' sk-dup '], OPTS, new Map([['sk-dup', 7]]));
+    expect(pool.size).toBe(1);
+    expect(pool.accountIdOf('sk-dup')).toBe(7);
+  });
+
+  it('addKey 热加载：新 key 立即可用且带账户归属', () => {
+    const pool = new KeyPool(['sk-aaa-1'], OPTS);
+    expect(pool.addKey('sk-new-2', 3)).toBe(true);
+    expect(pool.size).toBe(2);
+    expect(pool.accountIdOf('sk-new-2')).toBe(3);
+    // 新 key lastUsedAt=0 → 下一轮探针会自动探它（staleKeys 语义）。
+    expect(pool.staleKeys(3_600_000).some((s) => s.key === 'sk-new-2')).toBe(true);
+  });
+
+  it('addKey 去重：同名返回 false，不改原有归属', () => {
+    const pool = new KeyPool(['sk-aaa-1'], OPTS, new Map([['sk-aaa-1', 1]]));
+    expect(pool.addKey('sk-aaa-1', 9)).toBe(false);
+    expect(pool.addKey(' sk-aaa-1 ', 9)).toBe(false);
+    expect(pool.addKey('   ', 9)).toBe(false);
+    expect(pool.size).toBe(1);
+    expect(pool.accountIdOf('sk-aaa-1')).toBe(1);
+  });
+
+  it('removeKey：删除成功返回 true，未知 key 返回 false', () => {
+    const pool = new KeyPool(['sk-aaa-1', 'sk-bbb-2'], OPTS);
+    expect(pool.removeKey('sk-aaa-1')).toBe(true);
+    expect(pool.size).toBe(1);
+    expect(pool.accountIdOf('sk-aaa-1')).toBe(0);
+    expect(pool.removeKey('sk-aaa-1')).toBe(false);
+    expect(pool.removeKey('nonexistent')).toBe(false);
+  });
+
+  it('removeKey 后在飞请求的 release/markFailure/markSuccess 不崩', () => {
+    const pool = new KeyPool(['sk-aaa-1', 'sk-bbb-2'], OPTS);
+    const held = pool.acquire(); // 拿到 sk-aaa-1（顺序第一个）
+    pool.removeKey(held);
+    // 在飞请求结束时上报全部安全忽略，其余 key 不受影响。
+    expect(() => {
+      pool.release(held);
+      pool.markFailure(held, 'auth');
+      pool.markSuccess(held);
+    }).not.toThrow();
+    expect(pool.size).toBe(1);
+    expect(pool.healthyCount).toBe(1);
+    // 剩余 key 正常工作。
+    expect(pool.acquire()).toBe('sk-bbb-2');
   });
 });

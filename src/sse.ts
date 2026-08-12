@@ -45,10 +45,25 @@ export async function* parseOpenAISSE(
       return null;
     }
     try {
-      const parsed = JSON.parse(payload) as OpenAIStreamChunk;
-      // 上游收尾会发 `{"choices":[],"cost":"0"}` 这类无 choices 的记账 chunk；
-      // 保留它（usage 可能在里面），由转换器判断。
-      return parsed != null && typeof parsed === 'object' ? parsed : null;
+      const parsed = JSON.parse(payload) as unknown;
+      if (parsed != null && typeof parsed === 'object') {
+        const p = parsed as Record<string, unknown>;
+        const hasChoices = Array.isArray(p.choices) && p.choices.length > 0;
+        const hasUsage = p.usage != null;
+        // 无 choices/usage 的 chunk 只允许是收尾记账（实测 `{"choices":[],"cost":"0"}`）。
+        // 上游把错误体当 chunk 插进流时 JSON 解析必然成功 —— 此前会被静默跳过，
+        // 客户端只见「中途没了」的断流。带 error 或未知顶层字段的按脏数据上报，
+        // 由 server 层中止流并发 error 事件（行本身仍丢弃，不透传）。
+        if (!hasChoices && !hasUsage) {
+          const allowed = new Set(['choices', 'cost', 'id', 'object', 'created', 'model', 'system_fingerprint']);
+          if (Object.keys(p).some((k) => !allowed.has(k))) {
+            onDirty?.({ sample: payload.slice(0, DIRTY_SAMPLE_MAX_CHARS) });
+            return null;
+          }
+        }
+        return parsed as OpenAIStreamChunk;
+      }
+      return null;
     } catch {
       // `{` 开头但 JSON 解析失败：截断/损坏的 chunk，属于脏数据。
       onDirty?.({ sample: payload.slice(0, DIRTY_SAMPLE_MAX_CHARS) });
