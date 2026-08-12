@@ -8,7 +8,8 @@ import {
 import { extractToken, verifyAuth } from '../src/security/auth.js';
 import { validateChatRequest, validateAnthropicRequest, isJsonContentType } from '../src/security/validate.js';
 import { isPrivateUrl } from '../src/image.js';
-import { loadConfig, type AppConfig } from '../src/config.js';
+import { DEFAULT_ADMIN_PASS, loadConfig, type AppConfig } from '../src/config.js';
+import { clientIpForRateLimit } from '../src/server.js';
 
 const cfg: AppConfig = {
   host: '127.0.0.1',
@@ -417,6 +418,55 @@ describe('loadConfig', () => {
   it('MAX_MESSAGE_CHARS 空字符串走 fallback', () => {
     // 默认值按 DeepSeek V4 的 1M token 上下文留余量（约 400 万字符 × 2）。
     expect(loadConfig({ MAX_MESSAGE_CHARS: '' }).maxMessageChars).toBe(8_000_000);
+  });
+
+  it('DASHBOARD_OPEN 默认 false（fail-closed，防配置翻转即裸奔）', () => {
+    // 回归：曾默认 true —— 忘记设 DASHBOARD_OPEN=0 时管理面免凭据公开。
+    expect(loadConfig({}).dashboardOpen).toBe(false);
+    expect(loadConfig({ DASHBOARD_OPEN: '' }).dashboardOpen).toBe(false);
+  });
+
+  it('DASHBOARD_OPEN=1 且回环绑定才打开（非回环强制关）', () => {
+    expect(loadConfig({ DASHBOARD_OPEN: '1', HOST: '127.0.0.1' }).dashboardOpen).toBe(true);
+    // 绑非回环（0.0.0.0/局域网）时即使显式 1 也不放行 —— 面板含设备信息。
+    expect(loadConfig({ DASHBOARD_OPEN: '1', HOST: '0.0.0.0' }).dashboardOpen).toBe(false);
+  });
+
+  it('adminPass 默认 DEFAULT_ADMIN_PASS；显式 ADMIN_PASS 覆盖', () => {
+    expect(loadConfig({}).adminPass).toBe(DEFAULT_ADMIN_PASS);
+    expect(loadConfig({ ADMIN_PASS: 'my-strong-pass' }).adminPass).toBe('my-strong-pass');
+  });
+});
+
+describe('clientIpForRateLimit（登录限速 IP 信任决策）', () => {
+  it('非回环对端：转发头被忽略，一律回落 socket 地址（直连无盾场景）', () => {
+    // 伪造 XFF/X-Real-IP/cf-connecting-ip 都不能改变限速键 —— TCP 层对端无法伪造。
+    const withXff = clientIpForRateLimit('198.51.100.9', { 'x-forwarded-for': '10.0.0.1' });
+    const withCf = clientIpForRateLimit('198.51.100.9', { 'cf-connecting-ip': '10.0.0.2' });
+    const withReal = clientIpForRateLimit('198.51.100.9', { 'x-real-ip': '10.0.0.3' });
+    expect(withXff).toBe('198.51.100.9');
+    expect(withCf).toBe('198.51.100.9');
+    expect(withReal).toBe('198.51.100.9');
+  });
+
+  it('轮换 XFF 无法改变非回环对端的限速键（限速不可绕过）', () => {
+    // 攻击者每请求换一个 XFF：若键跟着变 = 无限爆破；必须恒等于 socket 地址。
+    const a = clientIpForRateLimit('198.51.100.9', { 'x-forwarded-for': '1.2.3.4' });
+    const b = clientIpForRateLimit('198.51.100.9', { 'x-forwarded-for': '5.6.7.8' });
+    const c = clientIpForRateLimit('198.51.100.9', { 'x-forwarded-for': '9.9.9.9' });
+    expect(new Set([a, b, c]).size).toBe(1);
+  });
+
+  it('回环对端：盾覆写的 cf-connecting-ip / 转发头被信任（本机代理场景）', () => {
+    // 盾/cloudflared 是本机进程，覆写 cf-connecting-ip 后经回环转发 → 可信。
+    expect(clientIpForRateLimit('127.0.0.1', { 'cf-connecting-ip': '203.0.113.7' })).toBe('203.0.113.7');
+    expect(clientIpForRateLimit('::1', { 'cf-connecting-ip': '203.0.113.8' })).toBe('203.0.113.8');
+    expect(clientIpForRateLimit('127.0.0.1', { 'x-forwarded-for': '203.0.113.9' })).toBe('203.0.113.9');
+  });
+
+  it('回环对端无转发头：回落 socket 地址', () => {
+    expect(clientIpForRateLimit('127.0.0.1', {})).toBe('127.0.0.1');
+    expect(clientIpForRateLimit(undefined, {})).toBe('unknown');
   });
 });
 
