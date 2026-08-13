@@ -90,7 +90,7 @@
 
 | 层级 | 样式 | 依据 |
 |---|---|---|
-| 页面级顶 tab（总览/账号/用量/设置） | **现状不动**：sticky + accent 下划线 | 已有用户认知；旧版控制台移动端同款底部 2px 横条 |
+| 页面级顶 tab（总览/账号/用量/**Keys**/设置） | **现状不动**：sticky + accent 下划线 | 已有用户认知；旧版控制台移动端同款底部 2px 横条。**2026-08-14 核对：实际是 5 个**（admin.ts:1579-1583，含分发密钥页 sec-tokens）；与账号详情内「Keys 子 tab」（本地池/远程 SA/legacy）是两回事 |
 | 详情内子 tab（新） | 纯文字 13px 无图标；非 active `--text-muted`，active `--text` + `font-weight:700`；容器 `overflow-x:auto` 隐藏滚动条（窄屏横滑） | 新版控制台 tab 条：active 仅文字变白、字重 530-700，无下划线无背景；tab 条横向滚动不收起 |
 | 侧栏子导航（sidebar） | 现状不动 | 新版控制台 Settings 左竖排子导航同款语义 |
 
@@ -224,6 +224,12 @@ sticky，滚动容器是内容区）。
 ## 4. 设置页改造方案
 
 现状 3 块（语言/模型映射/关于）纵向排，模型映射表 + 添加表单较长。
+**2026-08-14 补充现状**：设置页还有 Admin account（登录凭据）区块，且
+「当前生效密码 == 默认值（13141516）」时显示 `adminPassIsDefault` 强提示徽章
+（实心红底 oc-chip-danger，密码 label 旁 + 输入框下 oc-hint-err 双提示）——
+服务端 handleGetSettings 返回**顶层字段** `adminPassIsDefault`（server.ts:929/1005，
+精确判定 `cfg.adminPass === DEFAULT_ADMIN_PASS`，不是 source==='env' 近似），
+前端 settingsCache.def 驱动（admin.ts:3933-3954）。
 
 改造（复用现有 sidebar 子导航机制，对应新版控制台 Settings 子页模式）：
 

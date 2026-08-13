@@ -3,7 +3,8 @@
 状态：`确认` 有复现路径 / `可疑` 只是读代码推断 / `已修` 本轮修掉 / `设计取舍` 不是 bug
 / `已证伪` 曾被记为缺陷，但查证后不存在
 
-最后核对：2026-08-11，`npm test` 全绿、`tsc --noEmit` 干净。
+最后核对：2026-08-14（审计轮，`npm test` 1297 全绿、`tsc --noEmit` 干净），
+行号已按当前 main 重新定位。
 
 ## 已证伪（2026-08-09 第二轮核查）
 
@@ -74,9 +75,7 @@ opencode Zen 只认内容块数组。Claude Code 发 `content: "hi"` 字符串�
 
 ## 已修（2026-08-09）
 
-### I-1 chat 端点发顶层 reasoning_effort，DeepSeek 必 400 — 已修
-
-`request.ts` 把 OpenAI `reasoning_effort` 写成 Anthropic 顶层字段，
+### I-1 chat 端点发顶层 reasoning_effort，DeepSeek 必 400 — 已修`request.ts` 把 OpenAI `reasoning_effort` 写成 Anthropic 顶层字段，
 但 DeepSeek 只认 `output_config.effort`（[deepseek.ts:14](../../src/deepseek.ts) 自己的文档就写了这条）。
 直通路径做了转换，chat 路径没做。
 
@@ -101,6 +100,15 @@ OpenAI 客户端永远收不到 `finish_reason`，可能一直等或报错。
   所有 chunk 的 `finish_reason` 都是 null
 - 修法：加 `emittedFinish` 状态位，`message_stop` 和迭代结束时兜底补发
   （[stream.ts:205-208](../../src/stream.ts)）
+
+### I-6 SSE 解析缓冲区无上界 — 已修（2026-08-09，eac0f43）
+
+`sse.ts` 的 `buffer` 只在遇到 `\n` 时才切分。上游若发一个超长无换行的流，
+buffer 无限增长。修复后 `SSE_BUFFER_MAX_CHARS=1MB`（[sse.ts:24](../../src/sse.ts)）：
+`parseOpenAISSE` 超限抛错（[sse.ts:87-89](../../src/sse.ts)）、
+历史 `parseAnthropicSSE` 三处上限（[sse.ts:154-156/166-168/194-196](../../src/sse.ts)）。
+
+- 回归测试：`test/stream.test.ts:330-333`（超长单行断流）、`:335-340`（合法短行不触发）
 
 ## 确认（未修）
 
@@ -131,15 +139,16 @@ DSML 兜底非流式/流式两处接线）。见 [ARCHITECTURE.md](ARCHITECTURE.
 ### I-4 max_tokens 下限保护违反客户端意图
 
 thinking 非 disabled 时，`max_tokens` 会被静默抬到 4096
-（[deepseek.ts:198-206](../../src/deepseek.ts)）。客户端显式要 200 却按 4096 计费，
-且响应里没有任何提示。
+（直通 [deepseek.ts:275-281](../../src/deepseek.ts)；chat 路径已对齐，[server.ts:2837-2854](../../src/server.ts)，d359338）。
+客户端显式要 200 却按 4096 计费，且响应里没有任何提示。
 
 - 这是刻意取舍（空回复 vs 超预算），但客户端无从得知
+- 2026-08-14 更新：chat 路径已补回对齐（P1-G），「静默抬升、无提示」核心问题两条路径都仍在
 - 建议：至少在日志里记一行「max_tokens 200 → 4096」，便于排查账单疑问
 
 ### I-5 /v1/messages 不加 system 护栏
 
-`buildSystemGuard` 只在 chat 路径调用（[server.ts:729-731](../../src/server.ts)）。
+`buildSystemGuard` 只在 chat 路径调用（[server.ts:2820-2822](../../src/server.ts)）。
 直通路径的 system 原样转发，L4 防护对 Claude Code 完全不生效。
 
 - 复现：`POST /v1/messages` 带 `system`，上游收到的 system 不含护栏文本
@@ -147,24 +156,106 @@ thinking 非 disabled 时，`max_tokens` 会被静默抬到 4096
   system prompt 里插入中文安全约束可能干扰它的正常工作
 - 需要你定：是补上护栏（安全一致），还是明确写进文档说直通端点不做 L4（保持直通语义）
 
-## 可疑（读代码推断，未构造复现）
+### I-7 writeChunk 的监听器可能累积 — 确认（仍在）
 
-### I-6 SSE 解析缓冲区无上界
-
-`sse.ts` 的 `buffer`（parseOpenAISSE 在 [sse.ts:100](../../src/sse.ts)，
-历史的 parseAnthropicSSE 在 [sse.ts:35](../../src/sse.ts)）只在遇到 `\n` 时才切分。
-上游若发一个超长无换行的流，buffer 无限增长。
-
-- 上游是可信的 DeepSeek，实际风险低
-- 未验证：没构造过恶意上游
-
-### I-7 writeChunk 的监听器可能累积
-
-[server.ts:63-73](../../src/server.ts) 每次背压都 `res.once('drain'|'close'|'error')`。
+[server.ts:96-106](../../src/server.ts) 每次背压都 `res.once('drain'|'close'|'error')`。
 resolve 后另外两个监听器不会被摘掉。长流 + 频繁背压下监听器会累积，
 可能触发 MaxListenersExceededWarning。
 
-- 未验证：需要慢客户端 + 长流才能观察到
+- 2026-08-14 审计确认仍在（state.md P2 F5）
+- 修法：用具名函数 + `removeListener` 收尾
+- 未构造复现（需要慢客户端 + 长流）
+
+### I-11 面板用量 tab 三请求非 usage 视图每 2s 空转 — 确认（未修）
+
+`admin.ts` 的 `tick()`（[admin.ts:2958-2992](../../src/admin.ts)）每 2 秒无条件调用
+`fetchRequests()`/`fetchIpStats()`/`fetchAudit()`（`:2973-2975`），这三个请求渲染的
+全是 `view-usage`（用量 tab）内容。`curView` 在非 `usage` 视图（总览/账户/密钥等）
+时，每次 tick 都白打 3 个请求，只更新隐藏 DOM，无人可见。
+
+- 审计 P2 确认（不涉及正确性，纯浪费；慢网络下还在 2s 无 in-flight 防护叠加，见 I-12）
+- 修法一行：tick 里 `if (curView === 'usage')` 才发这三个请求
+
+### I-12 面板 2s tick 无 in-flight 防护，慢网络请求叠加 — 确认（未修）
+
+`admin.ts` 的 `tick()` 与 `dashboard.ts` 每 2s 发一批请求，没有 in-flight 去重。
+慢网络下上一轮请求未返回，下一轮又发出，积压可叠加（与 I-11 同一批 tick 调用）。
+审计 P2 确认，建议给 tick 请求组加 in-flight 门（进行中跳过本轮）。
+
+### I-13 flush() 整批丢弃面宽：transient 写失败连坐丢整批 — 确认（未修）
+
+`usagedb.ts` 的 `flush()`（[usagedb.ts:863-893](../../src/usagedb.ts)）在 `:870` 先把
+`pendingRows` 清空再写事务，`:887-890` catch 里整批丢弃并记日志。任何一条写入
+transient 失败（如 SQLite busy/lock）都连坐丢掉整个批（最多 50 条真实请求记录），
+后续积压照常但这一批不再重试。
+
+- 比文档宣称的「崩溃最多丢最后一批」更宽：transient 错误也丢
+- 修法：失败时把该批放回队首重试 1 次（仍失败再丢），避免无限重试拖住事件循环
+
+### I-14 早期错误（401/415）不消费 body 不关连接 → keep-alive 污染 — 确认（未修）
+
+`server.ts` 数据面鉴权失败/类型校验失败路径直接 `sendJson` 后 `return`，
+不读请求体也不关连接：[server.ts:2343](../../src/server.ts)（401）、
+`:2350-2352`/`:2361-2363`/`:2373-2375`（415，三条路径）。
+
+对比同文件已修的先例：限流响应（[server.ts:1149-1153](../../src/server.ts)）
+有 `connection: close` + `req.resume()` 双保险，注释明说「未消费的 body 残留在
+socket 上，被当成下一个请求解析（keep-alive 假 400）」；并发超限 503 也做了
+`req.resume()`（`:1907`）。401/415 路径漏了同样的处理 —— 带 body 的失败请求
+（客户端重试/脚本）会污染 keep-alive 连接，下一条请求可能被残留字节打挂。
+
+- 审计 F7 确认；修法与限流路径对齐：`req.resume()` + `connection: close`
+
+### I-15 history/trend/ipStats 缓存返回内部引用 — 确认（未修）
+
+`usagedb.ts` 三个带缓存的读方法直接把内部缓存对象返回给调用方：
+- `history()` [usagedb.ts:1382-1383](../../src/usagedb.ts) 直接 `return this.historyCache`
+- `usageTrend()` [usagedb.ts:1207-1208](../../src/usagedb.ts) 直接 `return cached.data`
+- `statsByIp()` [usagedb.ts:1056-1061](../../src/usagedb.ts) 返回 `all.slice()` 切片
+  （数组是新引用，但元素是缓存内同一对象）
+
+任何调用方改动返回结构会污染缓存，后续 15s 内所有请求读到脏数据。当前调用方
+都是只读渲染，所以是隐患不是故障；修法：返回前浅拷贝（或 `structuredClone`）。
+
+### I-16 Origin 校验数组头放行 — 确认（未修，语义错误当前不可利用）
+
+`adminOriginAllowed`（[server.ts:3258-3275](../../src/server.ts)）读
+`req.headers.origin`，`:3260` 处 `typeof origin !== 'string'` 直接 `return true`。
+攻击者发 `Origin: <valid>, <evil>` 逗号分隔数组头时，Node 会把多值头解析成数组，
+校验直接放行 —— 语义上「多 Origin 任一匹配即放行」未被实现，而是全放行。
+
+- 审计 P2 确认；浏览器发不出多值 Origin（fetch 只允许单值），所以当前不可利用
+- 修法：origin 非 string 时按拒绝处理（fail-closed），与 host 缺失时 `return false` 对齐
+
+### I-17 生产 MAX_BODY_BYTES=0（无上限）— 确认（部署配置问题，代码已安全）
+
+代码默认 `maxBodyBytes = 64MB`（[config.ts:264](../../src/config.ts)），但线上
+`fuckopencode.env` 设了 `MAX_BODY_BYTES=0`（无上限）。大 body 整读进堆 +
+注入扫描/count_tokens 放大 = 认证客户端的内存/CPU DoS 面（配合 OOM 史）。
+审计 P1-E 确认，代码默认值已是 64MB，**待办是改线上 env**：`0 → 33554432`。
+
+### I-18 注入检测围栏降权吞 ignore-instr — 确认（未修）
+
+`injection.ts` 的 `CODE_FENCE_SIGNAL_IDS`（[injection.ts:88-94](../../src/security/injection.ts)）
+只含 `fake-system-tag`/`role-takeover`/`leak-prompt` 等高危标记，**不含**
+`ignore-instr`/`ignore-instr-zh`（`:27/:32` 定义）。带语言标签的代码围栏整体降权、
+只查这 5 个标记 —— 围栏内的「忽略以上指令」句式检测不到。定位是「降噪」不是
+安全边界（设计取舍区内已注明），但 ignore-instr 正是注入句式里最常用的，降权后
+基本失效。
+
+### I-19 文档漂移：DEEPSEEK-QUIRKS 行号过期 + 模型白名单零文档 — 已修（2026-08-14）
+
+- DEEPSEEK-QUIRKS.md 引用的 deepseek.ts 行号系统性过期（9 处 8 处错）——本轮已
+  全部重新定位（deepseek.ts 现 533 行），并补 3 条新 quirk（0/13/14）。
+- 账号级模型白名单（commit d1083b8）零文档——本轮已补进 MULTI-ACCOUNT.md。
+
+### I-20 OTA 自更新未实现 — 确认（只有研究记录）
+
+只有研究没有实现：CURRENT.md 记录「OTA 研究：cursorapi/windsurf/kirostudio 三项目
+OTA 对比 + 改进提示词」，代码里没有任何自更新机制（无版本检查、无自动拉取发布、
+无更新通道）。当前部署靠手动 scp + systemctl。
+需要明确：不做（手动部署够用，但每次部署要人工介入）或做（轮询 GitHub release，
+tag 门禁 + SHA256 校验 + 原子替换 + 崩溃回滚，参考对比项目的四段式 UX）。
 
 ## 设计取舍（不是 bug）
 

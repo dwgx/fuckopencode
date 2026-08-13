@@ -547,7 +547,7 @@ GET /__metrics   （仅 isAdminRequest 通过的请求包含此段）
 
 | 文件 | 改动点 | 一句话说明 |
 |---|---|---|
-| `src/usagedb.ts` | migrate() 内 `:234-262` 加 accounts DDL（§1.3）；类尾部加 listAccounts/getAccount/insertAccount/updateAccount/deleteAccount（返回 boolean 的写操作，失败记日志返 false——管理面操作要真相，查询保持 null 降级）；文件头注释「两张表」改「三张表」 | accounts 表的底层读写，沿用全部 PRAGMA 与降级哲学 |
+| `src/usagedb.ts` | migrate() 内 `:234-262` 加 accounts DDL（§1.3）；类尾部加 listAccounts/getAccount/insertAccount/updateAccount/deleteAccount（返回 boolean 的写操作，失败记日志返 false——管理面操作要真相，查询保持 null 降级）；文件头注释「两张表」改「三张表」；**2026-08-14 再加 key_totals 聚合表**（byKey 口径聚合：flush 同事务增量 upsert + 启动初始重建 + prune 随 requests 窗口重建，byKey 读端由实时聚合改为读表 O(#keys)） | accounts 表的底层读写，沿用全部 PRAGMA 与降级哲学 |
 | `src/keypool.ts` | `PooledKey` 加 accountId（`:17-36`）；构造加第三参 `accountIds?: ReadonlyMap<string, number>`（`:152`）；新增 addKey/removeKey/accountIdOf（~15 行）；`PoolKeySnapshot` 加 accountId（`:45-64`）并写入 snapshot()（`:249-268`） | 最小改动，全部现有调用点兼容 |
 | `src/errors.ts` | 新增 `classifyAccountError(status, body)`（§4.2 表）；quotaSignals 显式加 MonthlyLimitError/UserLimitError/BlackUsageLimitError（`:147-151`） | 账户状态机与 pool 分类共享同一错误体解析，测试钉住两张表一致 |
 | `src/keyprobe.ts` | `probeKey` 加 baseUrl/model 参数（`:57-63`）；`runProbeRound` 重构为账户驱动（`:129-170`，候选规则见 §4.4）；`startKeyProbe` 签名加 accounts（`:177`）；PROBE_MODEL 拆出 PAYG 模型常量 | 探针目标从「空闲 key」变为「到期的账户」 |
@@ -597,6 +597,51 @@ GET /__metrics   （仅 isAdminRequest 通过的请求包含此段）
   页面固化为 fixture 再写解析。
 - **不做**：手动触发探针端点、账户级用量明细页、keys 独立表迁移、dashboard 主面板
   加账户区（对外只展示流量是已确认方向）。
+
+---
+
+## 9. 账号级模型白名单（allowedModels，2026-08-14 上线 d1083b8）
+
+账户级 `allowedModels` 在全局白名单（`ALLOWED_MODELS`，代码常量）之上再收紧
+单个账号可用模型；选号时两者取交集（账号不能突破全局底线）。
+
+- **PATCH `/__admin/api/accounts/:id`** body 加 `allowedModels?: string[] | null`：
+  ≤ 50 项、空串项剔除（admin.ts:155-159、250-262）。
+- **update() PATCH 语义**（accounts.ts:269-282）：`null`/空数组 = 清除回全局默认；
+  **只有 patch 显式含 allowedModels 才更新内存 allowedCache** —— 否则不含白名单的
+  PATCH（改 cookie/name/kind/workspaceId 常见操作）会把内存缓存静默清成 null
+  （d359338 修的「白名单缓存清空」回归，见 accounts.ts:277-282 注释）。
+- **拒绝路径**：postUpstreamChat 选号时 `allowedModelsOf(accountId)` 过滤
+  （server.ts:1788-1791），白名单外明确 400（`resolveModel` 不再静默回落）。
+- 空数组/全空项 = 清除；缓存懒加载重建（重启后从 DB 读）。
+
+## 10. 分发密钥（tokens，2026-08-13 上线 90164db）
+
+- **端点**：`/__admin/api/tokens` 全套（server.ts:1011-1142）：GET 列表 /
+  POST 批量创建（1-10）/ PATCH 改名/状态/备注/rpmLimit / DELETE / GET stats。
+- **tokens.ts**：`tk-` + 64 hex 生成；库内只存 `sha256(token)` 前 24 hex 指纹
+  （校验全程无解密）；**token 明文仅创建响应出现一次**（面板 overlay 只显示一次）。
+- **明文加密存储**：自定义 `sk-` 值 create 时 AES-256-GCM 加密落库
+  （tokens.ts:220-230）；补录旧 key 走 `tokenPlain`（server.ts:1096-1110）；
+  管理面查看/复制 `plainOf`（tokens.ts:149-159）。注意：usagedb.ts:617-621 的
+  「token_enc 恒为 NULL」注释已过时。
+- **per-key RPM**：`rpmLimit` 列（0 = 不限流，上限 1e6），RpmLimiter 内存滑动窗口
+  （ratelimit.ts），数据面每分发 token 请求限流（超限 429）。
+- 用量聚合按 `requests.token_fp`（取 cost_micro_cents，不自己定价）。
+
+## 11. legacy 通道（旧版控制台，opencode.ai）
+
+- **legacy.ts**：SSR 水合 HTML 解析三个页面（keys 列表 / GO 订阅+三窗口用量 / billing），
+  `/_server` 写通道（创建/删除 key、setGoToggle）。key 明文绝不出模块。
+- **服务端 TTL 缓存（2026-08-14，d359338）**：
+  - `LegacyPlainCache` 15min（legacy.ts:195）：keys/plain 端点的明文缓存
+    （main.ts 适配器每次成功抓取后填充，get 惰性过期，账户上限防膨胀）。
+  - `LegacyTtlCache` 30s（server.ts）：keys 列表 / go 状态 / billing 三读端点
+    服务端缓存（createApp 内建，只缓存成功响应，写操作成功/账号删除 clear，
+    条目存 ws，切换 workspace 不命中旧数据）——面板详情 2s tick 不再每轮打上游 HTML。
+  - 前端另有 TTL 门（admin.ts legacyDetailFresh/legacyDetailMark，成功渲染才打点，
+    失败保留 2s 自愈重试）。
+- 详情端点：`/__admin/api/legacy/account/:id/{keys,go,billing}` + 写操作 + `/keys/plain`。
 
 ## 9. 上线与运维注意
 

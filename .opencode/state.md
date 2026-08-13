@@ -135,6 +135,14 @@ OpenAI ↔ Anthropic 协议转换网关（上游 opencode Zen 订阅 + DeepSeek�
 
 **版本收尾**：v0.2.0 已 tag + push + GitHub release（github.com/dwgx/fuckopencode/releases/tag/v0.2.0）。CI（.github/workflows/ci.yml，node 22/24 × typecheck+test+build）两轮全绿。commit：d359338（fix 审计轮）/ c856f3a（ci+版本 0.2.0）/ 088a31d（actions v5）。
 
+**八、文档同步轮（2026-08-14，用户指令「深度回顾 + 整理同步清理所有文档 + 同步 status」）**
+- DEEPSEEK-QUIRKS.md 重写：行号全面重定位（9 处 8 处过期，主因 08-09 协议改造 + request.ts 退役）+ 语义更新（Quirk 3/8/9/11 已变）+ 3 条新 quirk（0 上游工具坏/13 -free 端点/14 tool_choice 400）。
+- ARCHITECTURE.md：模块表补 14 个（admin/accounts/console/legacy/oauth/tokens/settings/modelmap/ratelimit/secrets/billing/cookie/shutdown/compact）+ 前置链路（并发上限/鉴权/RPM/模型门）+ 管理面端点/表清单 + 安全 L0 + 换 key 重试不对称。
+- README.md（根）：特性/端点（管理面板表）/数据面/安全/运行章节 + env 全量清单（40 项）+ 架构树补 14 模块 + KEY_PROBE 默认值修正。
+- ISSUES.md：I-6 标已修（eac0f43）、I-7 确认仍在 + 行号更新、I-4/I-5 行号更新、新增 I-11~I-20（面板空转/flush 连坐/keep-alive 污染/缓存内部引用/Origin 数组头/MAX_BODY_BYTES/围栏降权/文档漂移/OTA）。
+- MULTI-ACCOUNT.md 补 3 章（allowedModels/tokens/legacy 通道）+ key_totals 一行；ADMIN-LAYOUT 补徽章 + 第五 tab；DEPLOY 补 MAX_BODY/并发/CI/发版/shutdown 语义 + ADMIN_PASS 默认值修正（13141516）；SHIELD 401 透传修正；CONVENTIONS 前缀列表；docs/README 文件清单补全；CONSOLE-PORT 基线数字去除。
+- CURRENT.md 重写（待办全清 + 新待办）；.opencode/state.md 本文件。
+
 ### 观察项
 - OOM 修复完整周期验证（大 body >512KB 免克隆路径）。
 - 盾高并发内存；tokens WAL 持久性（曾丢一次，checkpoint 已加固）。

@@ -21,6 +21,11 @@
 - `ISSUES.md` — 已知问题，按严重度排，带文件行号和复现条件
 - `PLAN.md` — 接下来做什么，按优先级
 - `CONVENTIONS.md` — 代码与提交风格
+- `SHIELD.md` — 护盾（kiro_shield.py）行为与端口约定（动隧道/端口前必读）
+- `MULTI-ACCOUNT.md` — 多账号面板实现契约（表结构/API/模块划分/已知取舍）
+- `ADMIN-LAYOUT.md` — 管理面板布局设计（tab 结构/设置页/移动端）
+- `CONSOLE-PORT.md` — 新版控制台（console.opencode.ai）REST 端点实测记录
+- `CONSOLE-P0-ENDPOINTS.md` — console 端点 P0 契约（分页字段/返回形状）
 
 ## 规则
 
