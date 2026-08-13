@@ -163,7 +163,7 @@ describe('TokensStore', () => {
     expect(JSON.stringify(rows)).not.toContain(a.value.token);
 
     // verify：active 匹配、未知拒绝。
-    expect(store.verify(a.value.token)).toEqual({ ok: true, fingerprint: a.value.fingerprint });
+    expect(store.verify(a.value.token)).toEqual({ ok: true, fingerprint: a.value.fingerprint, rpmLimit: 0 });
     expect(store.verify('tk-' + '0'.repeat(64)).ok).toBe(false);
 
     // 禁用 → verify 拒绝；恢复 → 放行；改名生效。
@@ -214,6 +214,29 @@ describe('TokensStore', () => {
     // 未知指纹 / 脏数据（负值）都归 0，不产生「负数限流」意外行为。
     expect(store.getRpmLimit('000000000000000000000000')).toBe(0);
     expect(store.verify(a.value.token).ok).toBe(true); // rpmLimit 不影响校验
+    db.close();
+  });
+
+  it('verify 单次点查即带回 rpmLimit（与 getRpmLimit 同口径，0 = 不限流）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'verify-rpm.db'), 30, () => {});
+    const store = new TokensStore(db);
+    const a = store.create('verify-rpm', null);
+    expect(a.ok).toBe(true);
+    if (!a.ok) return;
+    // 默认 rpm_limit=0：verify 返回 0（不限流），与 getRpmLimit 一致。
+    expect(store.verify(a.value.token)).toEqual({ ok: true, fingerprint: a.value.fingerprint, rpmLimit: 0 });
+    // 设 7 后 verify 在同一次点查里带出 7 —— 调用方不再需要为同一指纹做第二次
+    // getRpmLimit。回归：把 rpm_limit 从 verify 的 SELECT 里拿掉这条会红。
+    expect(store.update(a.value.id, { rpmLimit: 7 })).toBe('ok');
+    expect(store.verify(a.value.token)).toEqual({ ok: true, fingerprint: a.value.fingerprint, rpmLimit: 7 });
+    // 脏数据（负值）归一 0：verify 与 getRpmLimit 共用同一套归一化。
+    db.sqlite()!.prepare('UPDATE tokens SET rpm_limit = ? WHERE id = ?').run(-3, a.value.id);
+    const dirty = store.verify(a.value.token);
+    expect(dirty.ok).toBe(true);
+    if (dirty.ok) expect(dirty.rpmLimit).toBe(0);
+    if (dirty.ok) expect(dirty.rpmLimit).toBe(store.getRpmLimit(a.value.fingerprint));
+    // 未知指纹仍是 fail-closed。
+    expect(store.verify('tk-' + 'f'.repeat(64))).toEqual({ ok: false });
     db.close();
   });
 });
@@ -782,6 +805,28 @@ describe('tokens RPM 限流（入口 429，不计入上游）', () => {
       expect((await chatReq(token, s.baseUrl)).status).toBe(429);
       const r = await chatReq('env-key-1', s.baseUrl);
       expect(r.status).toBe(200);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('热路径不再调 getRpmLimit：限流值来自 verify 同一次点查（少一次同步查询）', async () => {
+    const s = await freshStack();
+    try {
+      // 给 store.getRpmLimit 套计数 —— 若 server 仍为每个请求单独查一次，
+      // 这个计数会 >0；现在限流判定直接用 verify 带回的 rpmLimit，应为 0。
+      let getRpmLimitCalls = 0;
+      const orig = s.store.getRpmLimit.bind(s.store);
+      s.store.getRpmLimit = (fp: string) => {
+        getRpmLimitCalls++;
+        return orig(fp);
+      };
+      const { token } = await createLimited(s, 2);
+      expect((await chatReq(token, s.baseUrl)).status).toBe(200);
+      expect((await chatReq(token, s.baseUrl)).status).toBe(200);
+      const r3 = await chatReq(token, s.baseUrl);
+      expect(r3.status).toBe(429);
+      expect(getRpmLimitCalls).toBe(0);
     } finally {
       await s.close();
     }

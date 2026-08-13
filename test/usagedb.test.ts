@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -304,6 +304,83 @@ describe('UsageDb 保留期清理', () => {
     db.recordRequest(row({ at: 1 })); // 极旧
     db.pruneNow(100 * 86_400_000);
     expect(db.history()!.totalRequests).toBe(1);
+    db.close();
+  });
+});
+
+describe('UsageDb 批量异步落库（热路径优化）', () => {
+  /** 用第二个只读连接看「已提交」的行数（不经 UsageDb 读方法，绕过 flush-on-read）。 */
+  function committedCount(p: string): number {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string, o?: { readOnly?: boolean }) => any;
+    };
+    const raw = new DatabaseSync(p, { readOnly: true });
+    const n = (raw.prepare('SELECT COUNT(*) AS n FROM requests').get() as { n: number }).n;
+    raw.close();
+    return n;
+  }
+
+  it('recordRequest 只入队不落库：flush 前第二个连接看不到，flush 后可见', () => {
+    // 回归：去掉批量（recordRequest 改回同步 INSERT）这条会红 —— 未 flush 就不该
+    // 有已提交行，这正是「写挪出热路径」的断言。
+    const p = path.join(tmpDir, 'batch.db');
+    const db = new UsageDb(p, 30, log);
+    db.recordRequest(row({ at: 1000, keyFingerprint: '****batch' }));
+    expect(committedCount(p)).toBe(0);
+    db.flush();
+    expect(committedCount(p)).toBe(1);
+    db.close();
+  });
+
+  it('攒满 50 条自动批量落库（不等定时器）', () => {
+    const p = path.join(tmpDir, 'batch50.db');
+    const db = new UsageDb(p, 30, log);
+    for (let i = 0; i < 50; i++) db.recordRequest(row({ at: 1000 + i, keyFingerprint: '****b50' }));
+    expect(committedCount(p)).toBe(50);
+    db.close();
+  });
+
+  it('100ms 定时器驱动批量落库', () => {
+    vi.useFakeTimers();
+    try {
+      const p = path.join(tmpDir, 'batch-timer.db');
+      const db = new UsageDb(p, 30, log);
+      db.recordRequest(row({ at: 5, keyFingerprint: '****t' }));
+      expect(committedCount(p)).toBe(0);
+      vi.advanceTimersByTime(100);
+      expect(committedCount(p)).toBe(1);
+      db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('close() 前自动 flush（干净关停不丢最后一批）', () => {
+    const p = path.join(tmpDir, 'batch-close.db');
+    const db = new UsageDb(p, 30, log);
+    db.recordRequest(row({ at: 9, keyFingerprint: '****c' }));
+    expect(committedCount(p)).toBe(0);
+    db.close();
+    expect(committedCount(p)).toBe(1);
+  });
+
+  it('读路径先 flush：recordRequest 后直接 listRequests 能看到（面板语义）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'batch-read.db'), 30, log);
+    db.recordRequest(row({ at: 1234, keyFingerprint: '****read', endpoint: 'subscription' }));
+    const page = db.listRequests(1, 10)!;
+    expect(page.items[0]!.fingerprint).toBe('****read');
+    expect(db.history()!.totalRequests).toBe(1);
+    db.close();
+  });
+
+  it('UA 解析复用：调用方已给 client 就用它，不再从 ua 重解析', () => {
+    // 回归：去掉复用（recordRequest 一律 parseUserAgent(row.ua)）这条会红 ——
+    // 落库的 client 应是调用方给的值，而不是从 ua 重解析出的 Chrome。
+    const db = new UsageDb(path.join(tmpDir, 'batch-ua.db'), 30, log);
+    db.recordRequest(row({ at: 7, ua: 'Mozilla/5.0 (X11; Linux) Chrome/120', client: 'Preparsed' }));
+    db.flush();
+    const page = db.listRequests(1, 10)!;
+    expect(page.items[0]!.client).toBe('Preparsed');
     db.close();
   });
 });
@@ -655,9 +732,11 @@ describe('UsageDb WAL 持久性加固（tokens 丢数据回归）', () => {
                 VALUES ('t1', NULL, 'fp-harden-1', 'active', NULL, 'tk', 1000)`)
       .run();
     // 模拟「异常终止前唯一的机会就是下一次写入时惰性触发的显式 checkpoint」：
-    // 把内部计时拨回过去（0 恒早于任何 now），下一次写入即触发 TRUNCATE。
+    // 把内部计时拨回过去（0 恒早于任何 now），下一次批量 flush 即触发 TRUNCATE。
     (db as unknown as { nextCheckpointAt: number }).nextCheckpointAt = 0;
     db.recordRequest(row({ at: 2000, keyFingerprint: '****ZOBb' }));
+    // 批量写入是异步的：checkpoint 跟着 flush 走，先把这批落库 + 折叠 WAL。
+    db.flush();
 
     // TRUNCATE 后 WAL 被折回主库，文件应基本为空（缺失按 0 处理）。
     const walSize = fs.existsSync(p + '-wal') ? fs.statSync(p + '-wal').size : 0;

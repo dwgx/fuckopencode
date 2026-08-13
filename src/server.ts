@@ -12,6 +12,7 @@ import {
   rejectionError,
   stripControl,
   stripSecrets,
+  UPSTREAM_TIMEOUT_ERROR,
 } from './errors.js';
 import { verifyAuth } from './security/auth.js';
 import { buildSystemGuard, detectInjection, extractAllText, scanMessagesForInjection } from './security/injection.js';
@@ -1098,6 +1099,9 @@ function validateTokenPatch(body: Record<string, unknown>): { ok: true; patch: T
  * 凭据，没有 per-key 配置；rpm_limit<=0 = 不限流。限流是网关侧策略，**不触发
  * keypool 冷却**（429 来自上游账号才是上游故障，这里是本地配置）。
  *
+ * 热路径优化：rpmLimit 是 verifyAuth 里 tokens.verify 同一次点查带回来的
+ * （tokens 行同一列），这里直接用，不再为同一指纹做第二次同步点查。
+ *
  * 拒绝时写 429：Anthropic messages 回 `{type:'error',error:{type:'rate_limit_error'}}`
  * （Claude Code 期望的原生错误格式），OpenAI chat 回 `{error:{type:'rate_limit_error'}}`
  * （与 errors.ts anthropicErrorToOpenAI 的出口同形）。两个都带 retry-after 头。
@@ -1110,20 +1114,18 @@ function checkTokenRpmLimit(
   res: ServerResponse,
   path: string,
   tokenFp: string | null,
-  tokens: TokensStore | null,
+  rpmLimit: number,
   limiter: RpmLimiter,
   ctx: MetricsCtx,
 ): boolean {
-  if (tokenFp == null) return true;
-  const limit = tokens?.getRpmLimit(tokenFp) ?? 0;
-  if (limit <= 0) return true;
-  const verdict = limiter.check(tokenFp, limit);
+  if (tokenFp == null || rpmLimit <= 0) return true;
+  const verdict = limiter.check(tokenFp, rpmLimit);
   if (verdict.allowed) return true;
   const retryAfterSec = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
   // 观测：写进 ctx.error，这条 429 会在 finally 落库（requests.error 列），
   // 面板能看出这个 token 在撞限流。不进 console（客户端死循环重试会刷屏）。
-  ctx.error = `rate-limited:${path} rpm=${limit}`;
-  const message = `rate limit exceeded (${limit}/min), retry in ${retryAfterSec}s`;
+  ctx.error = `rate-limited:${path} rpm=${rpmLimit}`;
+  const message = `rate limit exceeded (${rpmLimit}/min), retry in ${retryAfterSec}s`;
   const body =
     path === '/v1/messages'
       ? { type: 'error', error: { type: 'rate_limit_error', message } }
@@ -2189,7 +2191,7 @@ export function createApp(
           return;
         }
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
-        if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, tokens, rpmLimiter, ctx)) return;
+        if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
         await handleChatCompletion(req, res, cfg, keyPool, auth.keyId, ctx);
         return;
       }
@@ -2200,7 +2202,7 @@ export function createApp(
           return;
         }
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
-        if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, tokens, rpmLimiter, ctx)) return;
+        if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
         await handleMessagesPassThrough(req, res, cfg, keyPool, auth.keyId, ctx);
         return;
       }
@@ -2295,6 +2297,9 @@ export function createApp(
           // UA 是客户端可控的任意串，落库前剥控制符（与 error 列同口径）——
           // 否则 ANSI 注入能进详细请求页 JSON，终端型消费者可被利用。
           ua: stripControl(device.ua),
+          // 热路径优化：client 在 extractDevice 里已经解析过了，直接复用，
+          // recordRequest 不再为同一 UA 二次 parseUserAgent。
+          client: device.client,
           ip: clientIpOf(req),
           costMicroCents: ctx.costMicroCents,
           tokenFp: ctx.tokenFp,
@@ -2317,6 +2322,18 @@ export function createApp(
  */
 function isClientAbort(controller: AbortController, res: ServerResponse): boolean {
   return controller.signal.aborted && res.destroyed;
+}
+
+/**
+ * 判定流/body 消费失败是否源于**网关注侧的超时**（idle watchdog / 非流式总超时）。
+ *
+ * `controller.signal.aborted` 有两个来源：客户端断开（res close → abort）与
+ * 我们自己的定时器（idle/total/header）。客户端断开时 res 已被 destroy，所以
+ * `aborted && !destroyed` 精确区分出「网关主动掐断」—— 这是「上游响应超时」，
+ * 回给客户端的文案应明确说明，而不是泛化的 internal error（第十九轮口径）。
+ */
+function isUpstreamWatchdog(controller: AbortController, res: ServerResponse): boolean {
+  return controller.signal.aborted && !res.destroyed;
 }
 
 async function handleChatCompletion(
@@ -2541,7 +2558,10 @@ async function handleChatCompletion(
         upstream.markFailure('transient');
       }
       if (!res.writableEnded && !res.destroyed) {
-        res.write(`data: ${JSON.stringify({ error: INTERNAL_SERVER_ERROR })}\n\n`);
+        // 网关主动掐断（idle watchdog 超时）时给客户端明确「上游响应超时」；
+        // 其余流错误保持泛化 internal error。
+        const timedOut = isUpstreamWatchdog(controller, res);
+        res.write(`data: ${JSON.stringify({ error: timedOut ? UPSTREAM_TIMEOUT_ERROR : INTERNAL_SERVER_ERROR })}\n\n`);
       }
     } finally {
       upstream.release();
@@ -2553,13 +2573,20 @@ async function handleChatCompletion(
   const data = (await upstream.response.json().catch(() => null)) as OpenAIChatResponse | null;
   upstream.release();
   if (data === null) {
-    // 上游 200 但 body 非法（或 body 阶段被 idle watchdog 掐断）：记失败不记成功，
+    // 上游 200 但 body 非法（或 body 阶段被 idle/total watchdog 掐断）：记失败不记成功，
     // 否则坏 key 永不降权、requests.error 恒空。客户端主动断开触发的 abort 除外。
+    // watchdog 掐断（网关主动断开）要明确「上游响应超时」，不能泛化成 malformed body
+    // —— 客户端（Claude Code/curl）面对 502 需要能区分是上游挂了还是响应坏了。
+    const timedOut = isUpstreamWatchdog(controller, res);
     if (!isClientAbort(controller, res)) {
       upstream.markFailure('transient');
-      noteUpstreamError(ctx, 200, null);
+      // 观测：超时记成可读原因（面板/db 里能直接看到「上游响应超时」而非「upstream 200」）。
+      if (timedOut) ctx.error = 'upstream response timed out';
+      else noteUpstreamError(ctx, 200, null);
     }
-    sendJson(res, 502, { error: { message: 'upstream returned malformed body', type: 'server_error' } });
+    sendJson(res, 502, {
+      error: { message: timedOut ? UPSTREAM_TIMEOUT_ERROR.message : 'upstream returned malformed body', type: 'server_error' },
+    });
     return;
   }
   upstream.markSuccess();
@@ -2844,6 +2871,16 @@ async function handleMessagesPassThrough(
       // 上报 keypool，否则 Claude Code 停生成 5 次就把健康 key 禁 5 分钟。
       if (!isClientAbort(controller, res)) {
         upstream.markFailure('transient');
+        // 网关主动掐断（idle watchdog 超时）：给客户端明确「上游响应超时」，
+        // 别让流无声断掉（Claude Code 拿到 event: error 才能报出可读错误）。
+        if (isUpstreamWatchdog(controller, res) && !res.writableEnded) {
+          res.write(
+            `event: error\ndata: ${JSON.stringify({
+              type: 'error',
+              error: { type: 'overloaded_error', message: UPSTREAM_TIMEOUT_ERROR.message },
+            })}\n\n`,
+          );
+        }
       }
     } finally {
       upstream.release();
@@ -2856,13 +2893,18 @@ async function handleMessagesPassThrough(
   const data = (await upstream.response.json().catch(() => null)) as OpenAIChatResponse | null;
   upstream.release();
   if (data === null) {
-    // 上游 200 但 body 非法（或 body 阶段被 idle watchdog 掐断）：记失败不记成功，
+    // 上游 200 但 body 非法（或 body 阶段被 idle/total watchdog 掐断）：记失败不记成功，
     // 否则坏 key 永不降权、requests.error 恒空。客户端主动断开触发的 abort 除外。
+    // watchdog 掐断（网关主动断开）要明确「上游响应超时」，不能泛化成 malformed body。
+    const timedOut = isUpstreamWatchdog(controller, res);
     if (!isClientAbort(controller, res)) {
       upstream.markFailure('transient');
-      noteUpstreamError(ctx, 200, null);
+      if (timedOut) ctx.error = 'upstream response timed out';
+      else noteUpstreamError(ctx, 200, null);
     }
-    sendJson(res, 502, { error: { message: 'upstream returned malformed body', type: 'server_error' } });
+    sendJson(res, 502, {
+      error: { message: timedOut ? UPSTREAM_TIMEOUT_ERROR.message : 'upstream returned malformed body', type: 'server_error' },
+    });
     return;
   }
   upstream.markSuccess();

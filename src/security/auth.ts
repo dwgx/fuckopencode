@@ -2,16 +2,18 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { AppConfig } from '../config.js';
 
 export type AuthResult =
-  | { ok: true; keyId: string; tokenFp: string | null }
+  | { ok: true; keyId: string; tokenFp: string | null; rpmLimit: number }
   | { ok: false };
 
 /**
  * 分发 token 校验器的最小接口假设（tokens.ts 的 TokensStore 满足）。
  * duck typing：auth.ts 不 import tokens.ts，避免模块耦合 —— 与 console/legacy
- * 的注入点同一套路。返回指纹供落库聚合（requests.token_fp）。
+ * 的注入点同一套路。返回指纹供落库聚合（requests.token_fp）；rpmLimit 是
+ * verify 同一次点查带回来的（tokens 行同一列的 per-key 限流值，0 = 不限流），
+ * 让数据面入口不用为同一指纹再查一次。
  */
 export interface TokenVerifier {
-  verify(token: string): { ok: true; fingerprint: string } | { ok: false };
+  verify(token: string): { ok: true; fingerprint: string; rpmLimit: number } | { ok: false };
 }
 
 /**
@@ -69,23 +71,23 @@ export function verifyAuth(
     if (!token) return { ok: false };
     for (const allowed of cfg.apiKeys) {
       if (safeEqualHex(token, allowed)) {
-        return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null };
+        return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null, rpmLimit: 0 };
       }
     }
     if (tokensStore != null) {
       const r = tokensStore.verify(token);
-      if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint };
+      if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint, rpmLimit: r.rpmLimit };
     }
     return { ok: false };
   }
 
   if (token != null && tokensStore != null) {
     const r = tokensStore.verify(token);
-    if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint };
+    if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint, rpmLimit: r.rpmLimit };
   }
 
   if (cfg.allowUnauthenticated) {
-    return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null };
+    return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null, rpmLimit: 0 };
   }
   return { ok: false };
 }

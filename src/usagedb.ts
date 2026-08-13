@@ -65,6 +65,12 @@ export interface UsageRow {
   /** 原始 User-Agent（详细请求页展示；client 由本模块写入时解析）。 */
   ua: string;
   /**
+   * 调用方已解析好的 client（metrics.extractDevice 的结果）。热路径优化：请求
+   * 结束时 metrics 侧已经解析过 UA，这里直接复用，不二次 parseUserAgent；不传
+   * （如 keyprobe 这类没有设备解析的后台写入）才由本模块在入队时补解析一次。
+   */
+  client?: string | null;
+  /**
    * 调用方 IP（管理鉴权后的统计用；取自 cf-connecting-ip / x-forwarded-for 首段 /
    * socket，与登录限速同一套逻辑）。探针等后台动作不传（null）。
    */
@@ -337,6 +343,13 @@ const TOKEN_USAGE_CACHE_MS = 10_000;
 const TREND_CACHE_MS = 10_000;
 
 /**
+ * 请求记账批量写入：攒批间隔与上限。见 `recordRequest`/`flush` 的注释 ——
+ * 热路径把每请求一次同步 INSERT 改成内存队列，攒批后一次事务落库。
+ */
+const REQUEST_BATCH_MS = 100;
+const REQUEST_BATCH_MAX = 50;
+
+/**
  * 首次清理的宽限期。进程启动后等这么久才允许惰性清理跑第一次，
  * 既不让「每次重启都全表 DELETE」，也不至于像原来那样在重启频繁时永不清理。
  */
@@ -365,6 +378,13 @@ export class UsageDb {
   private insertRequest: any = null;
   private insertKeyEvent: any = null;
   private insertAdminAuditStmt: any = null;
+  /**
+   * 请求记账的批量队列（未落库的行）。recordRequest 只入队，flush 时单事务
+   * 写库 —— 见 recordRequest/flush 的注释（热路径优化：请求结束不再同步 INSERT）。
+   */
+  private pendingRows: Array<{ at: number; args: unknown[] }> = [];
+  private pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingLastAt = 0;
   private retentionMs: number;
   /**
    * 下次允许清理的最早时刻。
@@ -716,11 +736,24 @@ export class UsageDb {
     }
   }
 
-  /** 记一条请求。失败只记日志，不上抛（观测不能拖垮代理）。 */
+  /**
+   * 记一条请求（**异步批量**）：只入内存队列，攒批后一次写库。
+   *
+   * 热路径优化：原来每个请求都同步 INSERT（node:sqlite 是同步 API，阻塞事件
+   * 循环）。现在请求结束只 push 一个数组元素（亚微秒），写库挪到 `flush` ——
+   * 100ms 定时器或攒满 50 条时把整批包进一次事务（一次 fsync 而不是 N 次）。
+   * 代价：进程崩溃最多丢最后一批未落库的（可接受，观测数据非关键；`close()`
+   * 与读路径都会先 flush）。
+   * 失败只记日志，不上抛（观测不能拖垮代理）。
+   */
   recordRequest(row: UsageRow): void {
     if (!this.enabled) return;
-    try {
-      this.insertRequest.run(
+    // client 复用调用方已解析的结果（metrics.extractDevice 在请求结束时做过一次
+    // 了）；没有（keyprobe 等后台写入）才在入队时补解析一次。
+    const client = row.client ?? parseUserAgent(row.ua).client;
+    this.pendingRows.push({
+      at: row.at,
+      args: [
         row.at,
         row.keyFingerprint || '-',
         row.model || null,
@@ -735,17 +768,62 @@ export class UsageDb {
         row.error,
         row.path || null,
         row.ua || null,
-        // client 写时解析：同一 ua 只解析一次，详细请求查询直接读列。
-        parseUserAgent(row.ua).client,
+        client,
         row.ip ?? null,
         row.costMicroCents ?? 0,
         row.tokenFp ?? null,
-      );
-      this.maybePrune(row.at);
-      this.maybeCheckpoint(row.at);
-    } catch (err) {
-      this.log(`[usagedb] 写入请求记录失败（已忽略）: ${err instanceof Error ? err.message : err}`);
+      ],
+    });
+    if (row.at > this.pendingLastAt) this.pendingLastAt = row.at;
+    if (this.pendingRows.length >= REQUEST_BATCH_MAX) {
+      this.flush();
+    } else if (this.pendingTimer == null) {
+      this.pendingTimer = setTimeout(() => {
+        this.pendingTimer = null;
+        this.flush();
+      }, REQUEST_BATCH_MS);
+      // 不拖住进程退出：定时器只在有积压时存在，unref 后空转进程可正常退出。
+      this.pendingTimer.unref?.();
     }
+  }
+
+  /**
+   * 把积压的请求记录批量写库（单事务）。幂等：没有积压时是空操作。
+   *
+   * 触发点：攒满 50 条 / 100ms 定时器 / 读 requests 表的方法先 flush（保证读到的
+   * 是已落库数据，批量延迟上限 ~100ms，面板 2s 轮询不受影响）/ `close()` 收尾。
+   * 写失败整批回滚并记日志 —— 丢的是观测数据，符合「崩溃最多丢最后一批」口径，
+   * 后续积压照常（队列已清空，不再重试这一批，避免无限重试拖住事件循环）。
+   */
+  flush(): void {
+    if (this.pendingTimer != null) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = null;
+    }
+    if (!this.enabled || this.pendingRows.length === 0) return;
+    const rows = this.pendingRows;
+    this.pendingRows = [];
+    const lastAt = this.pendingLastAt;
+    this.pendingLastAt = 0;
+    try {
+      this.db.exec('BEGIN');
+      try {
+        for (const { args } of rows) this.insertRequest.run(...args);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch {
+          // 事务可能已自动回滚，忽略。
+        }
+        throw err;
+      }
+    } catch (err) {
+      this.log(`[usagedb] 批量写入请求记录失败（已忽略，丢 ${rows.length} 条）: ${err instanceof Error ? err.message : err}`);
+      return;
+    }
+    this.maybePrune(lastAt);
+    this.maybeCheckpoint(lastAt);
   }
 
   /**
@@ -763,6 +841,8 @@ export class UsageDb {
    */
   listRequests(page: number, pageSize: number, q?: string): RequestPage | null {
     if (!this.enabled) return null;
+    // 批量写入是异步的：读前先把积压 flush，保证查询读到已落库数据。
+    this.flush();
     const offset = Math.max(0, (page - 1) * pageSize);
     // LIKE 的 %/_/\ 是模式字符；用户输入是字面关键词，先转义再包 %（ESCAPE '\'）。
     const like = escapeLike(q ?? '');
@@ -827,6 +907,8 @@ export class UsageDb {
    */
   statsByIp(page: number, pageSize: number): IpStatsPage | null {
     if (!this.enabled) return null;
+    // 批量写入是异步的：读前先把积压 flush，保证聚合读到已落库数据。
+    this.flush();
     const now = Date.now();
     if (this.ipStatsCache == null || now - this.ipStatsCacheAt >= IP_STATS_CACHE_MS) {
       const fresh = this.queryIpStats();
@@ -890,6 +972,8 @@ export class UsageDb {
   usageByKeyFingerprints(fingerprints: string[], sinceMs: number): KeyFingerprintUsage {
     const empty: KeyFingerprintUsage = { requests: 0, inputTokens: 0, outputTokens: 0, costMicroCents: 0 };
     if (!this.enabled || fingerprints.length === 0) return empty;
+    // 批量写入是异步的：读前先把积压 flush，保证聚合读到已落库数据。
+    this.flush();
     const tails = fingerprints.filter((f) => f.length >= 4);
     if (tails.length === 0) return empty;
     try {
@@ -927,6 +1011,8 @@ export class UsageDb {
   tokenUsageAll(): Map<string, KeyFingerprintUsage> {
     const empty = new Map<string, KeyFingerprintUsage>();
     if (!this.enabled) return empty;
+    // 批量写入是异步的：读前先把积压 flush，保证聚合读到已落库数据。
+    this.flush();
     const now = Date.now();
     if (this.tokenUsageCache != null && now - this.tokenUsageCacheAt < TOKEN_USAGE_CACHE_MS) {
       return this.tokenUsageCache;
@@ -980,6 +1066,8 @@ export class UsageDb {
    */
   usageTrend(rangeDays: number, now?: number): UsageTrend | null {
     if (!this.enabled) return null;
+    // 批量写入是异步的：读前先把积压 flush，保证聚合读到已落库数据。
+    this.flush();
     const days = Number.isFinite(rangeDays) ? Math.max(1, Math.floor(rangeDays)) : 7;
     const nowMs = now ?? Date.now();
     const cached = this.trendCache.get(days);
@@ -1154,6 +1242,8 @@ export class UsageDb {
    */
   history(): UsageHistory | null {
     if (!this.enabled) return null;
+    // 批量写入是异步的：读前先把积压 flush，保证聚合读到已落库数据。
+    this.flush();
     const now = Date.now();
     if (this.historyCache && now - this.historyCacheAt < HISTORY_CACHE_MS) {
       return this.historyCache;
@@ -1288,6 +1378,9 @@ export class UsageDb {
   /** 立即执行一次保留期清理（跳过节流）。`retentionDays=0` 时是空操作。 */
   pruneNow(now: number): void {
     if (!this.enabled || this.retentionMs <= 0) return;
+    // 清理按已落库数据判断；批量写入是异步的，先把积压 flush 再删，
+    // 否则刚 recordRequest 的旧行会「先逃过清理、后随 flush 落库」。
+    this.flush();
     this.nextPruneAt = now + PRUNE_INTERVAL_MS;
     this.prune(now);
   }
@@ -1440,6 +1533,8 @@ export class UsageDb {
 
   /** 关闭底层句柄。幂等。 */
   close(): void {
+    // 干净关停时把积压的批量请求记录先落库（优雅退出不丢最后一批；崩溃丢失除外）。
+    this.flush();
     if (!this.db) return;
     try {
       // 显式折叠 WAL：干净关停时让主库文件就是最新状态。DatabaseSync.close()
