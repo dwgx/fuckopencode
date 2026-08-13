@@ -6,6 +6,16 @@ import { resolveUpstreamBaseUrl } from './deepseek.js';
 const UPSTREAM_TIMEOUT_MS = 120_000;
 /** 上游响应 body 的空闲超时：流式下超过该时长没有新数据即中止（防上游挂死拖住客户端）。 */
 const UPSTREAM_IDLE_TIMEOUT_MS = 90_000;
+/**
+ * 非流式请求的总超时（从请求发出起算）：一次性 JSON 响应等待的封顶。
+ *
+ * 为什么非流式不能只靠 idle 90s：非流式没有「持续吐 chunk」可续命（touch 不会被
+ * 调用），idle 实际是「响应头到达后 90s」的固定死线 —— 头到得早（常见）反而比
+ * 流式更早掐断合法长生成。改用总超时：比 idle 90s 更宽（头到得早时 body 有最多
+ * ~150s），但整体封顶 —— 客户端（Claude Code/curl）大概率在 120s 级已放弃，
+ * 网关继续挂着只占内存/连接，超时即 abort + markFailure。流式不适用（长生成合法）。
+ */
+const UPSTREAM_NONSTREAM_TOTAL_MS = 150_000;
 
 /**
  * 上游调用句柄：Response + key 释放/失败上报。
@@ -37,13 +47,18 @@ export interface UpstreamCall {
  * 上游调用的可选控制项。
  *
  * `timeouts` 只在测试里注入短值用：生产恒走 UPSTREAM_TIMEOUT_MS /
- * UPSTREAM_IDLE_TIMEOUT_MS 两个模块级常量。
+ * UPSTREAM_IDLE_TIMEOUT_MS / UPSTREAM_NONSTREAM_TOTAL_MS 三个模块级常量。
  */
 export interface UpstreamCallOptions {
   /** 换 key 重试时排除刚失败的 key（见 KeyPool.acquire 的 excludeKey） */
   excludeKey?: string;
-  /** 响应头超时 / body 空闲超时（毫秒），默认 120s / 90s */
-  timeouts?: { headerMs?: number; idleMs?: number };
+  /**
+   * 超时（毫秒），默认 headerMs 120s / idleMs 90s / totalMs 0（无总超时）。
+   *
+   * 非流式请求（body.stream !== true）生产默认走 UPSTREAM_NONSTREAM_TOTAL_MS
+   * （150s）封顶整体时长；流式仍靠 idle watchdog。测试注入短值验证行为。
+   */
+  timeouts?: { headerMs?: number; idleMs?: number; totalMs?: number };
 }
 
 /**
@@ -82,23 +97,34 @@ export async function postUpstreamChat(
   // 用一次性标志兜住，调用方就不必逐条排查控制流。
   let released = false;
 
-  // 超时是两段式的，不能用一个 AbortSignal.timeout 全程挂着：
+  // 超时是三段式的，不能用一个 AbortSignal.timeout 全程挂着：
   // 1. 响应头阶段：超过 headerMs 没拿到响应头 → abort（长生成不在这段）。
-  // 2. body 阶段：不再限制总时长，只盯「空闲」—— idleMs 无新数据才 abort。
+  // 2. body 阶段：流式不再限制总时长，只盯「空闲」—— idleMs 无新数据才 abort；
+  //    非流式（一次性 JSON）没有 chunk 可续命，改用一个从请求发出起算的
+  //    totalMs 封顶整体（比 idle 90s 更宽但封顶，客户端大概率已放弃）。
   //    fetch resolve 后 AbortSignal.timeout 没法撤（它一旦触发就 abort 整个
-  //    fetch 含 body），所以自己造 controller 管理两个定时器。
+  //    fetch 含 body），所以自己造 controller 管理三个定时器。
+  const isStream = body.stream === true;
   const controller = new AbortController();
   const headerMs = opts.timeouts?.headerMs ?? UPSTREAM_TIMEOUT_MS;
   const idleMs = opts.timeouts?.idleMs ?? UPSTREAM_IDLE_TIMEOUT_MS;
+  // 非流式才设总超时；流式恒 0（长生成合法，只靠 idle watchdog 续命）。
+  const totalMs = opts.timeouts?.totalMs ?? (isStream ? 0 : UPSTREAM_NONSTREAM_TOTAL_MS);
   let headerTimer: ReturnType<typeof setTimeout> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let totalTimer: ReturnType<typeof setTimeout> | undefined;
   const clearTimers = (): void => {
     if (headerTimer !== undefined) clearTimeout(headerTimer);
     if (idleTimer !== undefined) clearTimeout(idleTimer);
+    if (totalTimer !== undefined) clearTimeout(totalTimer);
     headerTimer = undefined;
     idleTimer = undefined;
+    totalTimer = undefined;
   };
   headerTimer = setTimeout(() => controller.abort(), headerMs);
+  if (totalMs > 0) {
+    totalTimer = setTimeout(() => controller.abort(), totalMs);
+  }
   /** 重置 body 空闲计时：调用方每次读到上游数据时调（即 UpstreamCall.touch）。 */
   const resetIdle = (): void => {
     if (idleTimer !== undefined) clearTimeout(idleTimer);
@@ -107,7 +133,7 @@ export async function postUpstreamChat(
   const releaseOnce = (): void => {
     if (released) return;
     released = true;
-    // 生命周期终点：清掉两个定时器，防测试/服务进程被残留 timer 挂住。
+    // 生命周期终点：清掉全部定时器，防测试/服务进程被残留 timer 挂住。
     clearTimers();
     pool.release(key);
   };
@@ -124,10 +150,14 @@ export async function postUpstreamChat(
       body: JSON.stringify(body),
       signal: combinedSignal,
     });
-    // 响应头已到：头超时撤下，换 idle watchdog 接管 body 阶段。
+    // 响应头已到：头超时撤下。流式换 idle watchdog 接管 body 阶段（touch 续命）；
+    // 非流式不设 idle（touch 不会被调用，idle 对一次性 JSON 没有意义），
+    // 由 totalTimer 从请求起算封顶整体。
     if (headerTimer !== undefined) clearTimeout(headerTimer);
     headerTimer = undefined;
-    resetIdle();
+    if (isStream) {
+      resetIdle();
+    }
     return {
       response,
       key,
