@@ -55,7 +55,8 @@
 
 ## 提交
 
-- 中文或英文，简洁说明性。`feat:` / `fix:` / `docs:` / `refactor:` 前缀。
+- 中文或英文，简洁说明性。前缀实践：`feat:` / `fix:` / `perf:` / `docs:` /
+  `ci:` / `test:` / `chore:`（git 全史没用过 `refactor:`）。
 - **绝不带 Claude / Anthropic 署名**（项目铁律，见 `/CLAUDE.md`）。
 - 提交前 `git add <具体文件>`，不用 `git add .`。
 - 提交前跑 `npm run typecheck && npm test`。

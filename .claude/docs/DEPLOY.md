@@ -64,6 +64,15 @@
    `dist.prevJ` 共 17 份陈旧备份（占 9.9M，已清理到 1.3M）。脚本每次轮转时
    先删旧备份再挪当前 dist，不再堆积。
 
+重启语义（2026-08-14 起，src/shutdown.ts）：SIGINT/SIGTERM → 停后台任务 →
+`server.close` → `closeIdleConnections`（掐空闲 keep-alive，活跃流式不掐）→
+5s 兜底 **exit(0)**；用量库 flush（最后一批 + WAL 收尾）推迟到退出时刻执行。
+带活跃连接重启是常态，systemd 不再记 FAILURE，最后一批用量先 flush 再退出不丢。
+
+**CI 与发版**（2026-08-14 起）：`.github/workflows/ci.yml` 已接入（push main +
+PR 触发，node 22/24 × typecheck + test + build）。发版走 tag：
+`git tag vX.Y.Z` + `gh release create vX.Y.Z`（版本号在 package.json）。
+
 ## 环境变量
 
 上游是 **opencode Zen**（`https://opencode.ai/zen`），不是 Anthropic 官方。
@@ -82,11 +91,13 @@
 | `INJECTION_MODE` | `block` |
 | `USAGE_DB_PATH` | 不设 = `data/usage.db`（相对 `WorkingDirectory`）。设为空串关闭持久化 |
 | `USAGE_DB_RETENTION_DAYS` | 不设 = 30。`0` = 不清理 |
-| `KEY_PROBE_INTERVAL_MS` | 不设 = 1800000（30 分钟）。`0` = 关闭探活 |
-| `KEY_PROBE_IDLE_MS` | 不设 = 1800000。key 空闲超过这个时长才探 |
+| `KEY_PROBE_INTERVAL_MS` | 不设 = 900000（15 分钟）。`0` = 关闭探活 |
+| `KEY_PROBE_IDLE_MS` | 不设 = 3600000（60 分钟）。key 空闲超过这个时长才探 |
 | `KEY_PROBE_TIMEOUT_MS` | 不设 = 30000 |
+| `MAX_BODY_BYTES` | 不设 = 64MB（67108864）。**线上当前设 0（无上限）是认证客户端内存 DoS 面，建议改 33554432**（改 env 后 systemctl restart） |
+| `MAX_CONCURRENT_REQUESTS` | 数据面并发在飞上限，不设 = 400，`0` = 不限（不推荐：曾是该进程唯一 OOM 向量） |
 | `ADMIN_USER` | 面板登录账号，不设 = `admin` |
-| `ADMIN_PASS` | 面板登录密码，不设 = `<REDACTED>`（**上线必改**） |
+| `ADMIN_PASS` | 面板登录密码，不设 = `<REDACTED>`（DEFAULT_ADMIN_PASS）。使用默认值时有 `adminPassIsDefault` 徽章 + stderr 告警，**上线必改** |
 | `ADMIN_SESSION_TTL_MS` | 面板会话 cookie 有效期，不设 = 24h |
 | `ADMIN_LOGIN_FAIL_LIMIT` / `ADMIN_LOGIN_LOCK_MS` | 登录失败限速（默认 5 次锁 5 分钟） |
 

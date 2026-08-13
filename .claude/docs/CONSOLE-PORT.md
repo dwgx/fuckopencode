@@ -3,7 +3,7 @@
 面向「把 OpenCode Console（console.opencode.ai）能展示、能编辑、能点击的功能
 全部搬进自建 /__admin 管理面板」的落地设计。本文档是给实现 agent 的契约：
 通道矩阵标注证据等级，接口给完整 JSON 示例，每个决策给理由与取舍。
-代码基线：当前 main（628 tests 全绿，多账号面板 + OAuth 已上线）。
+代码基线：当前 main（多账号面板 + OAuth 已上线；测试数量见 README，不在此复制）。
 
 总原则（沿用 MULTI-ACCOUNT.md）：
 
