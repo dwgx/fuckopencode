@@ -1,78 +1,98 @@
-# 热路径性能优化（2026-08-13）
+# fuckopencode 接收文档（新会话从这里开始）
 
-## 目标
-2GB VPS / Node 单线程 / 全同步 SQLite 的防御性优化。对抗审查已确认三个热点，逐一优化 + 回归测试。
-
-## 已确认事实（读文档+codegraph 核实）
-- 热路径每请求：`verifyAuth` → `tokens.verify()`（同步点查 status）→ `checkTokenRpmLimit`
-  → `tokens.getRpmLimit()`（同一行第二次同步点查 rpm_limit）→ finally `db.recordRequest`
-  （同步 INSERT + `parseUserAgent(ua)` 重复解析）。
-- `getRpmLimit` 只被 `server.ts`（checkTokenRpmLimit 内）+ test 使用。verify 的查询
-  是 `SELECT status FROM tokens WHERE fingerprint=? AND status='active'`。
-- `recordRequest` 调用方：`server.ts` finally（已有 `device=extractDevice(req)` 解析过 UA）、
-  `keyprobe.ts`（无 UA 解析）。
-- 读 requests 表的 UsageDb 方法：listRequests/statsByIp/usageByKeyFingerprints/tokenUsageAll/
-  usageTrend/history（加 flush-on-read 保持既有测试读逻辑不改）。
-- e2e「用量持久化接线」describe 有 4 条测试用裸只读连接直读 requests 表 → 注入 UsageDb
-  实例 + 测试里显式 flush。
-
-## 改动方案（全部落地）
-1. tokens.verify 返回 `{ok:true,fingerprint,rpmLimit}`（单次点查取 status+rpm_limit），
-   归一化与 getRpmLimit 共用 `normalizeRpmLimit`；auth.verifyAuth 透传 rpmLimit
-   （AuthResult 加字段）；server.checkTokenRpmLimit 去掉 tokens 参数改收 rpmLimit。
-2. recordRequest 改内存队列：100ms 定时器 / 攒满 50 条 / 读路径 / close() 触发 flush，
-   单事务批量 INSERT。崩溃最多丢最后一批。pruneNow 也先 flush（防旧行逃过清理后落库）。
-3. UsageRow 加可选 `client`，server finally 传 `device.client`（已解析），不再二次 parse。
-
-## 验证（真实输出）
-- npm run typecheck：干净
-- npm test：27 files / 1218 passed（3.36s）
-- npm run build：干净
-- 变异验证（去掉优化会红，已实测）：
-  - recordRequest 强制同步 flush → 「只入队不落库」测试红
-  - verify 不再返回 rpmLimit → 「单次点查即带回 rpmLimit」测试红
-
-## 热路径查询次数对比（每分发 key 请求）
-- 改前：2 次同步点查（verify + getRpmLimit）+ 1 次同步 INSERT + 1 次 parseUserAgent
-- 改后：1 次同步点查（verify 带回 rpmLimit）+ 0 次 INSERT（挪批量）+ 0 次 parse（复用 device.client）
-
-## 边界/诚实披露
-- server 传 device.client（raw UA 解析）与旧实现 parse(stripControl(ua)) 对含 ASCII
-  控制符的 UA 理论有差异；stripControl 只删控制符，parseUserAgent 正则不受影响，现实等价。
-- flush-on-read 保持读一致性（强于「批量延迟<1s」要求），读路径队列空时零开销。
-- 写失败整批回滚丢弃（观测数据非关键），不重试避免拖事件循环。
-- 会话期间并行 agent 的改动（deepseek/sse/toAnthropic + 其测试 + CURRENT.md）落树，未碰。
-  一次误用 `git checkout -- src/tokens.ts` 把 tokens.ts 整文件还原，已重做，最终 diff 正确。
-- 未碰 toAnthropic/deepseek/oauth/console/legacy/盾。
+更新时间：2026-08-14（最近一次大改动：账号级模型白名单 + 订阅探测）。**本项目继续由主控负责（用户明确：不用 fable，一切由主控）。** 新会话先读本文件，再读 `.claude/docs/ARCHITECTURE.md`、`DEEPSEEK-QUIRKS.md`、`SHIELD.md`、`MULTI-ACCOUNT.md`。
 
 ---
 
-## 上游慢响应处理（2026-08-13，独立会话）
+## 一、项目一句话
 
-目标：网关对上游慢/卡的处理分级（上游本身推理耗时不可控，只动网关侧）。
-硬约束只改 `upstream.ts` / `keypool.ts` / `server.ts` 上游请求区 / `errors.ts` / 相关测试。
-**未提交**（工作区含并行 agent 的在途改动）。
+OpenAI ↔ Anthropic 协议转换网关（上游 opencode Zen 订阅 + DeepSeek），带**多账号管理面板**（账号/分发密钥/RPM/热配置/观测/审计），生产在 nbus（2GB VPS），前面有 Python 护盾（FurCDN 直连回源）。
 
-### 改动（逐项）
-1. **非流式总超时**（upstream.ts）：新增 `UPSTREAM_NONSTREAM_TOTAL_MS=150_000`。
-   非流式（`body.stream !== true`）从请求起算 total 封顶（比 idle 90s 更宽但封顶），
-   流式保持 header 120s + idle 90s（touch 续命，长生成合法）。`UpstreamCallOptions.timeouts`
-   加 `totalMs`（测试注入用）。超时触发 → abort → server 非流式 data===null → markFailure('transient')。
-2. **markFailure 归因确认**：非流式总超时/idle 掐断 → `controller.signal.aborted && !res.destroyed`
-   （`isClientAbort`=aborted && destroyed，客户端断开仍不记失败，维持既有修复）。
-3. **长响应观测**：`isUpstreamWatchdog()` 区分「网关主动掐断」→ 502 文案 `upstream response
-   timed out`（errors.ts 新增 `UPSTREAM_TIMEOUT_ERROR`），ctx.error 记 `upstream response timed out`；
-   非超时非法 body 保持 `upstream returned malformed body`。流式超时错误 chunk / passthrough
-   error 事件同步用超时文案。duration 本就在 db/面板（慢响应 e2e 钉住）。
-4. **面板通道并发（item 3）审计，未改文件**：console.ts `cachedGet` 有 30s TTL 缓存但**无读单飞**
-   （只有 OAuth refresh 单飞）——多 tab 缓存过期瞬间会各打一次上游；legacy.ts `fetchLegacyKeys`
-   等**无缓存无单飞**（仅 plain 15min 缓存）。属 console.ts/legacy.ts 域，按硬约束未动，已报告。
+**测试基线：1278 条全绿**（28 文件）+ 盾测试 40/40。`npm run typecheck` 干净。
 
-### 验证
-- npm run typecheck：干净
-- npm test：27 files / 1224 passed（改前 1218 = 本会话 +6：upstream 非流式总超时 2 条、
-  e2e 文案 + 慢响应 2 条、errors 常量 2 条）
-- npm run build：干净
-- 超时参数表（改前 → 改后）：header 120s→120s（不变）；idle 90s→90s（流式，不变）；
-  非流式 total 新增 150s（原来无 total，只靠 idle 90s-from-headers 死线）
+## 二、架构（模块与数据流）
 
+```
+客户端(Claude Code/Cursor/kirostudio)
+  → FurCDN (cdn.taipei, 边缘缓存/加速)
+  → 盾 kiro_shield.py (8787, Python, 并发闸门 200/重试吸收/观测端点仅回环)
+  → 网关 main.js (8788, systemd fuckopencode)
+      ├─ 代理链路: /v1/chat/completions (OpenAI) + /v1/messages (Anthropic)
+      │   鉴权(API_KEYS/分发key) → RPM限流(ratelimit.ts) → 模型门(resolveModel)
+      │   → key池选号(keypool.ts, 账号级allowedModels过滤) → 上游(/zen/go 订阅 | /zen 按量)
+      │   → 响应转换(toAnthropic/toOpenAI/sse, 流式) → 错误分类(errors.ts)
+      ├─ 管理面: /__admin 面板(admin.ts 单文件内联JS) + /__admin/api/* (accounts/tokens/
+      │   console/legacy/settings/audit/requests/models)
+      ├─ 数据层: usagedb.ts (SQLite, WAL, 用量批量异步落库 100ms/50条事务)
+      │   accounts表(cookie/oauth加密) tokens表(分发key 明文AES加密存) settings表(热配置)
+      │   requests表(用量) admin_audit表(操作审计)
+      ├─ 控制台通道: console.ts(新版 opencode REST, cookie/Bearer fallback, OAuth补绑)
+      │   legacy.ts(旧版网页抓取: keys/GO订阅/计费)
+      └─ 观测: metrics.ts(改写/剥离/压缩计数) keyprobe.ts(探活所有key, 15m)
+```
+
+**关键设计**：
+- 密钥/明文（cookie/分发 key）AES-256-GCM 加密落库（secret.key，`1:...` 格式）；分发 key 明文加密存储、面板可查看/复制。
+- 模型门：`ALLOWED_MODELS`（deepseek-v4-flash/free 全局底线）+ **账号级 allowedModels**（accounts 表列，选号过滤，对齐 kirostudio 语义）——白名单外**明确拒绝 400**（不再静默降级）；池冷却才是 503。订阅实际可用 21 模型（探测清单见下）。
+- 上游订阅模型（**实测可用 21 个**）：deepseek-v4-flash/pro、glm-5/5.1/5.2、kimi-k2.5/2.6/2.7-code/k3、minimax-m2.5/2.7/m3、qwen3.5/3.6/3.7/3.7-max/3.8-max-plus、gpt-5.6-luna、mimo-v2.5/2.5-pro、hy3。不可用：grok-4.5(503)、mimo-v2-pro/omni(400)、hy3-preview(400)。
+- 请求日志默认过滤噪音（健康检查/probe/count_tokens），「显示全部」开关。
+- 错误透传：GoUsageLimitError 原样透传（含 Resets in ...，盾 passthrough）——下游能看到额度信号。
+
+## 三、当前状态
+
+- **最新 commit**：`d1083b8 feat: 账号级模型白名单与白名单外明确拒绝`（已 push 到 github.com:dwgx/fuckopencode main）。
+- **线上已部署**：网关 + 盾都 active（最近部署 08-14，模型白名单轮）。公网面板 200。
+- **本机压测基线**（假上游）：并发 100 → 664 RPS / 200 → 1435 RPS，错误率 0，内存 113-133MB。完整报告在 `/tmp/perf/report-baseline.json`（并发梯度/流式/分发key/混合场景）。
+- **工作树**：干净（无未提交）。
+
+## 四、最近完成（08-12 ~ 08-14 大轮）
+
+1. **多账号面板全量**：账号层 AES/OAuth/探活、双控制台通道（console 新版 + legacy 旧版）、分发密钥（RPM/明文加密查看/复制/补录）、热配置（settings 运行时）、面板全量（趋势/workspace 切换/右键详情/loading/错误中性化/请求过滤）。
+2. **线上稳定**：OOM 修复（structuredClone）、400 改写、盾并发闸门/观测回环/管理路径 401 透传/quota passthrough、GoUsageLimitError 透传、探活覆盖所有 key、非流式 150s 超时封顶。
+3. **安全加固**：伪造 Host 免鉴权（B1）、DASHBOARD_OPEN 默认关、会话密码版本、登录 Origin 校验、转发头剥离、登录 body 上限。
+4. **性能 3 轮**：热路径查询合并 + 批量异步落库、流式 O(n²) 消除 + 缓冲上限 + 字段级克隆、SSE 上限；高并发回归测试。
+5. **监控**：操作审计（admin_audit + 面板视图）、count_tokens 记账修正、趋势真实聚合。
+6. **模型白名单**（本轮）：账号级 allowedModels + 白名单外明确拒绝 400 + 被动学习 blocked + 目录定时刷新 + 面板可用模型区块。订阅 21 模型实测清单（见上）。
+7. **OTA 研究**：cursorapi/windsurf/kirostudio 三项目 OTA 对比 + 改进提示词（桌面 `OTA-改进提示词/`）。
+8. **outlook key**（sk-HwTc...7qpF）：已补进 env 账号 + 昵称「dwgx outlook key」；探活现在覆盖全部 3 key（ZOBb/0osU/7qpF）。
+
+## 五、已知遗留 / 待办（按优先级——新会话从这里继续）
+
+### P0（应修，都在 fable 提示词里——桌面 `fuckopencode-缺陷审计优化-提示词.md`）
+1. **console 读缓存无单飞**（src/console.ts cachedGet ~326 行）：30s TTL 过期瞬间多并发各打上游——加 in-flight promise 去重。配并发测试（5 并发 → 上游 1 次）。
+2. **shutdown flush 不可达**（src/main.ts ~210-219）：usageDb.close()（flush 最后一批）在 server.close 回调里，活跃 SSE 连接时 5s 兜底 exit(1) 先跑 → **每次部署丢最后一批用量**。修复：shutdown 先显式 flush + closeIdleConnections + 兜底 exit 0。
+3. **legacy keys/billing 无服务端缓存**（server.ts handleLegacyKeysList/Billing + legacy.ts fetchLegacyKeys）：面板详情 2s tick 每 2s 打上游 HTML——加服务端 TTL 缓存 + 前端 TTL 门。
+4. **默认密码弱**（13141516）：面板设置页加「默认密码建议修改」强提示徽章（读 adminPassIsDefault 字段——UI 层还没做）。
+
+### P1（性能/健壮）
+5. 注入检测预筛（injection.ts 入口 includes 词根短路——1.5KB 文本 185µs→30µs）。
+6. 鉴权 key 哈希预计算 Map（auth.ts safeEqualHex——8 key 129µs→46ns）+ apiKeys 热更新重建。
+7. tokens.verify 复用 prepared statement（38µs→2.3µs）。
+8. UA 解析 Map 缓存（上限 1000）、recordEvent 环形缓冲、RPM check 惰性分配、SSE offset 索引。
+9. 并发在飞上限（upstream.ts，超限 503，压测定阈值）。
+
+### P2（体验/观测）
+10. 面板多 tab tick 去重；gatewayPoolUsage 读 requests 未先 flush；usageTrend 失败不写缓存（瞬时 503 十秒）。
+11. 文档同步：新功能（RPM/审计/OAuth/明文存储/请求过滤/模型白名单）进 `.claude/docs/`。
+12. 订阅模型探测结果的使用：是否把 env 账号默认 allowedModels 配成订阅 21 个（用户未决定——问用户）。
+
+### 观察项
+- OOM 修复完整周期验证（大 body >512KB 免克隆路径）。
+- 盾高并发内存；tokens WAL 持久性（曾丢一次，checkpoint 已加固）。
+- kirostudio 的 GoUsageLimitError 透传实际效果（下游能否看到额度信号）。
+
+## 六、关键操作与信息
+
+- **测试/构建**：`npm test`（1278 基线）、`npm run typecheck`、`npm run build`、盾 `python3 scripts/dwgx/test-shield.py`（40/40）。
+- **部署**：`scp -P 52535 -r dist root@38.244.34.15:/root/fuckopencode/dist.new` → ssh `mv dist.prev dist; mv dist.new dist; systemctl restart fuckopencode`；盾同理 `/opt/fuckopencode-shield/kiro_shield.py` + `systemctl restart fuckopencode-shield`。
+- **线上**：ssh -p 52535 root@38.244.34.15。面板密码 `13141516`（admin/admin？——登录用 username=admin, password=13141516）。本地调试隧道：`ssh -f -N -L 8788:127.0.0.1:8788 root@38.244.34.15 -p 52535 -o ServerAliveInterval=60`（隧道不稳，每次用前 curl 检查）。
+- **密钥**：`/root/fuckopencode/fuckopencode.env`（API_KEYS 1 个管理 key + OPENSEA_KEYS 3 个池 key ZOBb/0osU/7qpF）。**SECRETS.md 规则**：凭证不外泄、只发给归属服务。
+- **kirostudio**（nbus 同机，systemd kirostudio.service，配置 /opt/kirostudio/config/）：fuckopencode 是它的上游之一（credential 1，已手动禁用——当时 v4pro 误路由质量问题）；v4pro 走官方 DeepSeek（credential 2）。
+- **git 规范**：中文提交、无 AI 署名、`feat:/fix:/perf:/docs:/test:` 前缀 + 逗号描述。
+
+## 七、约定（项目铁律）
+
+- 零运行时依赖（node: 内置 + 已装）；改动最小、外科手术式；每项修复配回归测试（去掉修复会红）；`npm test + typecheck` 全绿是底线。
+- 面板内联 JS 有 `new Function()` 解析测试防线（改 admin.ts 内联 JS 保持绿）；i18n 中英键集合一致。
+- 提交信息不带 emoji、不带 AI 署名；只提交用户要求的内容。
+- 诚实报告：测试真实输出、没跑过的不说跑过、改了什么/为什么/验证证据。
