@@ -1116,3 +1116,19 @@ npm run build      → 干净
   console 各端点是否真认 Bearer，若不认需给 console.ts 的 Bearer fallback 加白名单降级。
 - 未提交、未上线（工作区含并行 agent 的未提交改动，提交范围待用户确认）。
 
+## 第二十五轮：流式/转换路径内存优化（2026-08-13，本地验证，未提交）
+
+任务：对抗审查确认的 O(n²) 拼接 + 全量缓冲风险。只碰 toAnthropic.ts / deepseek.ts /
+sse.ts + 相关测试。typecheck 干净 + build 干净；全量 1216/1218 绿（2 条 usagedb 失败为
+并行 agent 在途改动，stash 我的改动后同样失败，与本轮无关）。
+
+| # | 项 | 改法 | 回归测试（新） |
+|---|---|---|---|
+| 1 | 流式缓冲上限 | bufferedText `+=` → 分段数组；缓冲含 `<`/`⟨`（DSML 标记信号）才累积，无标记即提前流式（TTFB 恢复首字）；超 256KB 硬上限放弃该流 DSML 兜底、转直接流式；流式遇新标记可回到缓冲重新兜底 | 上限触发转流式、无标记提前流式、放弃后不再二次缓冲、前缀 flush 后标签仍还原 |
+| 2 | normalize 克隆 | <512KB 的 structuredClone 改为 fieldCloneBody（只深拷贝会被原地修改的 messages/tools），移出 MessagePort 反序列化崩溃路径；触发压缩时回退全量拷贝 | 深层隔离、deepFreeze 零写入、压缩路径冻结也过、字段拷贝与全量路径等价 |
+| 3 | SSE buffer 上限 | parseOpenAISSE/parseAnthropicSSE 的 `buffer +=` 与 dataLines 累积设 1MB 硬上限，超限抛错断流（server 已有 catch 转错误事件 + markFailure） | 超长单行抛错、同事件 data 行累积超限抛错、大量合法短行不触发 |
+
+DSML 兜底窗口模式边界（诚实披露）：标签切在 chunk 边界的常见场景照常兜底（切片含
+`<`）；「已提前发出的前缀文本」无法追溯（保持普通文本，其后标签仍还原）；超过 256KB
+或已被放弃的流不再兜底（偶发 quirk 收益 < 内存风险，注释说明）。
+
