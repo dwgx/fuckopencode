@@ -598,6 +598,27 @@ balance_history + admin_audit（进 prune）、ConsoleClient（读缓存 TTL + �
 五个页面真实响应 fixture（usage/keys 响应含 keyId/明文 key，fixture 手动掩码），
 验证 seroval 能否直接 JSON.parse，抽查 id 跨构建稳定性。
 
+## 第二十六轮：高并发回归测试（2026-08-13，1229 tests 全绿，未提交）
+
+任务：加高并发回归测试防倒退，并发 bug 只报告不改 src（只碰 test/）。
+
+**新增 `test/concurrency.test.ts`（5 条，全启用，未发现 bug）**：
+
+| 场景 | 断言（严格，错误率必须 0） |
+|---|---|
+| 并发 50 非流式 /v1/chat/completions | 全 200、每条都带 content、上游收到全部 50 请求 |
+| 并发 30 流式 /v1/messages | 全 200、text/event-stream、message_start+message_stop 收尾（无断流）、无 event:error、上游收到 30 |
+| 混合（30 非流式 + 20 流式 + 10 面板轮询 /__metrics） | 60 全成功、流式都带 [DONE]、上游恰好收到 50 |
+| RPM 滑动窗口（rpm_limit=50，并发 80） | 恰好 50×200 + 30×429（拒绝也计数）、无其他状态、上游只收到 50、429 带 retry-after+rate_limit_error |
+| 高并发用量批量落库（并发 50 后 flush） | requests 表行数 = 50（防 REQUEST_BATCH_MAX 批量队列丢行） |
+
+验证：`npm run typecheck` 干净；`npm test` 28 文件 1229/1229 全绿（1224 + 5 新）；
+concurrency 文件连跑 5 轮全绿（无间歇竞态）。**未发现并发 bug，无 skip。**
+
+实测确认的测试基建事实（写测试时踩到）：`/__metrics` 在 `dashboardOpen=false` 下
+无凭据返回 401（e2e 里免 key 200 的那个 describe 用的是 `dashboardOpen=true`）——
+面板轮询测试要带 `x-api-key`。RpmLimiter 每 createApp 一个实例（测试用例独立窗口）。
+
 ## 环境须知
 
 - `tsc` / `vitest` 不在 PATH，用 `npx` 或 npm script
@@ -1131,4 +1152,57 @@ sse.ts + 相关测试。typecheck 干净 + build 干净；全量 1216/1218 绿�
 DSML 兜底窗口模式边界（诚实披露）：标签切在 chunk 边界的常见场景照常兜底（切片含
 `<`）；「已提前发出的前缀文本」无法追溯（保持普通文本，其后标签仍还原）；超过 256KB
 或已被放弃的流不再兜底（偶发 quirk 收益 < 内存风险，注释说明）。
+
+## 第二十七轮：GoUsageLimitError 的 key 一直 healthy + 池空错误不透传（2026-08-14，本地验证，未提交未部署）
+
+任务：用户实测「限流用完 usage 的 key 为什么还会被打到，不是应该被禁用吗」+ 「kirostudio
+收到的是 503 通用文案，GoUsageLimitError 没原样透传」。故障 A（key 该禁不禁）+ 故障 B（
+额度错误不透传）。**1238 tests 全绿 + typecheck/build 干净 + 盾 40/40。每项修复都做过
+「去掉修复即红」的变异验证。**
+
+### 线上证据（journalctl，只读）
+- `[keyprobe] account=env probe ok 200` —— env 账户每轮只有**一行**，只探 keys[0]
+- `[keypool] disabled key=****0osU reason=quota-exhausted cooldown=259260s` 在 12:01/
+  19:32/22:14/23:59 反复出现（跨 node PID 81356→86956→87962→89387→90044 = 多次重启）
+  —— 池内存进程级，**重启即清零**，坏 key 重新 healthy、被 real traffic 撞到才再禁用
+- `****7qpF` 出现在任何 disabled/recovered 日志里 —— 从未被验证过
+
+### 故障 A 根因（keyprobe.ts:224 原 `const key = keys[0]!`）
+账户驱动探活**只探每个账户的 keys[0]**。env 种子把整组 OPENSEA_KEYS（ZOBb/0osU/7qpF）
+塞进一个账户，于是只有 ZOBb 被探。0osU 靠 real traffic 撞 429 才被禁用；7qpF 从没被
+验证，加上池内存重启清零，一直 healthy 挂着、被 least-loaded 选中派流量。`staleKeys`
+（bc463bb 的按 key 探活）在生产是死代码（只有测试引用）。
+
+**修复**：`runProbeRound` 改为循环探账户内**所有** key。pool 侧 markSuccess/markFailure
+逐 key 生效（GoUsageLimitError → quota-exhausted → 长冷却禁用）；账户写账取「任一失败」
+（第一个失败，最严重语义），全过才 ok。单 key 账户行为与旧格式逐字节一致。已知取舍：
+一个 key 额度耗尽会把账户 retryUntil 推到其冷却窗口（3 天），期间同账户其他 key 不被
+重复探 —— 但每次 idle 轮都会至少探一次，且 real traffic 兜底，比「从不探」严格更好。
+回归测试：多 key 账户两个 key 都探；**排在后边的 key 额度耗尽也被禁用**（变异验证红）。
+
+### 故障 B 根因（server.ts 3 处 PoolEmptyError → 503 通用文案）
+chat 路径换 key 重试与直通路径在「有上游响应」时**已**能透传 429+GoUsageLimitError
+（`anthropicErrorToOpenAI` 对未在 TYPE_MAP 的 type 原样保留）。但整池额度耗尽时
+`acquire` 抛 `PoolEmptyError`，三个出口（server.ts:2425/2479/2773）统一回 503
+`all upstream keys are disabled` —— 上游额度信息全部丢失。**盾**又把这 503 吸收重试
+后回通用 503 中文文案（`upstream_error_detail` 对非 403 只回「上游返回 <status>」），
+所以 kirostudio 永远看不到 GoUsageLimitError。
+
+**修复**：
+1. keypool.ts：`noteQuotaError(status, body)` + `quotaEmptyError` getter（仅当**全部**
+   禁用 key 都是 quota-exhausted 且池确实空时才透传；混 auth/transient 回 null）
+2. server.ts：4 处 classify 出 quota-exhausted 时 `pool.noteQuotaError(...)`；
+   新增 `sendPoolEmpty(res, pool)` 替换 3 个 PoolEmptyError 出口（额度空透传 429 +
+   GoUsageLimitError，否则原 503）
+3. kiro_shield.py：`UPSTREAM_QUOTA_MARKERS`（GoUsageLimitError 等 5 个 type）在 classify
+   里直接 `return "pass"` —— 原样转发给 kirostudio，不吸收不重试。这是覆盖 2026-08-07
+   「任何错误不透传」用户决策的刻意例外。
+
+### 验证
+- 变异验证：改回 keys[0] 探活 → keyprobe 回归红；改回通用 503 → e2e「池空透传」红；
+  删盾 quota passthrough → test-shield 红。全部还原后全绿。
+- e2e 新增 3 条：/v1/messages 与 /v1/chat/completions 池空透传 429+GoUsageLimitError+
+  Resets in 3 days（body 无 sk-）；auth 禁用的池空仍回 503（不伪装额度）。
+- 未提交、未部署（工作区含并行 agent 未提交改动；`src/admin.ts`/`test/admin.test.ts` 的
+  改动是并行 agent 的，未碰）。部署走 `./scripts/deploy.sh`。
 
