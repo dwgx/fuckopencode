@@ -255,6 +255,18 @@ FUCKOPENCODE_TRANSIENT_MARKERS = (
     "upstream interrupted the stream",
 )
 
+# 上游明确告知的**额度耗尽**（Go 订阅周/月额度、free 日窗等）。这类在重置
+# （小时~天级）前重试全是白等，且用户要求原样透传给下游 —— 让 kirostudio
+# 知道「是额度问题 + 多久恢复」，而不是干等预算耗尽拿一个通用 503。
+# type 名取自 fuckopencode/src/errors.ts 的 quotaSignals；命中直接 "pass"。
+UPSTREAM_QUOTA_MARKERS = (
+    "GoUsageLimitError",
+    "MonthlyLimitError",
+    "UserLimitError",
+    "BlackUsageLimitError",
+    "FreeUsageLimitError",
+)
+
 # 账号被封 / 全池禁用。**要重试**，但节奏完全不同：
 # KiroStudio 换号（auto_disable + 切下一个凭据 + 推送补号）实测有约 10 分钟
 # 的空窗，期间所有请求都是 403。这类等得起，所以给长退避 + 长预算，
@@ -737,6 +749,12 @@ def classify(status, peek, path=""):
             return "pass"
     text = peek.decode("utf-8", "replace") if peek else ""
     if text:
+        # 上游额度耗尽：原样透传（不重试、不吸收）。周额度能挂 3 天，重试只
+        # 白烧预算；下游需要看到「是额度问题 + 多久恢复」—— 这是用户要求，
+        # 覆盖「任何错误都不透传」的旧决策（见 PERMANENT_BODY_MARKERS 注释）。
+        for marker in UPSTREAM_QUOTA_MARKERS:
+            if marker in text:
+                return "pass"
         # 先分流「号池救不了」的：客户端自己的错，等待纯属空转。
         # 仍然不透传原文（用户要求），但用最短窗口，别让客户端白卡。
         #

@@ -185,6 +185,21 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
             },
           }),
         );
+      } else if (messagesJson.includes('GoError透传测试')) {
+        // 测试钩子（故障 B）：上游真实的 GoUsageLimitError 形态（type + Resets in）。
+        res.writeHead(429, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: { type: 'GoUsageLimitError', message: 'Weekly usage limit reached. Resets in 3 days.' },
+          }),
+        );
+      } else if (messagesJson.includes('AuthError透传测试')) {
+        // 测试钩子：凭据失效 401（auth 禁用，12x cooldown）—— 池空但**不是**
+        // 额度耗尽，应回通用 503 而非透传额度错误。
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({ error: { type: 'authentication_error', message: 'invalid api key' } }),
+        );
       } else if (messagesJson.includes('上下文超限测试')) {
         // 测试钩子：DeepSeek 风格的上下文超限 400 —— 网关必须把它改写成
         // Claude Code 认识的 "prompt is too long"（rewriteContextOverflow），
@@ -5562,5 +5577,163 @@ describe('postUpstreamChat 超时语义（B1：头超时不误伤长流，body �
       }),
     ).rejects.toThrow('network down');
     // 失败路径：releaseOnce 已执行（幂等），不抛、不泄漏。
+  });
+});
+
+// ─── 故障 B：池空时把上游 GoUsageLimitError 原样透传（不再回通用 503） ───────
+// 整池额度耗尽时 acquire 抛 PoolEmptyError，此前统一回 503「all upstream keys
+// are disabled」—— kirostudio 这类下游拿不到「是额度问题 + 何时恢复」。
+
+function poolEmptyCfg(upstreamKeys: string[]): AppConfig {
+  return {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: [],
+    anthropicApiKey: null,
+    upstreamKeys,
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: true,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',  // 单测不落盘
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+}
+
+describe('池空透传 GoUsageLimitError（故障 B）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    const qcfg = poolEmptyCfg(['sk-go-error']);
+    qcfg.anthropicBaseUrl = fake.baseUrl;
+    qcfg.payAsYouGoBaseUrl = `${fake.baseUrl}/payg`;
+    proxy = createApp(qcfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const address = proxy.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    baseUrl = `http://127.0.0.1:${port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  it('/v1/messages：首个请求把唯一 key 打成额度耗尽，之后池空原样透传（429 + GoUsageLimitError + Resets in）', async () => {
+    const first = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: 'GoError透传测试' }],
+      }),
+    });
+    expect(first.status).toBe(429);
+
+    const second = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    // 修复前这里是 503 通用文案；现在必须带上额度信号
+    expect(second.status).toBe(429);
+    const json = (await second.json()) as { error: { type: string; message: string } };
+    expect(json.error.type).toBe('GoUsageLimitError');
+    expect(json.error.message).toContain('Weekly usage limit reached. Resets in 3 days.');
+    expect(json.error.message).not.toContain('sk-');
+  });
+
+  it('/v1/chat/completions：同一池空也透传 GoUsageLimitError', async () => {
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(429);
+    const json = (await res.json()) as { error: { type: string; message: string } };
+    expect(json.error.type).toBe('GoUsageLimitError');
+    expect(json.error.message).toContain('Resets in 3 days');
+  });
+});
+
+describe('非额度原因导致的池空仍回通用 503（不伪装成额度问题）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    const acfg = poolEmptyCfg(['sk-auth-error']);
+    acfg.anthropicBaseUrl = fake.baseUrl;
+    acfg.payAsYouGoBaseUrl = `${fake.baseUrl}/payg`;
+    proxy = createApp(acfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const address = proxy.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    baseUrl = `http://127.0.0.1:${port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  it('唯一 key 凭据失效禁用后池空：回通用 503，不透传额度错误', async () => {
+    const first = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: 'AuthError透传测试' }],
+      }),
+    });
+    expect(first.status).toBe(401);
+
+    const second = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-6',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(second.status).toBe(503);
+    const json = (await second.json()) as { error: { message: string } };
+    expect(json.error.message).toBe('all upstream keys are disabled');
   });
 });

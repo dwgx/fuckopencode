@@ -156,6 +156,10 @@ REGION_403_CLIENT = json.dumps({"error": {
     "message": "RegionError: The latest version of this model is only available "
                "hosted in China and requires explicit opt in: "
                "https://example.com/opt-in key sk-live-abc123def456ghi789"}})
+# 上游额度耗尽（fuckopencode 透传形态）：type + Resets in，应原样透传。
+GO_USAGE_LIMIT = json.dumps({"error": {
+    "type": "GoUsageLimitError",
+    "message": "Weekly usage limit reached. Resets in 3 days."}})
 
 RESULTS = []
 
@@ -216,6 +220,30 @@ def case_content_policy_fast():
         check("400 content policy 快速收敛（不拖 auth 长窗）",
               elapsed < 15,
               f"status={status} 耗时={elapsed:.1f}s（auth 长窗会是 25s+）")
+    finally:
+        shield.kill(); up.shutdown()
+
+
+def case_quota_passthrough():
+    """上游额度耗尽（GoUsageLimitError）必须原样透传，不吸收不重试。
+
+    周额度能挂 3 天，重试只白烧预算；用户要求下游知道「是额度问题 + 多久
+    恢复」。命中直接 pass，客户端收到的是上游原文（429 + body），而不是
+    干等预算耗尽后拿到通用 503。
+    """
+    up, up_port = start_fake([(429, GO_USAGE_LIMIT)] * 20)
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port)
+        check("GoUsageLimitError 原样透传（状态码 429，不是 503）",
+              status == 429 and "GoUsageLimitError" in body,
+              f"status={status} body={body[:90]}")
+        check("透传 body 带重置时间（下游知道多久恢复）",
+              "Resets in" in body,
+              f"body={body[:120]}")
+        check("不重试：上游只被请求一次（不白烧预算）",
+              up.hits == 1,
+              f"上游收到 {up.hits} 次请求")
     finally:
         shield.kill(); up.shutdown()
 
@@ -587,6 +615,7 @@ def main():
     case_403_client_fault_message_delivered()
     case_403_no_body_fallback()
     case_content_policy_fast()
+    case_quota_passthrough()
     case_admin_401_passthrough()
     case_inference_401_still_converged()
     failed = [r for r in RESULTS if not r[1]]
