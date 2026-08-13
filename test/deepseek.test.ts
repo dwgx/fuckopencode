@@ -21,6 +21,15 @@ function iter<T>(arr: T[]): AsyncIterable<T> {
   };
 }
 
+/** 递归冻结对象/数组：normalize 若原地改写入参，在 strict 模式会抛 TypeError。 */
+function deepFreeze<T>(obj: T): T {
+  if (obj == null || typeof obj !== 'object') return obj;
+  for (const key of Object.keys(obj as object)) {
+    deepFreeze((obj as Record<string, unknown>)[key]);
+  }
+  return Object.freeze(obj) as T;
+}
+
 describe('模型白名单（只放行 DeepSeek V4 两个变体）', () => {
   it('白名单就是这两个', () => {
     expect([...ALLOWED_MODELS].sort()).toEqual(['deepseek-v4-flash', 'deepseek-v4-flash-free']);
@@ -118,6 +127,97 @@ describe('normalizeAnthropicRequest', () => {
     expect(out).not.toBe(input);
     expect(input.model).toBe('claude-opus-4-6');
     expect((input.thinking as { type: string }).type).toBe('adaptive');
+  });
+
+  it('字段级拷贝：深层 messages/tools 与入参完全隔离', () => {
+    const input = {
+      model: 'claude-opus-4-6',
+      thinking: { type: 'adaptive', budget_tokens: 1024 },
+      tools: [{ name: 'f', strict: true, defer_loading: true }],
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'f', input: {} }] },
+      ],
+    };
+    const out = normalizeAnthropicRequest(input, EMPTY_MAP, DEFAULT_FALLBACK_MODEL);
+    expect(out).not.toBe(input);
+    expect(out.model).toBe('deepseek-v4-flash');
+    // 输出归一化到位：字符串 content 转块数组、assistant 注入 thinking、工具剥 strict。
+    const msgs = out.messages as Array<{ role: string; content: unknown }>;
+    expect(msgs[0]!.content).toEqual([{ type: 'text', text: 'hi' }]);
+    expect((msgs[1]!.content as Array<{ type: string }>)[0]).toEqual({ type: 'thinking', thinking: '', signature: '' });
+    expect(out.tools).toEqual([{ name: 'f' }]);
+    // 入参侧完全未被污染（含嵌套对象与数组）。
+    expect(input.model).toBe('claude-opus-4-6');
+    expect((input.thinking as { type: string }).type).toBe('adaptive');
+    expect(input.tools).toEqual([{ name: 'f', strict: true, defer_loading: true }]);
+    expect((input.messages[0] as { content: string }).content).toBe('hi');
+    expect((input.messages[1] as { content: unknown }).content).toEqual([
+      { type: 'tool_use', id: 't1', name: 'f', input: {} },
+    ]);
+  });
+
+  it('字段级拷贝：深度冻结的入参也能归一化（绝不原地改写入参）', () => {
+    // 深拷贝若不覆盖某处原地修改，冻结对象会在 strict 模式下抛 TypeError ——
+    // 比逐字段断言更强：直接证明 normalize 对入参零写入。
+    const input = deepFreeze({
+      model: 'claude-opus-4-6',
+      thinking: { type: 'adaptive', budget_tokens: 1024 },
+      tools: [{ name: 'f', strict: true }],
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'f', input: {} }] },
+      ],
+    });
+    const out = normalizeAnthropicRequest(input, EMPTY_MAP, DEFAULT_FALLBACK_MODEL);
+    expect(out.model).toBe('deepseek-v4-flash');
+    const msgs = out.messages as Array<{ content: Array<{ type: string }> }>;
+    expect(msgs[1]!.content[0]!.type).toBe('thinking');
+    expect(out.tools).toEqual([{ name: 'f' }]);
+  });
+
+  it('触发被动压缩时深度冻结的入参也能归一化（压缩走全量拷贝保契约）', () => {
+    const input = deepFreeze({
+      model: 'm',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'a   b\n\n  c' }] }],
+    });
+    // triggerBytes 配到 <512KB：压缩改 content 块内文本，字段级拷贝覆盖不到，
+    // 应回退 structuredClone 全量拷贝。
+    const out = normalizeAnthropicRequest(input, EMPTY_MAP, DEFAULT_FALLBACK_MODEL, {
+      bodyBytes: 4096,
+      triggerBytes: 1024,
+      maxMessageChars: 8000,
+    });
+    const outText = (out.messages as Array<{ content: Array<{ text: string }> }>)[0]!.content[0]!.text;
+    expect(outText).toBe('a b c');
+    // 入参不被压缩改写。
+    const inText = (input.messages as Array<{ content: Array<{ text: string }> }>)[0]!.content[0]!.text;
+    expect(inText).toBe('a   b\n\n  c');
+  });
+
+  it('字段级拷贝输出与触发压缩时的全量拷贝路径等价', () => {
+    // 同一 body 分别走「字段级拷贝」（不压缩）与「全量拷贝」（触发压缩）：
+    // 压缩只折叠空白，归一化的其余结果必须逐字段一致。
+    const make = () => ({
+      model: 'claude-opus-4-6',
+      thinking: { type: 'adaptive', budget_tokens: 1024 },
+      reasoning_effort: 'high',
+      context_management: { type: 'auto' },
+      max_tokens: 200,
+      tools: [{ name: 'web_search_preview', type: 'web_search_2025' }, { name: 'f', strict: true }],
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'user', content: [{ type: 'text', text: 'b' }] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'f', input: {} }] },
+      ],
+    });
+    const field = normalizeAnthropicRequest(make(), EMPTY_MAP, DEFAULT_FALLBACK_MODEL);
+    const full = normalizeAnthropicRequest(make(), EMPTY_MAP, DEFAULT_FALLBACK_MODEL, {
+      bodyBytes: 4096,
+      triggerBytes: 1024,
+      maxMessageChars: 8000,
+    });
+    expect(field).toEqual(full);
   });
 
   it('非法 body 抛错', () => {

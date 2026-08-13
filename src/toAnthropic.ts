@@ -10,6 +10,23 @@ import type {
   OpenAIStreamChunk,
 } from './types.js';
 
+/**
+ * 流式文本缓冲上限。DSML 兜底（DEEPSEEK-QUIRKS 第 12 条）需要把一段文本缓冲到流
+ * 结束才能解析分片标签，但大响应（5-50MB）全量缓冲是内存风险（2GB VPS 693 次
+ * OOM 教训）。超过上限立即转普通文本流式转发，放弃该流的 DSML 兜底：DSML 泄漏是
+ * 偶发 quirk，长文本的兜底收益 < 内存风险。
+ */
+const STREAM_TEXT_BUFFER_CAP = 256 * 1024;
+
+/**
+ * 提前 flush 的 DSML 标记信号。DSML 泄漏标签一律以 `<`/`⟨` 开头（quirk 12 的三种
+ * 前缀形态 `|DSML|` / `antml:` / 全角 `｜` 以及无前缀形态都如此）。缓冲里完全没有
+ * `<`/`⟨` → 不可能是泄漏中的工具调用，立刻按普通文本流式转发 —— 顺带把 TTFB 从
+ * 「整个 text 块结束」恢复成「首字」。标签被切在 chunk 边界的常见场景，切片后任何
+ * 一段都含 `<`/`⟨`，仍会继续缓冲到收尾，DSML 兜底行为不变。
+ */
+const DSML_TAG_SIGNAL = /[<⟨]/;
+
 /** OpenAI finish_reason → Anthropic stop_reason。 */
 export function openAIFinishReasonToAnthropic(
   reason: OpenAIFinishReason | null | undefined,
@@ -154,13 +171,22 @@ export async function* openAIStreamToAnthropic(
   let messageId = options.id;
   let model = options.model;
   /**
-   * 流式文本缓冲。上游偶发把工具调用当文本吐（DSML 包裹），流式下边收边吐
-   * 无法中途判断，所以**缓冲整个 text 块**到流结束，收尾时统一解析——
-   * 解析出 DSML 就还原成 tool_use 块，否则原样补发 text。
-   * 代价：流式文本的 TTFB 从「首字」变成「整个 text 块结束」。工具调用场景
-   * 本来就要等工具结果，牺牲可接受；纯长文对话会有感知延迟。
+   * 流式文本缓冲。上游偶发把工具调用当文本吐（DSML 包裹），流式下边收边吐无法
+   * 中途判断，所以需要缓冲一段文本在收尾统一解析（见下）：
+   * - 缓冲里没有任何 DSML 标记形态（`<`/`⟨`，quirk 12 的标签一律以它们开头）时
+   *   立刻按普通文本流式转发 —— 长文对话的 TTFB 恢复为「首字」，也不做全量缓冲。
+   * - 出现标记形态后缓冲到流结束，收尾统一解析还原成 tool_use 块；标签被切在
+   *   chunk 边界的常见场景，切片后的任何一段都含 `<`/`⟨`，仍能兜底。
+   * - 缓冲超过 STREAM_TEXT_BUFFER_CAP（256KB）立即转普通文本流式，放弃该流的
+   *   DSML 兜底：DSML 泄漏是偶发 quirk，长文本的兜底收益 < 内存风险。
    */
-  let bufferedText = '';
+  let bufferedSegments: string[] = [];
+  let bufferedLength = 0;
+  let sawDsmlSignal = false;
+  /** 已提前把文本流式转发（无标记触发）；遇到标记可回到缓冲模式重新兜底。 */
+  let streaming = false;
+  /** 缓冲超过硬上限：放弃本流 DSML 兜底，之后文本一律直接流式。 */
+  let abandoned = false;
   /** DSML 还原出工具调用时要把 stop_reason 纠正为 tool_use（同非流式）。 */
   let recoveredToolUse = false;
 
@@ -186,6 +212,25 @@ export async function* openAIStreamToAnthropic(
     if (openTextBlock) {
       yield { type: 'content_block_stop', index: openTextBlock.index };
       openTextBlock = null;
+    }
+  };
+
+  /**
+   * 确保存在一个打开的 text 块：打开的是 thinking/tool 块就先闭合（Anthropic 块
+   * 不能交错），再新开 text 块；已是 text 块则复用（流式增量续写）。
+   */
+  const ensureTextBlock = function* (): Generator<AnthropicStreamEvent> {
+    if (openTextBlock && openTextBlock.kind !== 'text') {
+      yield { type: 'content_block_stop', index: openTextBlock.index };
+      openTextBlock = null;
+    }
+    if (!openTextBlock) {
+      openTextBlock = { index: nextIndex++, kind: 'text' };
+      yield {
+        type: 'content_block_start',
+        index: openTextBlock.index,
+        content_block: { type: 'text', text: '' },
+      };
     }
   };
 
@@ -226,16 +271,60 @@ export async function* openAIStreamToAnthropic(
       };
     }
 
-    // 2. content → text 块：缓冲到流结束，收尾统一解析 DSML（见收尾段）。
+    // 2. content → text 块：优先按需缓冲（DSML 分片判定），无标记/超上限时提前转流式。
     if (typeof delta.content === 'string' && delta.content) {
       yield* ensureStart();
-      // 首次收到文本时关掉 thinking 块，让收尾能新开独立的 text 块
-      // （否则缓冲的文本会被误并入还在开着的 thinking 块）。
+      // 首次收到文本时关掉 thinking 块，让文本能开独立的 text 块
+      // （否则缓冲/流式文本会误并入还在开着的 thinking 块）。
       if (openTextBlock && openTextBlock.kind !== 'text') {
         yield { type: 'content_block_stop', index: openTextBlock.index };
         openTextBlock = null;
       }
-      bufferedText += delta.content;
+      const hasSignal = DSML_TAG_SIGNAL.test(delta.content);
+      if (abandoned || (streaming && !hasSignal)) {
+        // 已放弃该流兜底，或已在流式转发且这段仍无标记：直接增量发出。
+        yield* ensureTextBlock();
+        yield {
+          type: 'content_block_delta',
+          index: openTextBlock!.index,
+          delta: { type: 'text_delta', text: delta.content },
+        };
+        continue;
+      }
+      if (streaming && hasSignal) {
+        // 流式模式遇到标记：关掉当前 text 块回到缓冲，让收尾能把这部分解析
+        // 还原成 tool_use（已提前发出的前缀文本保持原样，无法追溯）。
+        if (openTextBlock) {
+          yield { type: 'content_block_stop', index: openTextBlock.index };
+          openTextBlock = null;
+        }
+        streaming = false;
+      }
+      bufferedSegments.push(delta.content);
+      bufferedLength += delta.content.length;
+      if (hasSignal) sawDsmlSignal = true;
+      const flushAsPlainText = function* (): Generator<AnthropicStreamEvent> {
+        yield* ensureTextBlock();
+        yield {
+          type: 'content_block_delta',
+          index: openTextBlock!.index,
+          delta: { type: 'text_delta', text: bufferedSegments.join('') },
+        };
+        bufferedSegments = [];
+        bufferedLength = 0;
+        sawDsmlSignal = false;
+      };
+      if (bufferedLength > STREAM_TEXT_BUFFER_CAP) {
+        // 超过硬上限：放弃该流的 DSML 兜底，转普通文本流式。
+        yield* flushAsPlainText();
+        abandoned = true;
+        continue;
+      }
+      if (!sawDsmlSignal) {
+        // 缓冲里没有任何 DSML 标记形态：不可能是泄漏中的工具调用，提前转流式。
+        yield* flushAsPlainText();
+        streaming = true;
+      }
     }
 
     // 3. tool_calls → tool_use 块（每个 OpenAI index 一个独立块）
@@ -273,6 +362,7 @@ export async function* openAIStreamToAnthropic(
   yield* ensureStart();
 
   // 解析缓冲的文本：DSML → tool_use 块；普通文本 → 补发 text 块。
+  const bufferedText = bufferedSegments.join('');
   if (bufferedText) {
     // 收尾时 thinking 块可能还开着：上游先吐 content 再吐 reasoning_content 时，
     // content 已缓冲、随后 reasoning 开了 thinking 块，这里 text_delta 不能发进

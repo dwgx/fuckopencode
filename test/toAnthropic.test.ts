@@ -391,9 +391,11 @@ describe('openAIStreamToAnthropic', () => {
     expect(delta.usage).toEqual({ output_tokens: 9, input_tokens: 5 });
   });
 
-  it('content 先于 reasoning_content 时，收尾文本不发进 thinking 块', async () => {
-    // 回归：上游先 content 后 reasoning_content 时，收尾段曾把缓冲文本以
+  it('content 先于 reasoning_content 时，各自独立成块，文本不进 thinking 块', async () => {
+    // 回归：上游先 content 后 reasoning_content 时，旧实现把缓冲文本在收尾以
     // text_delta 发进仍开着的 thinking 块（协议非法，Claude Code 报错/丢弃）。
+    // 现在 content 无 DSML 标记会提前流式成独立 text 块，reasoning 后到再开
+    // thinking 块 —— 文本绝不落进 thinking 块的不变量比旧实现更强。
     const events = await collect(
       openAIStreamToAnthropic(
         chunks([chunk({ content: '答' }), chunk({ reasoning_content: '想' }), chunk({}, 'stop')]),
@@ -402,16 +404,16 @@ describe('openAIStreamToAnthropic', () => {
     const starts = events.filter(
       (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_start' }> => e.type === 'content_block_start',
     );
-    // thinking 块先开，text 块单独新开（收尾先闭合 thinking）。
+    // content 先到：text 块先开（提前 flush），reasoning 后到再开 thinking 块。
     expect(starts).toHaveLength(2);
-    expect(starts[0]!.content_block.type).toBe('thinking');
-    expect(starts[1]!.content_block.type).toBe('text');
+    expect(starts[0]!.content_block.type).toBe('text');
+    expect(starts[1]!.content_block.type).toBe('thinking');
     // 文本 text_delta 必须落在 text 块 index 上，绝不能落进 thinking 块。
     const textDelta = events.find(
       (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_delta' }> =>
         e.type === 'content_block_delta' && 'text' in e.delta,
     )!;
-    expect(textDelta.index).toBe(starts[1]!.index);
+    expect(textDelta.index).toBe(starts[0]!.index);
     expect(textDelta.delta).toEqual({ type: 'text_delta', text: '答' });
     // 所有块都有闭合（没有泄漏未闭合的 thinking 块）。
     const stops = events.filter((e) => e.type === 'content_block_stop');
@@ -421,6 +423,75 @@ describe('openAIStreamToAnthropic', () => {
   it('空流也补出自洽骨架，不让客户端挂死', async () => {
     const events = await collect(openAIStreamToAnthropic(chunks([])));
     expect(events.map((e) => e.type)).toEqual(['message_start', 'message_delta', 'message_stop']);
+  });
+});
+
+describe('流式文本缓冲上限与提前 flush', () => {
+  const textOf = (events: AnthropicStreamEvent[]): string =>
+    events
+      .filter(
+        (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_delta' }> =>
+          e.type === 'content_block_delta' && 'text' in e.delta,
+      )
+      .map((e) => ('text' in e.delta ? e.delta.text : ''))
+      .join('');
+
+  it('无 DSML 标记形态：首个文本 chunk 即流式发出（不缓冲到收尾）', async () => {
+    const events = await collect(
+      openAIStreamToAnthropic(chunks([chunk({ content: '你' }), chunk({ content: '好' }), chunk({}, 'stop')])),
+    );
+    const firstText = events.findIndex((e) => e.type === 'content_block_delta' && 'text' in (e as { delta: { text?: string } }).delta);
+    const messageDelta = events.findIndex((e) => e.type === 'message_delta');
+    // TTFB 恢复：text_delta 在 message_delta 之前出现（而非缓冲到收尾统一发）。
+    expect(firstText).toBeGreaterThanOrEqual(0);
+    expect(firstText).toBeLessThan(messageDelta);
+    expect(textOf(events)).toBe('你好');
+  });
+
+  it('超过缓冲上限立即转普通文本流式（放弃该流 DSML 兜底）', async () => {
+    // 内容带 `<`（DSML 标记形态）会先缓冲，超过 256KB 上限后转流式转发。
+    const big = '<' + 'x'.repeat(300 * 1024);
+    const events = await collect(
+      openAIStreamToAnthropic(chunks([chunk({ content: big }), chunk({ content: 'tail' }), chunk({}, 'stop')])),
+    );
+    expect(textOf(events)).toBe(big + 'tail');
+    // 正常收尾骨架仍在（放弃兜底不能挂死客户端）。
+    const types = events.map((e) => e.type);
+    expect(types.at(-1)).toBe('message_stop');
+    expect(types.at(-2)).toBe('message_delta');
+    // 文本块在流中途出现，不是缓冲到收尾才发。
+    const stopIdx = events.findIndex((e) => e.type === 'content_block_stop');
+    expect(stopIdx).toBeLessThan(events.findIndex((e) => e.type === 'message_delta'));
+  });
+
+  it('超上限放弃兜底后，后续文本（含新标记）一律直接流式', async () => {
+    const big = '<' + 'a'.repeat(300 * 1024);
+    const mid = 'b'.repeat(1000);
+    const events = await collect(
+      openAIStreamToAnthropic(
+        chunks([chunk({ content: big }), chunk({ content: mid }), chunk({ content: '<again' }), chunk({}, 'stop')]),
+      ),
+    );
+    expect(textOf(events)).toBe(big + mid + '<again');
+  });
+
+  it('DSML 标签前的普通文本被提前 flush，标签本身仍被兜底还原', async () => {
+    // 前缀文本无标记 → 提前流式；随后出现的 DSML 泄漏仍要能还原（流式可回到缓冲）。
+    const leaked =
+      '<|DSML|function_calls>\n<|DSML|invoke name="Bash"><|DSML|parameter name="command">ls</|DSML|parameter></|DSML|invoke>\n</|DSML|function_calls>';
+    const events = await collect(
+      openAIStreamToAnthropic(chunks([chunk({ content: '前缀' }), chunk({ content: leaked }), chunk({}, 'stop')])),
+    );
+    const texts = textOf(events);
+    expect(texts).toContain('前缀');
+    const toolUse = events.find(
+      (e): e is Extract<AnthropicStreamEvent, { type: 'content_block_start' }> =>
+        e.type === 'content_block_start' && e.content_block.type === 'tool_use',
+    );
+    expect(toolUse).toBeDefined();
+    expect((toolUse!.content_block as { name: string }).name).toBe('Bash');
+    expect(texts).not.toContain('DSML');
+    expect(texts).not.toContain('<invoke');
   });
 });
 
