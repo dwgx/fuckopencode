@@ -108,6 +108,13 @@ export function maskOf(fingerprint: string, prefix?: string | null): string {
   return `${p}-****${fingerprint.slice(-8)}`;
 }
 
+/** rpm_limit 归一化：非正数/脏数据一律归 0（rpm_limit=0 语义 = 不限流）。
+ *  verify 与 getRpmLimit 共用同一套规则，保证两处口径完全一致。 */
+function normalizeRpmLimit(v: unknown): number {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
 /**
  * tokens 表读写。降级：db 不可用 → list 空、verify 恒失败（fail-closed）、
  * 写操作返回 false，绝不抛。与 modelmap.ts 同模式（sqlite 句柄由
@@ -311,8 +318,7 @@ export class TokensStore {
       const row = this.raw
         .prepare('SELECT rpm_limit FROM tokens WHERE fingerprint = ?')
         .get(fingerprint) as { rpm_limit?: unknown } | undefined;
-      const n = Number(row?.rpm_limit);
-      return Number.isInteger(n) && n > 0 ? n : 0;
+      return normalizeRpmLimit(row?.rpm_limit);
     } catch (err) {
       console.warn(`[tokens] rpm_limit 查询失败（按不限流处理）: ${err instanceof Error ? err.message : err}`);
       return 0;
@@ -320,17 +326,22 @@ export class TokensStore {
   }
 
   /**
-   * 校验客户端 token：算指纹 → 查表（存在且 active）→ 命中返回指纹。
+   * 校验客户端 token：算指纹 → 查表（存在且 active）→ 命中返回指纹 + rpmLimit。
+   *
+   * 热路径优化：verify 本来就要点查 tokens 这一行，rpm_limit 是同一行的列 ——
+   * 一并取回，调用方（server 的 checkTokenRpmLimit）不用再为同一指纹做第二次
+   * 同步点查。rpmLimit 归一化与 getRpmLimit 完全一致（非正整数归 0，
+   * rpm_limit=0 语义不变 = 不限流）。
    * **全程无解密**；db 不可用恒返回失败（fail-closed）。
    */
-  verify(token: string): { ok: true; fingerprint: string } | { ok: false } {
+  verify(token: string): { ok: true; fingerprint: string; rpmLimit: number } | { ok: false } {
     if (!this.enabled) return { ok: false };
     const fingerprint = fingerprintOf(token);
     try {
       const row = this.raw
-        .prepare("SELECT status FROM tokens WHERE fingerprint = ? AND status = 'active'")
-        .get(fingerprint) as { status: string } | undefined;
-      return row ? { ok: true, fingerprint } : { ok: false };
+        .prepare("SELECT status, rpm_limit FROM tokens WHERE fingerprint = ? AND status = 'active'")
+        .get(fingerprint) as { status: string; rpm_limit?: unknown } | undefined;
+      return row ? { ok: true, fingerprint, rpmLimit: normalizeRpmLimit(row.rpm_limit) } : { ok: false };
     } catch (err) {
       console.warn(`[tokens] 校验查询失败: ${err instanceof Error ? err.message : err}`);
       return { ok: false };
