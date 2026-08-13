@@ -714,6 +714,17 @@ describe('统一容器模板 .panel（opencode 风格：所有区块容器同一
     expect(code).toContain('data-go-toggle="useBalance"');
   });
 
+  it('renderGo 三窗口含每周行，百分比与重置时间同行（「每周 77% · 重置于 X」口径）', () => {
+    const code = inlineScript();
+    // 三窗口渲染序列必须包含每周行（用户要的 weekusage）。
+    expect(code).toContain("row(T('goWeekly'), go.weekly)");
+    // 重置时间拼进 go-pct 行内（· 分隔），不再单独占一行。
+    expect(code).toContain("' · ' + T('goReset')");
+    expect(code).toContain("pctTxt + '<span class=\"go-reset\">' + resetTxt");
+    // 超额百分比钳到 100 画条（与 previewGoBox 同口径；renderGo 内而非 previewGoBox 内）。
+    expect(code).toMatch(/function renderGo[\s\S]{0,1200}Math\.max\(0,\s*Math\.min\(100,\s*w\.usagePercent\)\)/);
+  });
+
   it('容器内小卡去边框（防嵌套双框：preview-box / balance-card / balance-hero 无边框透明）', () => {
     expect(ADMIN_HTML).toContain('.preview-box { min-width: 0; }');
     expect(ADMIN_HTML).toContain('.balance-card { padding: 10px 14px; min-width: 148px; }');
