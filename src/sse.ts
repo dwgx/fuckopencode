@@ -17,6 +17,13 @@ export interface DirtyStreamLine {
 const DIRTY_SAMPLE_MAX_CHARS = 200;
 
 /**
+ * SSE 解析 buffer 上限。上游/中间层可能吐出超长单行（恶意或异常）而不换行，
+ * `buffer += ...` 会无限增长吃内存。超限直接抛错断开该流（由 server 层转成错误
+ * 事件 + 上报 keypool），错误文案不带任何上游内容（可能回显 Authorization 头）。
+ */
+const SSE_BUFFER_MAX_CHARS = 1024 * 1024;
+
+/**
  * 解析 **OpenAI** Chat Completions 流（`data: {...}` 行 + `[DONE]`）为 chunk 序列。
  *
  * 上游 opencode Zen 的 OpenAI 端点收尾会发 `{"choices":[],"cost":"0"}` 记账 chunk，
@@ -76,6 +83,10 @@ export async function* parseOpenAISSE(
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
+      // 超长行保护：一行塞满 1MB 说明上游异常，断流报错（不回带上游内容）。
+      if (buffer.length > SSE_BUFFER_MAX_CHARS) {
+        throw new Error('SSE buffer exceeded limit (stream aborted)');
+      }
 
       let newlineIndex: number;
       while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
@@ -114,11 +125,14 @@ export async function* parseAnthropicSSE(
   const decoder = new TextDecoder();
   let buffer = '';
   let dataLines: string[] = [];
+  /** dataLines 累积字符数（同一事件里多个 data: 行不换行分隔时也受同一上限约束）。 */
+  let dataLinesChars = 0;
 
   const flush = (): AnthropicStreamEvent[] => {
     if (dataLines.length === 0) return [];
     const raw = dataLines.join('\n');
     dataLines = [];
+    dataLinesChars = 0;
     if (raw === '[DONE]') return [];
     try {
       const parsed = JSON.parse(raw) as AnthropicStreamEvent | null;
@@ -136,6 +150,10 @@ export async function* parseAnthropicSSE(
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
+      // 超长行保护：一行塞满 1MB 说明上游异常，断流报错（不回带上游内容）。
+      if (buffer.length > SSE_BUFFER_MAX_CHARS) {
+        throw new Error('SSE buffer exceeded limit (stream aborted)');
+      }
 
       let newlineIndex: number;
       while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
@@ -143,11 +161,17 @@ export async function* parseAnthropicSSE(
         buffer = buffer.slice(newlineIndex + 1);
         if (line.startsWith('data:')) {
           dataLines.push(line.slice(5).replace(/^ /, ''));
+          dataLinesChars += line.length;
+          // 同一事件里 data: 行累积也受上限约束（异常上游不换行刷屏）。
+          if (dataLinesChars > SSE_BUFFER_MAX_CHARS) {
+            throw new Error('SSE buffer exceeded limit (stream aborted)');
+          }
         } else if (line === '') {
           yield* flush();
         } else if (line.startsWith('{')) {
           // 裸 JSON 行（opencode 风格）：直接作为一条事件处理。
           dataLines.push(line);
+          dataLinesChars += line.length;
           yield* flush();
         }
         // event: 行只作为辅助，类型以 data 内 JSON 的 type 字段为准。
@@ -157,9 +181,18 @@ export async function* parseAnthropicSSE(
     // EOF：处理 buffer 里残留的无换行 data 行（最后一行没有换行符时，事件会被丢）。
     if (buffer.length > 0) {
       const tail = buffer.replace(/\r$/, '');
-      if (tail.startsWith('data:')) dataLines.push(tail.slice(5).replace(/^ /, ''));
-      else if (tail.startsWith('{')) dataLines.push(tail);
+      if (tail.startsWith('data:')) {
+        dataLines.push(tail.slice(5).replace(/^ /, ''));
+        dataLinesChars += tail.length;
+      } else if (tail.startsWith('{')) {
+        dataLines.push(tail);
+        dataLinesChars += tail.length;
+      }
       buffer = '';
+    }
+    // 尾部 data 行也受同一上限约束（buffer 已按 cap 截断，双保险对齐 dataLinesChars）。
+    if (dataLinesChars > SSE_BUFFER_MAX_CHARS) {
+      throw new Error('SSE buffer exceeded limit (stream aborted)');
     }
     yield* flush();
   } finally {

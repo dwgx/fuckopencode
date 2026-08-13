@@ -107,13 +107,29 @@ export function normalizeAnthropicRequest(
   // 反序列化管线（崩溃堆栈 node::worker::Message::Deserialize——"worker" 是
   // 红鲱鱼，不是 worker_threads），大 body（1M+ tokens 的请求体）克隆 = 2-3 倍
   // 瞬时内存，并发即撞 V8 堆上限（白天 693 次 OOM 的根因）。
-  // 修复：compact 配置带 bodyBytes 且超过 512KB 时跳过克隆——此时入参来自
-  // JSON.parse 是请求私有对象（server 不会复用），normalize 的原地修改无害。
-  // 小请求保留克隆（库函数「不污染入参」的契约不变）。
+  // 三层修复：
+  // - bodyBytes > 512KB：完全跳过拷贝，原地修改。此时入参来自 JSON.parse 是请求
+  //   私有对象（server 不会复用），normalize 的原地修改无害。
+  // - 其余（含 ≤512KB）：不用 structuredClone，改用字段级拷贝 fieldCloneBody——
+  //   只深拷贝 normalize 会**原地修改**的子树（messages/tools），其余字段浅拷贝
+  //   即可（它们只被重新赋值或删除，共享引用无副作用）。同样移出 MessagePort
+  //   反序列化崩溃路径，且无序列化往返，小 body 更快。
+  // - 被动压缩（COMPACT_ENABLED）例外：它改 content 块**内部**字段，字段级拷贝
+  //   覆盖不到（如 tool_result 的嵌套子块）。压缩若真的触发（bodyBytes >
+  //   triggerBytes）就回退全量 structuredClone 保契约；默认 triggerBytes=4MB 恒在
+  //   >512KB 的免拷贝路径上，这个分支实际只在用户把阈值配到 <512KB 时才会走到。
+  const compactWillRun =
+    compact != null &&
+    compact.triggerBytes != null &&
+    typeof compact.bodyBytes === 'number' &&
+    compact.bodyBytes > compact.triggerBytes &&
+    Array.isArray((raw as Record<string, unknown>).messages);
   const body =
     compact != null && typeof compact.bodyBytes === 'number' && compact.bodyBytes > 512 * 1024
       ? (raw as Record<string, unknown>)
-      : (structuredClone(raw) as Record<string, unknown>);
+      : compactWillRun
+        ? (structuredClone(raw) as Record<string, unknown>)
+        : fieldCloneBody(raw as Record<string, unknown>);
 
   // 1. 模型名映射。
   if (typeof body.model === 'string') {
@@ -219,6 +235,41 @@ export function normalizeAnthropicRequest(
   }
 
   return body;
+}
+
+/**
+ * 字段级拷贝（替代 structuredClone，见 normalizeAnthropicRequest 的注释）。
+ *
+ * 只深拷贝 normalize 会**原地修改**的子树，其余字段浅拷贝——那些字段只被重新
+ * 赋值或删除（model/thinking/reasoning_effort/context_management/max_tokens 等），
+ * 共享引用不会把改动泄漏回入参：
+ * - messages：消息对象 + content 数组 + 块对象逐层复制 —— normalize 会原地改
+ *   content 字符串→块数组（改消息字段）、assistant 注入 thinking 块（content
+ *   unshift 改数组）；块对象复制是为兼容块内字段被改的路径（被动压缩），成本
+ *   极低、防御性到位。
+ * - tools：删工具上的 strict/defer_loading 改的是工具对象，需复制。
+ */
+function fieldCloneBody(raw: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...raw };
+  const copyItems = (arr: unknown[]): unknown[] =>
+    arr.map((item) =>
+      item != null && typeof item === 'object' && !Array.isArray(item)
+        ? { ...(item as Record<string, unknown>) }
+        : item,
+    );
+
+  if (Array.isArray(out.messages)) {
+    out.messages = (out.messages as unknown[]).map((m) => {
+      if (m == null || typeof m !== 'object' || Array.isArray(m)) return m;
+      const msg = { ...(m as Record<string, unknown>) } as Record<string, unknown>;
+      if (Array.isArray(msg.content)) msg.content = copyItems(msg.content);
+      return msg;
+    });
+  }
+  if (Array.isArray(out.tools)) {
+    out.tools = copyItems(out.tools);
+  }
+  return out;
 }
 
 /**

@@ -326,6 +326,53 @@ describe('parseOpenAISSE 脏行检测', () => {
     expect(chunks.length).toBe(1);
     expect(samples).toHaveLength(1);
   });
+
+  it('超长单行（>1MB 无换行）触发 buffer 上限：断流抛错', async () => {
+    const big = 'data: ' + 'A'.repeat(1024 * 1024 + 10) + '\n\n';
+    await expect(collect(parseOpenAISSE(sseBody(big)))).rejects.toThrow('SSE buffer exceeded limit');
+  });
+
+  it('大量合法短行（总长>1MB）不触发上限（逐行即时处理）', async () => {
+    // 上限是「未换行的累积 buffer」，不是总字节数：每行即时消费则不触发。
+    const body = okChunk.repeat(7000); // ~1MB+
+    const { chunks } = await dirty(body);
+    expect(chunks.length).toBe(7000);
+  });
+});
+
+describe('parseAnthropicSSE buffer 上限', () => {
+  function sseBody(raw: string): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(raw));
+        controller.close();
+      },
+    });
+  }
+
+  async function parse(raw: string): Promise<AnthropicStreamEvent[]> {
+    const out: AnthropicStreamEvent[] = [];
+    for await (const ev of parseAnthropicSSE(sseBody(raw))) out.push(ev);
+    return out;
+  }
+
+  it('超长单行 data（>1MB）触发上限：断流抛错', async () => {
+    const big = 'data: ' + 'A'.repeat(1024 * 1024 + 10) + '\n\n';
+    await expect(parse(big)).rejects.toThrow('SSE buffer exceeded limit');
+  });
+
+  it('同一事件累积超 1MB 的 data 行（无空行分隔）触发上限', async () => {
+    const line = 'data: ' + 'A'.repeat(8 * 1024) + '\n';
+    const big = line.repeat(140); // ~1.15MB，从不出现空行
+    await expect(parse(big)).rejects.toThrow('SSE buffer exceeded limit');
+  });
+
+  it('接近上限的合法事件仍能解析（8KB × 100 行 + 空行）', async () => {
+    const line = 'data: ' + 'A'.repeat(8 * 1024) + '\n';
+    const events = await parse(line.repeat(100) + '\n');
+    // 100 行拼成一个 >800KB 的 data，JSON 解析失败被静默跳过（不是断流）。
+    expect(events).toHaveLength(0);
+  });
 });
 
 describe('openAIStreamToAnthropic 错误 chunk（M2）', () => {
