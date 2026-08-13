@@ -29,6 +29,7 @@
 
 import crypto from 'node:crypto';
 import type { KeyFingerprintUsage, UsageDb } from './usagedb.js';
+import type { SecretKey } from './secrets.js';
 
 /** 一行分发 token（管理端展示用）。不含 token 明文。 */
 export interface TokenRow {
@@ -66,6 +67,8 @@ export interface TokenUpdate {
   note?: string | null;
   /** per-key RPM 限流（0 = 不限流）。校验在端点层（非负整数）。 */
   rpmLimit?: number;
+  /** 补录明文（老 token 创建时未存）：端点层先校验 sha256 匹配现有指纹，再加密落库。 */
+  tokenPlain?: string | null;
 }
 
 /** 用量聚合的一行（来自 requests 表的 token_fp 分组）。 */
@@ -117,10 +120,26 @@ export class TokensStore {
   /** 用量聚合走 UsageDb.tokenUsageAll（带 10s 缓存，面板轮询不能每次全表扫）。 */
   private readonly db: UsageDb | null;
 
-  constructor(db: UsageDb | null) {
+  /** 明文加密封存用（同 accounts 的 SecretKey：aes-256-gcm，`1:...` 格式）。null = 密钥不可用。 */
+  private readonly secret: SecretKey | null;
+
+  constructor(db: UsageDb | null, secret: SecretKey | null = null) {
     this.enabled = db != null && db.enabled;
     this.raw = db?.sqlite?.() ?? null;
     this.db = db;
+    this.secret = secret;
+  }
+
+  /** 解密 token 明文（管理面「查看/复制」用）。未存/密钥不可用/解密失败返回 null。 */
+  plainOf(id: number): string | null {
+    if (!this.enabled || !this.secret) return null;
+    try {
+      const row = this.raw.prepare('SELECT token_enc FROM tokens WHERE id = ?').get(id) as { token_enc: string | null } | undefined;
+      if (!row || !row.token_enc) return null;
+      return this.secret.decrypt(row.token_enc);
+    } catch {
+      return null;
+    }
   }
 
   /** 全部 token（按 id 升序）。db 不可用/查询失败返回空列表。
@@ -187,10 +206,11 @@ export class TokensStore {
       const key = customKey.trim();
       const fingerprint = fingerprintOf(key);
       const prefix = key.slice(0, 2).toLowerCase();
+      const enc = this.secret ? this.secret.encrypt(key) : null;
       try {
         const res = this.raw
           .prepare('INSERT INTO tokens (name, token_enc, fingerprint, status, note, prefix, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(name, null, fingerprint, 'active', note, prefix, Date.now());
+          .run(name, enc, fingerprint, 'active', note, prefix, Date.now());
         return { ok: true, value: { id: Number(res.lastInsertRowid), name, token: key, fingerprint, prefix } };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -203,10 +223,11 @@ export class TokensStore {
     }
     for (let attempt = 0; attempt < CREATE_RETRY_LIMIT; attempt++) {
       const { token, fingerprint } = generateToken();
+      const enc = this.secret ? this.secret.encrypt(token) : null;
       try {
         const res = this.raw
           .prepare('INSERT INTO tokens (name, token_enc, fingerprint, status, note, prefix, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-          .run(name, null, fingerprint, 'active', note, 'tk', Date.now());
+          .run(name, enc, fingerprint, 'active', note, 'tk', Date.now());
         return { ok: true, value: { id: Number(res.lastInsertRowid), name, token, fingerprint, prefix: 'tk' } };
       } catch (err) {
         // UNIQUE 冲突（指纹碰撞）重试；其余错误（表损坏等）直接失败。
@@ -246,6 +267,11 @@ export class TokensStore {
     if (patch.rpmLimit !== undefined) {
       sets.push('rpm_limit = ?');
       vals.push(patch.rpmLimit);
+    }
+    if (patch.tokenPlain !== undefined) {
+      // 补录明文：端点层已校验指纹匹配；这里加密落库（密钥不可用则存 null 并提示）。
+      sets.push('token_enc = ?');
+      vals.push(patch.tokenPlain === null ? null : (this.secret ? this.secret.encrypt(patch.tokenPlain) : null));
     }
     if (sets.length === 0) return this.get(id) != null ? 'ok' : 'missing';
     try {

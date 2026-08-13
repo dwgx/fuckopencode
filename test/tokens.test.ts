@@ -787,3 +787,45 @@ describe('tokens RPM 限流（入口 429，不计入上游）', () => {
     }
   });
 });
+
+describe('分发密钥明文存储与查看（token_enc 加密 + /plain 端点 + 补录指纹校验）', () => {
+  it('创建后明文加密落库，plainOf 能解密还原', async () => {
+    const { TokensStore, fingerprintOf } = await import('../src/tokens.js');
+    const { loadSecret } = await import('../src/secrets.js');
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tokenc-'));
+    const secFile = path.join(dir, 'secret.key');
+    fs.writeFileSync(secFile, 'test-secret-material-xyz');
+    const secret = loadSecret({ secretFilePath: secFile } as never);
+    const { UsageDb } = await import('../src/usagedb.js');
+    const db = new UsageDb(path.join(dir, 't.db'));
+    const store = new TokensStore(db as never, secret as never);
+    const created = store.create('plain-test', null, 'sk-mytestkey123');
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    // 明文能解密还原（与新创建一致）
+    expect(store.plainOf(created.value.id)).toBe('sk-mytestkey123');
+    // 指纹仍按明文派生（校验不受影响）
+    expect(fingerprintOf('sk-mytestkey123')).toBe(created.value.fingerprint);
+    db.close();
+  });
+
+  it('未存储明文的 token plainOf 返回 null（老 token 兼容）', async () => {
+    const { TokensStore } = await import('../src/tokens.js');
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tokennull-'));
+    const { UsageDb } = await import('../src/usagedb.js');
+    const db = new UsageDb(path.join(dir, 't.db'));
+    // 无 secret：create 时 token_enc 存 null
+    const store = new TokensStore(db as never, null);
+    const created = store.create('null-plain', null, 'sk-oldkey');
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(store.plainOf(created.value.id)).toBeNull();
+    db.close();
+  });
+});

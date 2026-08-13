@@ -163,7 +163,7 @@ const legacyClient = {
 };
 // 分发密钥系统（客户端 key，走共享池）：db 不可用内部降级（enabled=false，
 // verify 恒失败 —— fail-closed），构造不抛，不阻塞代理链路。
-const tokensStore = new TokensStore(usageDb);
+const tokensStore = new TokensStore(usageDb, secret);
 const server = createApp(cfg, pool, usageDb, accounts, undefined, consoleClient, importCookieFromChrome, legacyClient, tokensStore, legacyPlainCache);
 
 // 主动探活：面板的「可用」只代表不在冷却期，探活用最小 token 的真实请求
