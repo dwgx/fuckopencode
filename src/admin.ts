@@ -1127,6 +1127,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .oc-chip.st-cooldown, .oc-chip.st-limit, .oc-chip.st-insufficient,
   .badge.st-cooldown, .badge.st-limit, .badge.st-insufficient { color: var(--warn); border-color: rgba(255,159,10,.4); }
   .oc-chip.st-invalid, .oc-chip.st-error, .badge.st-invalid, .badge.st-error { color: var(--danger); border-color: rgba(255,69,58,.4); }
+  /* 强提示徽章（默认密码等安全告警）：实心红底白字，比 st-error 边框更醒目。 */
+  .oc-chip.oc-chip-danger { background: var(--danger); color: #fff; border-color: transparent; }
   .oc-chip.st-region, .oc-chip.st-unknown, .badge.st-region, .badge.st-unknown { color: var(--text-muted); }
   .retry { color: var(--warn); font-size: 12px; white-space: nowrap; }
   /* 操作菜单平时隐身，卡片 hover 才现身（危险操作不给误触机会）。 */
@@ -1869,7 +1871,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
             <input class="oc-input" id="aa-user" autocomplete="off">
           </div>
           <div class="oc-field">
-            <label><span data-i18n="adminPassLabel">password</span> <span class="oc-chip-src" id="aa-pass-src"></span></label>
+            <label><span data-i18n="adminPassLabel">password</span> <span class="oc-chip-src" id="aa-pass-src"></span>
+              <span class="oc-chip oc-chip-danger" id="aa-pass-badge" hidden></span></label>
             <input class="oc-input" id="aa-pass" type="password" placeholder="..." autocomplete="new-password">
             <div class="oc-hint oc-hint-err" id="aa-pass-warn" hidden></div>
           </div>
@@ -2200,6 +2203,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       adminPassPlaceholder: 'leave blank to keep current',
       adminPassHint: 'old sessions stay valid for up to 24h after a password change',
       adminPassEnvWarn: 'using the default password — change it',
+      adminPassDefaultBadge: 'default password — change it',
       authSaved: 'admin credentials saved', aaNothing: 'nothing to save',
       sourceEnv: 'source: env', sourceDb: 'source: panel',
       apiKeysTitle: 'API keys', apiKeysSub: 'keys accepted for management access',
@@ -2445,6 +2449,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       adminPassPlaceholder: '留空 = 保持当前密码',
       adminPassHint: '改密码后旧会话 24h 内仍有效',
       adminPassEnvWarn: '正在使用默认密码，建议修改',
+      adminPassDefaultBadge: '默认密码，建议修改',
       authSaved: '登录凭据已保存', aaNothing: '没有需要保存的内容',
       sourceEnv: '来源: env', sourceDb: '来源: 面板',
       apiKeysTitle: 'API 密钥', apiKeysSub: '管理面接受的密钥',
@@ -2982,7 +2987,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       loadBilling(detailState.id, !manual);
       loadGo(detailState.id, !manual);
       loadLegacyKeys(detailState.id, !manual);
-      loadLegacyBilling(detailState.id);
+      loadLegacyBilling(detailState.id, !manual);
     }
   }
 
@@ -3916,7 +3921,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // 明文只在 PATCH 请求体里由管理端提供）；PATCH 多键单事务，成功立即生效。
   // 刷新节奏与 previewCache 同款：60s TTL，进入设置页时拉一次，保存后强制重拉。
   var SETTINGS_TTL = 60 * 1000;
-  var settingsCache = null;  // {at, data}
+  var settingsCache = null;  // {at, data, def}
   var SETTINGS_SRC = { env: 'sourceEnv', db: 'sourceDb' };
   function loadSettings(force) {
     if (!force && settingsCache && Date.now() - settingsCache.at < SETTINGS_TTL) {
@@ -3925,7 +3930,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     }
     api('GET', '/__admin/api/settings', null).then(function (r) {
       if (r.ok && r.json && r.json.data && r.json.data.settings) {
-        settingsCache = { at: Date.now(), data: r.json.data.settings };
+        // def = 顶层 adminPassIsDefault（服务端精确判定「生效密码 === 默认值」，
+        // 比 settings.adminPass.source === 'env' 准 —— env 显式强密码不算默认）。
+        settingsCache = { at: Date.now(), data: r.json.data.settings, def: r.json.data.adminPassIsDefault === true };
         renderSettings(settingsCache.data);
       } else {
         var panel = $('exp-panel');
@@ -3944,11 +3951,19 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (us) us.textContent = srcOf('adminUser');
     var ps = $('aa-pass-src');
     if (ps) ps.textContent = srcOf('adminPass');
-    // env 来源 = 默认密码（settings 表没有 adminPass 键），提示修改。
+    // 默认密码强提示：读服务端顶层 adminPassIsDefault（精确判定），不是
+    // source==='env' 近似（env 显式配了强密码时 source 也是 env，会误报）。
+    // 徽章（密码 label 旁红底）+ 行内提示（输入框下）同源。
+    var isDefault = !!(settingsCache && settingsCache.def);
     var pw = $('aa-pass-warn');
     if (pw) {
-      pw.hidden = !(s.adminPass && s.adminPass.source === 'env');
+      pw.hidden = !isDefault;
       pw.textContent = T('adminPassEnvWarn');
+    }
+    var badge = $('aa-pass-badge');
+    if (badge) {
+      badge.hidden = !isDefault;
+      badge.textContent = T('adminPassDefaultBadge');
     }
     // API 密钥列表（掩码数组 + 来源标记）。
     var keys = s.apiKeys && Array.isArray(s.apiKeys.value) ? s.apiKeys.value : [];
@@ -4541,7 +4556,27 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       });
   }
 
+  // legacy 详情块前端 TTL 门：详情 tick 每 2s 调 loadGo/loadLegacyKeys/
+  // loadLegacyBilling，服务端已有 30s TTL 缓存兜住上游流量；前端再挡一层
+  // 减少 2s 轮询的 HTTP 往返。规则：**成功渲染后** TTL 内且是自动轮询
+  // （fromTick=true）直接跳过；用户发起（fromTick 空/false：进详情、手动
+  // 刷新、写操作后）绕过 TTL 强制重拉。失败不打点 —— 2s tick 会继续重试
+  // （保留「偶发失败自愈」，否则首次拉取失败会被门挡 30s 冻结错误）。
+  // sticky 语义不受影响 —— TTL 门只挡「发起请求」，渲染路径根本没进，
+  // 错误状态持续显示（见 clearSticky 注释）。
+  var LEGACY_DETAIL_TTL = 30 * 1000;
+  var legacyDetailAt = {};  // 'kind:id' -> 最近一次**成功渲染**时间
+  function legacyDetailFresh(id, kind, force) {
+    var k = kind + ':' + id;
+    var now = Date.now();
+    return !force && !!legacyDetailAt[k] && now - legacyDetailAt[k] < LEGACY_DETAIL_TTL;
+  }
+  function legacyDetailMark(id, kind) {
+    legacyDetailAt[kind + ':' + id] = Date.now();
+  }
+
   function loadGo(id, fromTick) {
+    if (legacyDetailFresh(id, 'go', !fromTick)) return;
     api('GET', '/__admin/api/legacy/account/' + id + '/go', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       var el = $('detail-go');
@@ -4551,6 +4586,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         detailErr('go', errMsg(r));
         return;
       }
+      legacyDetailMark(id, 'go');
       renderGo(r.json.data.go, id, fromTick);
     }).catch(function () { if (detailState.id !== id) return; detailErr('go', T('consoleUnavailable')); });
   }
@@ -4832,8 +4868,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       '<div class="tbl-scroll"><table class="tbl"><thead><tr><th>' + T('modelAlias') + '</th><th class="t-hide">' + T('name') + '</th><th>' + T('inPerMtok') + '</th><th>' + T('outPerMtok') + '</th></tr></thead><tbody>' +
       rows + '</tbody></table></div>');
   }
-  /** 旧版计费：余额（美元）+ 自动充值 + 最近 5 笔支付。失败语义与 legacy keys 同款。 */
-  function loadLegacyBilling(id) {
+  /** 旧版计费：余额（美元）+ 自动充值 + 最近 5 笔支付。失败语义与 legacy keys 同款。
+   *  fromTick：2s 轮询发起时 TTL 门生效（服务端 30s 缓存兜底）；用户操作绕过。 */
+  function loadLegacyBilling(id, fromTick) {
+    if (legacyDetailFresh(id, 'billing', !fromTick)) return;
     api('GET', '/__admin/api/legacy/account/' + id + '/billing', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-legacy-billing');
@@ -4845,6 +4883,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           : '';
         return;
       }
+      legacyDetailMark(id, 'billing');
       renderLegacyBilling(r.json.data.billing);
     }).catch(function () {
       if (detailState.id !== id) return;  // 详情切换竞态
@@ -4928,6 +4967,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // 失败语义：404 = 该账号没有 legacy workspace → 静默隐藏区块；
   // cookie 缺失/格式错误 → 明确提示；其余网络错误 → 静默隐藏。
   function loadLegacyKeys(id, fromTick) {
+    if (legacyDetailFresh(id, 'keys', !fromTick)) return;
     api('GET', '/__admin/api/legacy/account/' + id + '/keys', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-legacy');
@@ -4939,6 +4979,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         detailErr('legacy', errMsg(r));
         return;
       }
+      legacyDetailMark(id, 'keys');
       renderLegacyKeys(r.json, fromTick);
     }).catch(function () { if (detailState.id !== id) return; detailErr('legacy', T('consoleUnavailable')); });
   }

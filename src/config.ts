@@ -86,6 +86,14 @@ export interface AppConfig {
   allowUnauthenticated: boolean;
   /** 请求体字节上限 */
   maxBodyBytes: number;
+  /**
+   * 数据面代理路径并发在飞上限（/v1/chat/completions + /v1/messages）。
+   * 审计 P1-D：全链路无上限 + undici 无 per-origin 连接上限 + 大 body 多份
+   * 拷贝滞留整个流时长，是 2GB VPS 唯一的 OOM 向量。默认 400（本机压测基线
+   * 200 并发 1435 RPS 远低于此）。0 = 不限。
+   * 可选字段：config.ts 总是生成；server 侧兜底 `?? 400`，测试字面量可省略。
+   */
+  maxConcurrentRequests?: number;
   /** 单条消息文本字符上限 */
   maxMessageChars: number;
   /** messages 条数上限（防超长列表遍历 DoS；0 = 不限）。 */
@@ -254,6 +262,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // 否则 Claude Code 读个大文件就被网关自己拒掉（曾因 200_000 导致线上 400）。
     // 两者都支持 0 = 不限制。
     maxBodyBytes: intFromEnv(env.MAX_BODY_BYTES, 64 * 1024 * 1024),
+    maxConcurrentRequests: intFromEnv(env.MAX_CONCURRENT_REQUESTS, 400),
     maxMessageChars: intFromEnv(env.MAX_MESSAGE_CHARS, 8_000_000),
     // messages 条数上限：默认 4000 —— 2000 对 Claude Code 超长会话太紧
     // （实测线上真实请求超限被 400）。0 = 不限（不推荐）。

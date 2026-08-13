@@ -81,7 +81,32 @@ const startedAt = Date.now();
  * 必须让 iOS/Android 分支在桌面 OS 之前短路（修复过：真实 iPhone UA 曾被
  * 判成 macOS）。`ios` 用词边界——`axios/1.6.0` 这类 Node 库 UA 含裸 `ios` 子串。
  */
-export function parseUserAgent(ua: string): { client: string; os: string; mobile: boolean } {
+export interface ParsedUa {
+  client: string;
+  os: string;
+  mobile: boolean;
+}
+
+// UA 解析缓存（P1-8）：UA 字符串 → 解析结果。同一客户端的 UA 每请求重复
+// 出现，缓存省掉整串 20+ 个正则扫描。上限 1000、超限清空重建（近似 LRU：
+// UA 种类有限、清空代价极低，真 LRU 得不偿失）。结果对象只读共享 ——
+// 调用方（extractDevice / recordRequest）只读字段不原地改。
+const UA_CACHE_MAX = 1000;
+const uaCache = new Map<string, ParsedUa>();
+
+export function parseUserAgent(ua: string): ParsedUa {
+  const key = ua || '';
+  const hit = uaCache.get(key);
+  if (hit) return hit;
+  const result = parseUserAgentUncached(key);
+  // 冻结：缓存结果被多请求共享，防未来调用方原地改字段污染整个缓存。
+  Object.freeze(result);
+  if (uaCache.size >= UA_CACHE_MAX) uaCache.clear();
+  uaCache.set(key, result);
+  return result;
+}
+
+function parseUserAgentUncached(ua: string): ParsedUa {
   const s = ua || '';
   const lower = s.toLowerCase();
   let client = 'unknown';

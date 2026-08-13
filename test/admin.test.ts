@@ -1709,11 +1709,23 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     expect(code).toContain("$('aa-pass').value = '';");
   });
 
-  it('来源标记：env/db 小字；env 默认密码显示建议修改警告', () => {
+  it('来源标记：env/db 小字；默认密码强提示读服务端 adminPassIsDefault（非 source 近似）', () => {
     const code = inlineScript();
     expect(code).toContain("var SETTINGS_SRC = { env: 'sourceEnv', db: 'sourceDb' };");
-    expect(code).toContain("pw.hidden = !(s.adminPass && s.adminPass.source === 'env');");
+    // 回归：修复前用 source==='env' 近似判断（env 显式强密码会误报）；修复后
+    // 读服务端顶层 adminPassIsDefault 精确字段驱动徽章 + 行内提示。
+    expect(code).toContain('r.json.data.adminPassIsDefault === true');
+    expect(code).toContain('var isDefault = !!(settingsCache && settingsCache.def);');
+    expect(code).toContain("pw.hidden = !isDefault;");
+    expect(code).not.toContain("s.adminPass && s.adminPass.source === 'env'");
     expect(code).toContain("pw.textContent = T('adminPassEnvWarn');");
+    expect(code).toContain("badge.textContent = T('adminPassDefaultBadge');");
+  });
+
+  it('默认密码徽章挂点：设置页 Admin account 区块密码 label 旁（HTML + CSS）', () => {
+    expect(ADMIN_HTML).toContain('id="aa-pass-badge"');
+    expect(ADMIN_HTML).toContain('oc-chip oc-chip-danger" id="aa-pass-badge" hidden');
+    expect(ADMIN_HTML).toContain('.oc-chip.oc-chip-danger');
   });
 
   it('实验开关 toggle：反值 PATCH（scaleClientTokens / compactEnabled），只读值做后缀', () => {
@@ -1759,7 +1771,7 @@ describe('批次 2：设置页热改（settings 端点）', () => {
                   'subStatus', 'stGateway', 'stUpstream', 'stAccounts', 'stDistKeys', 'stFixes', 'stRunning',
                   'ovTrendNote', 'ovTrendFallback',
                   'adminAuthTitle', 'adminAuthSub', 'adminUserLabel', 'adminPassLabel', 'adminPassPlaceholder',
-                  'adminPassHint', 'adminPassEnvWarn', 'authSaved', 'aaNothing', 'sourceEnv', 'sourceDb',
+                  'adminPassHint', 'adminPassEnvWarn', 'adminPassDefaultBadge', 'authSaved', 'aaNothing', 'sourceEnv', 'sourceDb',
                   'apiKeysTitle', 'apiKeysSub', 'apiKeysEmpty', 'apiKeysAdd', 'apiKeysAddTitle',
                   'apiKeysPasteHint', 'apiKeysNoPlain', 'apiKeysEnvWarn', 'apiKeysDeleteConfirm',
                   'apiKeysSaved', 'settingsSaved', 'subAdminAuth', 'subAdminKeys', 'subExperimental',

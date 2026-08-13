@@ -368,6 +368,95 @@ describe('ConsoleClient 缓存', () => {
     expect(reqs.length).toBe(2);
   });
 
+  it('5 并发同端点只打一次上游（in-flight 单飞）', async () => {
+    // 回归：去掉 cachedGet 的 in-flight 去重这条会红 —— 并发 miss 每个都发
+    // 上游请求（TTL 过期瞬间 / 冷启动 / 慢上游轮询窗口的真实形态）。
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const { f, reqs } = fakeFetch(async () => {
+      await gate;
+      return jsonResponse(200, { balanceMicroCents: '0' });
+    });
+    const client = new ConsoleClient(cfg(), fakeAccounts(), log, { fetchImpl: f });
+
+    // 5 个调用在 leader 完成前全部到达 → 共享同一次上游请求。
+    const promises = Array.from({ length: 5 }, () => client.billingStatus(1));
+    release();
+    const results = await Promise.all(promises);
+
+    expect(reqs.length).toBe(1);
+    for (const r of results) expect((r as { balanceMicroCents: string }).balanceMicroCents).toBe('0');
+  });
+
+  it('invalidate 后新读不搭旧 in-flight 结果（M2 语义保持，防 naive 去重）', async () => {
+    // 时序：leader 在途（将返回旧值 999）→ invalidate → 新读必须自己打上游
+    // 拿新值 111，且旧 leader 的响应不得写回缓存。naive「follower 也写缓存」
+    // 或「新读搭旧 in-flight」的实现都会让第三次读命中旧值 —— 这正是 M2 竞态
+    // 防护要消灭的「写成功后 ≤30s 显示旧数据」，现有顺序测试覆盖不到。
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let call = 0;
+    const { f, reqs } = fakeFetch(async () => {
+      call++;
+      await gate;
+      return jsonResponse(200, { balanceMicroCents: call === 1 ? '999' : '111' });
+    });
+    const client = new ConsoleClient(cfg(), fakeAccounts(), log, { fetchImpl: f });
+
+    const pending = client.billingStatus(1); // leader 在途（将返回 999）
+    client.invalidate(1); // 写操作成功路径
+    const fresh = client.billingStatus(1); // 新读：必须自己打上游拿 111
+    release();
+    await pending;
+    expect((await fresh as { balanceMicroCents: string }).balanceMicroCents).toBe('111');
+    // 第三次读命中缓存 —— 缓存里必须是新值 111，不是旧 leader 的 999。
+    expect((await client.billingStatus(1) as { balanceMicroCents: string }).balanceMicroCents).toBe('111');
+    expect(reqs.length).toBe(2);
+  });
+
+  it('noteCredentialChanged 后新读不搭旧凭据的在途请求', async () => {
+    // 换 cookie/切 workspace（内部 invalidate）后，在途旧请求的结果不得被
+    // 新读共享 —— 否则新读拿到旧 cookie 的数据。
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let cookie = 'auth=old';
+    const accounts: ConsoleAccounts = {
+      cookieOf: () => cookie,
+      workspaceIdOf: () => 'ws-1',
+      getOauthRefresh: () => null,
+      setOauthRefresh: () => true,
+    };
+    const seen: string[] = [];
+    const { f, reqs } = fakeFetch(async () => {
+      await gate;
+      return jsonResponse(200, { balanceMicroCents: '0' });
+    });
+    const origFetch = f;
+    const client = new ConsoleClient(cfg(), accounts, log, {
+      fetchImpl: async (input, init) => {
+        seen.push(new Headers(init?.headers).get('cookie') ?? '');
+        return origFetch(input, init);
+      },
+    });
+
+    const pending = client.billingStatus(1); // 在途（旧 cookie）
+    client.noteCredentialChanged(1); // 换凭据 → 清缓存 + 清在途
+    cookie = 'auth=new';
+    const fresh = client.billingStatus(1); // 新读：自己打上游（带新 cookie）
+    release();
+    await pending;
+    await fresh;
+
+    expect(seen.filter((c) => c.includes('new')).length).toBe(1); // 新读用了新 cookie
+    expect(reqs.length).toBe(2); // 新读没有搭在途
+  });
+
   it('默认 TTL 30s，常量可断言', () => {
     expect(CACHE_TTL_MS).toBe(30_000);
     expect(TIMEOUT_MS).toBe(15_000);

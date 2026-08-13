@@ -130,11 +130,20 @@ export class TokensStore {
   /** 明文加密封存用（同 accounts 的 SecretKey：aes-256-gcm，`1:...` 格式）。null = 密钥不可用。 */
   private readonly secret: SecretKey | null;
 
+  /** verify 的 prepared statement（P1-7）：数据面每分发 token 请求都调 verify，
+   *  prepared 缓存避免每请求一次同步 prepare（38µs→2.3µs）。null = db 不可用。 */
+  private readonly verifyStmt: ReturnType<UsageDb['sqlite']> extends null
+    ? null
+    : ReturnType<NonNullable<ReturnType<UsageDb['sqlite']>>['prepare']> | null;
+
   constructor(db: UsageDb | null, secret: SecretKey | null = null) {
     this.enabled = db != null && db.enabled;
     this.raw = db?.sqlite?.() ?? null;
     this.db = db;
     this.secret = secret;
+    this.verifyStmt = this.raw
+      ? this.raw.prepare("SELECT status, rpm_limit FROM tokens WHERE fingerprint = ? AND status = 'active'")
+      : null;
   }
 
   /** 解密 token 明文（管理面「查看/复制」用）。未存/密钥不可用/解密失败返回 null。 */
@@ -335,12 +344,10 @@ export class TokensStore {
    * **全程无解密**；db 不可用恒返回失败（fail-closed）。
    */
   verify(token: string): { ok: true; fingerprint: string; rpmLimit: number } | { ok: false } {
-    if (!this.enabled) return { ok: false };
+    if (!this.enabled || !this.verifyStmt) return { ok: false };
     const fingerprint = fingerprintOf(token);
     try {
-      const row = this.raw
-        .prepare("SELECT status, rpm_limit FROM tokens WHERE fingerprint = ? AND status = 'active'")
-        .get(fingerprint) as { status: string; rpm_limit?: unknown } | undefined;
+      const row = this.verifyStmt.get(fingerprint) as { status: string; rpm_limit?: unknown } | undefined;
       return row ? { ok: true, fingerprint, rpmLimit: normalizeRpmLimit(row.rpm_limit) } : { ok: false };
     } catch (err) {
       console.warn(`[tokens] 校验查询失败: ${err instanceof Error ? err.message : err}`);

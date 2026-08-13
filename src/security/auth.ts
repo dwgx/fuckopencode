@@ -39,10 +39,29 @@ function sha256Hex(value: string): Buffer {
   return createHash('sha256').update(value, 'utf8').digest();
 }
 
-function safeEqualHex(a: string, b: string): boolean {
-  const ha = sha256Hex(a);
-  const hb = sha256Hex(b);
-  return timingSafeEqual(ha, hb);
+/**
+ * 预计算哈希缓存（P1-6）：cfg.apiKeys 内容指纹 → {key → sha256}。
+ * 原来 verifyAuth 每请求对**每个** apiKey 各做一次 sha256（8 key = 每请求
+ * 8 次）；现在每个 key 只算一次、缓存复用，token 侧也只要一次。
+ * apiKeys 热更新（settings PATCH 替换 cfg.apiKeys 引用）后 join 指纹变化 →
+ * 自动重建；缓存只增不减（keys 集合是配置级，个数有限）。
+ */
+const apiKeyHashCache = new Map<string, Map<string, Buffer>>();
+/** 缓存上限：apiKeys 集合是配置级、实际就一两个，16 条防长期频繁热改累积。 */
+const API_KEY_HASH_CACHE_MAX = 16;
+
+function apiKeyHashes(keys: string[]): Map<string, Buffer> {
+  const fp = keys.join('\u0000');
+  const cached = apiKeyHashCache.get(fp);
+  if (cached) return cached;
+  const m = new Map<string, Buffer>();
+  for (const k of keys) m.set(k, sha256Hex(k));
+  if (apiKeyHashCache.size >= API_KEY_HASH_CACHE_MAX) {
+    // 超限清空重建：淘汰全部比精确 LRU 便宜，集合数有限损失可忽略。
+    apiKeyHashCache.clear();
+  }
+  apiKeyHashCache.set(fp, m);
+  return m;
 }
 
 /**
@@ -69,8 +88,11 @@ export function verifyAuth(
 
   if (cfg.apiKeys.length > 0) {
     if (!token) return { ok: false };
-    for (const allowed of cfg.apiKeys) {
-      if (safeEqualHex(token, allowed)) {
+    // token 侧哈希只算一次，与预计算的各 key 哈希做常量时间比较
+    // （预计算 Map 按 cfg.apiKeys 内容指纹缓存，热更新自动重建）。
+    const tokenHash = sha256Hex(token);
+    for (const [allowed, allowedHash] of apiKeyHashes(cfg.apiKeys)) {
+      if (timingSafeEqual(tokenHash, allowedHash)) {
         return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null, rpmLimit: 0 };
       }
     }

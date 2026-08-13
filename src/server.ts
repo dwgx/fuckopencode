@@ -42,6 +42,7 @@ import { sseStringify } from './stream.js';
 import { parseOpenAISSE } from './sse.js';
 import {
   ALLOWED_MODELS,
+  DEEPSEEK_MIN_MAX_TOKENS,
   filterThinkingFromStream,
   normalizeAnthropicRequest,
   resolveModel,
@@ -1381,7 +1382,7 @@ async function handleDeleteToken(
 async function handleGatewayUsageRoute(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: LegacyDeps,
+  deps: Omit<LegacyDeps, 'ttlCache'>,
   accountId: number,
 ): Promise<void> {
   const empty = { requests: 0, inputTokens: 0, outputTokens: 0, costMicroCents: 0 };
@@ -1760,6 +1761,7 @@ export function createApp(
   legacyClient?: LegacyClientLike,
   tokensStore?: TokensStore | null,
   legacyPlainCache?: LegacyPlainCacheLike,
+  legacyTtlCache?: LegacyTtlCacheLike,
 ) {
   // 用量库：未显式传时按配置建。构造永不抛，不可用就退化成 no-op（面板无累计列）。
   const db = usageDb ?? new UsageDb(cfg.usageDbPath, cfg.usageDbRetentionDays);
@@ -1804,6 +1806,12 @@ export function createApp(
   // keys 明文的内存缓存（/keys/plain 端点专用）。main.ts 的 legacyClient 适配器
   // 在每次成功抓取后填充；未接线（undefined）时 /keys/plain fail-closed 502。
   const legacyPlainCacheImpl = legacyPlainCache;
+  // legacy 读端点服务端 TTL 缓存（keys/go/billing）：createApp 内建（或外部
+  // 注入 —— 测试持有实例以在 beforeEach 清缓存防用例互相污染）。填充与失效
+  // 都在 server.ts 端点层（写操作成功/账号删除 clear），无需外部注入。
+  const legacyTtlCacheImpl = legacyTtlCache ?? new LegacyTtlCache(LEGACY_TTL_MS);
+  // 数据面代理路径并发在飞计数（cfg.maxConcurrentRequests > 0 时生效）。
+  let concurrentInFlight = 0;
   // OAuth device flow 会话（内存 Map，每 app 一个；start 存、poll 取、过期清理）。
   const oauthManager = new OauthManager();
   // 未显式传 pool 时，用 cfg.upstreamKeys 建默认池（兼容测试直连场景）。
@@ -1874,6 +1882,40 @@ export function createApp(
       stripped: 0,
       compressed: 0,
     };
+    // 并发在飞上限（P1-D）：只限会占用上游连接的代理路径。计数覆盖整个
+    // 请求生命周期（响应写完 finish / 连接断开 close 才释放），防「无上限 +
+    // undici 无 per-origin 连接上限 + 大 body 多份拷贝滞留」组合打 OOM。
+    // 超限回 503 + Retry-After，并消费请求体防 keep-alive 污染下一条请求
+    // （照 RPM 429 路径的写法）；超限记 ctx.error，finally 统一落 metrics +
+    // requests 表（面板可看到拒绝计数，与 RPM 429 同口径）。
+    // count_tokens / models 是本地轻量处理不限。
+    const isProxyPath = path === '/v1/chat/completions' || path === '/v1/messages';
+    const maxInFlight = cfg.maxConcurrentRequests ?? 400;
+    if (isProxyPath && maxInFlight > 0) {
+      if (concurrentInFlight >= maxInFlight) {
+        ctx.error = 'overloaded_error';
+        const body = JSON.stringify({
+          error: { message: 'too many concurrent requests, retry shortly', type: 'overloaded_error' },
+        });
+        res.writeHead(503, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': Buffer.byteLength(body),
+          'retry-after': '1',
+          connection: 'close',
+        });
+        res.end(body);
+        req.resume();
+        return;
+      }
+      concurrentInFlight++;
+      const release = (): void => {
+        concurrentInFlight--;
+        res.off('finish', release);
+        res.off('close', release);
+      };
+      res.on('finish', release);
+      res.on('close', release);
+    }
 
     try {
       // 健康检查不需要鉴权。
@@ -2159,7 +2201,7 @@ export function createApp(
         }
         // 旧版控制台（opencode.ai，wrk_ 前缀 workspace）的 key 端点。
         if (path.startsWith('/__admin/api/legacy/')) {
-          await handleLegacyRoutes(req, res, { store, client: legacyClientImpl, db, plainCache: legacyPlainCacheImpl });
+          await handleLegacyRoutes(req, res, { store, client: legacyClientImpl, db, plainCache: legacyPlainCacheImpl, ttlCache: legacyTtlCacheImpl });
           return;
         }
         // 按 IP 聚合的用量统计：管理鉴权之上再加 Origin 校验（读也防跨站）。
@@ -2784,6 +2826,34 @@ function prepareOpenAIUpstreamRequest(
   // 上游不认的 OpenAI 扩展字段：剥掉防 400。
   for (const k of ['logit_bias', 'logprobs', 'top_logprobs', 'n', 'seed', 'user', 'store', 'metadata']) {
     delete out[k];
+  }
+  // tool_choice 两路径不对称修复：-free 模型走按量端点（/zen），该端点实测
+  // 不认显式 tool_choice（"Thinking mode does not support this tool_choice"
+  // 400 —— 直通路径 toOpenAI 无条件剥的同一实测）。订阅端点保留 tool_choice
+  // （OpenAI 合法字段，不影响它）。对齐直通路径语义，修 chat 路径的 400。
+  if (typeof out.model === 'string' && out.model.endsWith('-free')) {
+    delete out.tool_choice;
+  }
+  // max_tokens 下限保护（P1-G，对齐直通路径 quirk 6）：deepseek 的 thinking
+  // 计入 max_tokens 预算，客户端小预算（如 200）会被 thinking 吃光导致正文
+  // 空。直通路径按 thinking.type 判断（disabled 不抬）；OpenAI 协议没有
+  // thinking 字段，response_format（JSON mode）等价于 thinking 强制关闭
+  // （上游行为），不抬、尊重客户端；其余情况默认 thinking 可能开启，< 下限
+  // 的抬到 DEEPSEEK_MIN_MAX_TOKENS（与直通同一取舍：空回复 vs 超预算，选
+  // 后者）。2026-08-09 改造后该保护随 request.ts 退役丢失，审计 P1-G 补回。
+  // max_completion_tokens（新 OpenAI SDK 形态）与 max_tokens 同源，取任一值
+  // 判断 —— 只抬一个字段，避免双字段并存触达上游 400。
+  if (out.response_format == null) {
+    const maxTokens = typeof out.max_tokens === 'number' ? out.max_tokens : undefined;
+    const maxCompletion = typeof out.max_completion_tokens === 'number' ? out.max_completion_tokens : undefined;
+    const current = maxTokens ?? maxCompletion;
+    if (current == null || current < DEEPSEEK_MIN_MAX_TOKENS) {
+      if (maxCompletion != null && maxTokens == null) {
+        out.max_completion_tokens = DEEPSEEK_MIN_MAX_TOKENS;
+      } else {
+        out.max_tokens = DEEPSEEK_MIN_MAX_TOKENS;
+      }
+    }
   }
   return out;
 }
@@ -4222,6 +4292,60 @@ export type LegacyWriteResult =
   | { ok: true }
   | { ok: false; reason: 'no-cookie' | 'wrong-console' | 'auth' | 'upstream' };
 
+/**
+ * legacy 读端点服务端 TTL 缓存：面板详情 2s 轮询下，TTL 内同账号同端点只打
+ * 一次上游 HTML（keys 列表 / go 状态 / billing 三个读端点共用 —— 修复前每
+ * 2s 打 3 次，每分钟 90 次）。只缓存成功响应（失败永远重打，不给面板喂过期
+ * 真相，与 console 通道 cachedGet 同口径）；写操作成功 / 账号删除时 clear
+ * 该账号全部条目（列表/状态已变化）。30s TTL 对齐 console CACHE_TTL_MS。
+ */
+const LEGACY_TTL_MS = 30_000;
+export { LEGACY_TTL_MS };
+
+interface LegacyTtlEntry {
+  at: number;
+  /** 抓取时的 legacy workspace id —— 切换 workspace 后旧条目不可用（缓存
+   *  键不含 ws，命中时必须比对，否则 PATCH workspaceId 后 ≤30s 显示旧数据）。 */
+  ws: string;
+  data: unknown;
+}
+
+/** legacy 读 TTL 缓存的最小接口假设（createApp 可选注入；测试持有实例以在
+ *  beforeEach 清缓存，防用例互相污染）。 */
+export interface LegacyTtlCacheLike {
+  get(accountId: number, kind: string, ws: string): unknown | null;
+  set(accountId: number, kind: string, ws: string, data: unknown): void;
+  clear(accountId: number): void;
+}
+
+export class LegacyTtlCache implements LegacyTtlCacheLike {
+  private readonly map = new Map<string, LegacyTtlEntry>();
+  constructor(private readonly ttlMs: number) {}
+  /** 命中返回数据（空数组等合法空值是有效缓存，不是 miss）；过期或 workspace
+   *  与当前不一致 → miss（自动清除）。 */
+  get(accountId: number, kind: string, ws: string): unknown | null {
+    const e = this.map.get(`${accountId}:${kind}`);
+    if (!e) return null;
+    if (e.ws !== ws) {
+      this.map.delete(`${accountId}:${kind}`);
+      return null;
+    }
+    if (Date.now() >= e.at + this.ttlMs) {
+      this.map.delete(`${accountId}:${kind}`);
+      return null;
+    }
+    return e.data;
+  }
+  set(accountId: number, kind: string, ws: string, data: unknown): void {
+    this.map.set(`${accountId}:${kind}`, { at: Date.now(), ws, data });
+  }
+  clear(accountId: number): void {
+    for (const k of this.map.keys()) {
+      if (k.startsWith(`${accountId}:`)) this.map.delete(k);
+    }
+  }
+}
+
 /** legacy 读的结果（形状对齐 src/legacy.ts 的 LegacyReadResult）。 */
 export type LegacyReadResult =
   | { ok: true; keys: LegacyKeyRow[]; deleteServerId: string | null }
@@ -4322,6 +4446,8 @@ interface LegacyDeps {
   db: UsageDb | null;
   /** keys 明文的内存缓存（/keys/plain 端点专用；未接线 → fail-closed 502）。 */
   plainCache: LegacyPlainCacheLike | undefined;
+  /** 读端点服务端 TTL 缓存（keys/go/billing 三端点共用，createApp 内建或注入）。 */
+  ttlCache: LegacyTtlCacheLike;
 }
 
 /**
@@ -4443,9 +4569,10 @@ function legacyGuard(res: ServerResponse, deps: LegacyDeps, accountId: number): 
     return false;
   }
   if (!deps.store.get(accountId)) {
-    // 账号已被删除（admin.ts 删除路径不经过这里）：清掉明文缓存残留，
-    // 防止已删账号的明文继续留在内存里直到 TTL。TTL + 上限仍是兜底。
+    // 账号已被删除（admin.ts 删除路径不经过这里）：清掉明文缓存残留与读
+    // 缓存，防止已删账号的数据继续留在内存里直到 TTL。TTL + 上限仍是兜底。
     deps.plainCache?.clear(accountId);
+    deps.ttlCache.clear(accountId);
     sendJson(res, 404, { error: { message: 'account not found', type: 'not_found_error' } });
     return false;
   }
@@ -4499,6 +4626,8 @@ async function runLegacyWrite(
     sendLegacyChannelError(res, r.reason);
     return;
   }
+  // 写成功 → 该账号读缓存全部失效（keys 列表/go 状态已变化；billing 无写操作）。
+  deps.ttlCache.clear(accountId);
   sendJson(res, 200, { ok: true });
 }
 
@@ -4535,10 +4664,14 @@ async function runLegacyWriteNoBody(
     sendLegacyChannelError(res, r.reason);
     return;
   }
+  // 写成功 → 该账号读缓存全部失效（keys 列表已变化）。
+  deps.ttlCache.clear(accountId);
   sendJson(res, 200, { ok: true });
 }
 
-/** 读端点：GET /__admin/api/legacy/account/:id/keys。 */
+/** 读端点：GET /__admin/api/legacy/account/:id/keys。
+ *  服务端 TTL 缓存（30s）：面板详情 2s 轮询打的是缓存，上游调用频率 =
+ *  人类操作频率（与 console 通道 cachedGet 同口径）。只缓存成功响应。 */
 async function handleLegacyKeysList(res: ServerResponse, deps: LegacyDeps, accountId: number): Promise<void> {
   if (!legacyGuard(res, deps, accountId)) return;
   const ws = deps.store!.legacyWorkspaceIdOf(accountId);
@@ -4547,12 +4680,19 @@ async function handleLegacyKeysList(res: ServerResponse, deps: LegacyDeps, accou
     sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
+  const cached = deps.ttlCache.get(accountId, 'keys', ws);
+  if (cached !== null) {
+    sendJson(res, 200, { ok: true, data: { keys: cached } });
+    return;
+  }
   const cookie = deps.store!.cookieOf(accountId);
   const r = await deps.client!.listKeys(accountId, cookie, ws);
   if (!r.ok) {
     sendLegacyChannelError(res, r.reason);
     return;
   }
+  // 空 key 列表（[]）是合法状态，也缓存（创建按钮靠它可达）。
+  deps.ttlCache.set(accountId, 'keys', ws, r.keys);
   // key 列表本身不含明文（legacy.ts 解析时已剥掉 key 字段），可放心透传。
   sendJson(res, 200, { ok: true, data: { keys: r.keys } });
 }
@@ -4604,12 +4744,18 @@ async function handleLegacyGoStatus(res: ServerResponse, deps: LegacyDeps, accou
     sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
+  const cached = deps.ttlCache.get(accountId, 'go', ws);
+  if (cached !== null) {
+    sendJson(res, 200, { ok: true, data: { go: cached } });
+    return;
+  }
   const cookie = deps.store!.cookieOf(accountId);
   const r = await deps.client!.getGoStatus(accountId, cookie, ws);
   if (!r.ok) {
     sendLegacyChannelError(res, r.reason);
     return;
   }
+  deps.ttlCache.set(accountId, 'go', ws, r.status);
   sendJson(res, 200, { ok: true, data: { go: r.status } });
 }
 
@@ -4622,12 +4768,18 @@ async function handleLegacyBilling(res: ServerResponse, deps: LegacyDeps, accoun
     sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
+  const cached = deps.ttlCache.get(accountId, 'billing', ws);
+  if (cached !== null) {
+    sendJson(res, 200, { ok: true, data: { billing: cached } });
+    return;
+  }
   const cookie = deps.store!.cookieOf(accountId);
   const r = await deps.client!.getBilling(accountId, cookie, ws);
   if (!r.ok) {
     sendLegacyChannelError(res, r.reason);
     return;
   }
+  deps.ttlCache.set(accountId, 'billing', ws, r.billing);
   sendJson(res, 200, { ok: true, data: { billing: r.billing } });
 }
 

@@ -274,7 +274,12 @@ export class AccountsStore {
           : [...new Set(patch.allowedModels.map((m) => m.trim()).filter(Boolean))];
     }
     const ok = this.db.updateAccount(id, dbPatch);
-    if (ok) this.allowedCache.set(id, dbPatch.allowedModels ?? null);
+    // 只有 patch 显式含 allowedModels 才更新缓存 —— 否则任何不含白名单的
+    // PATCH（改 cookie/name/kind/workspaceId 常见操作）会把内存缓存静默清成
+    // null，账号级白名单在内存态失效（DB 未变，重启才恢复，零日志）。
+    if (ok && patch.allowedModels !== undefined) {
+      this.allowedCache.set(id, dbPatch.allowedModels ?? null);
+    }
     return ok;
   }
 

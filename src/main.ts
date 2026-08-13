@@ -10,6 +10,7 @@ import { loadSecret } from './secrets.js';
 import { AccountsStore } from './accounts.js';
 import { applySettingsToConfig, parseSettingValue, SettingsStore } from './settings.js';
 import { TokensStore } from './tokens.js';
+import { shutdown } from './shutdown.js';
 
 const cfg = loadConfig();
 
@@ -207,16 +208,16 @@ server.listen(cfg.port, cfg.host, () => {
   );
 });
 
-function shutdown(signal: string): void {
-  console.log(`[proxy] ${signal} — shutting down`);
-  stopKeyProbe();
-  server.close(() => {
-    usageDb.close();  // WAL 收尾；不关也不会丢已提交数据，但干净退出更好。
-    process.exit(0);
-  });
-  // 兜底：5s 内未关完强制退出。
-  setTimeout(() => process.exit(1), 5000).unref();
-}
+// 优雅关停（见 src/shutdown.ts 的时序契约）：先显式 closeDb（flush 最后一批
+// 用量 + WAL 收尾）—— 活跃 SSE 连接下 server.close 回调不可达，必须赶在
+// 兜底 exit 之前落库；再 closeIdleConnections 掐空闲 keep-alive 加速回调；
+// 兜底 exit(0)（flush 已完成，数据安全，「长连接还挂着」不是失败语义）。
+const shutdownTargets = {
+  stop: stopKeyProbe,
+  closeDb: () => usageDb.close(),
+  server,
+  exit: (code: number) => process.exit(code),
+};
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT', shutdownTargets));
+process.on('SIGTERM', () => shutdown('SIGTERM', shutdownTargets));
