@@ -386,6 +386,8 @@ export class UsageDb {
   private insertRequest: any = null;
   private insertKeyEvent: any = null;
   private insertAdminAuditStmt: any = null;
+  /** key_totals 增量 upsert（flush 每 100ms 调用，prepared 缓存免重复 prepare）。 */
+  private upsertTotalsStmt: any = null;
   /**
    * 请求记账的批量队列（未落库的行）。recordRequest 只入队，flush 时单事务
    * 写库 —— 见 recordRequest/flush 的注释（热路径优化：请求结束不再同步 INSERT）。
@@ -497,6 +499,19 @@ export class UsageDb {
       this.insertAdminAuditStmt = this.db.prepare(
         `INSERT INTO admin_audit (at, op, account_id, ok, note, ip) VALUES (?, ?, ?, ?, ?, ?)`,
       );
+      // key_totals 增量 upsert（flush 每 100ms 调用一次，prepared 必须缓存）。
+      this.upsertTotalsStmt = this.db.prepare(`
+        INSERT INTO key_totals (fingerprint, requests, ok, failed, input_tokens, output_tokens, last_at, min_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(fingerprint) DO UPDATE SET
+          requests = key_totals.requests + excluded.requests,
+          ok = key_totals.ok + excluded.ok,
+          failed = key_totals.failed + excluded.failed,
+          input_tokens = key_totals.input_tokens + excluded.input_tokens,
+          output_tokens = key_totals.output_tokens + excluded.output_tokens,
+          last_at = MAX(key_totals.last_at, excluded.last_at),
+          min_at = MIN(key_totals.min_at, excluded.min_at)
+      `);
       this.enabled = true;
       this.disabledReason = null;
     } catch (err) {
@@ -614,6 +629,23 @@ export class UsageDb {
         rpm_limit INTEGER NOT NULL DEFAULT 0,  -- 每分发 key 的 RPM（0 = 不限流，见 ratelimit.ts）
         created_at INTEGER NOT NULL
       );
+
+      -- 按 key 累计用量聚合表（P1-F）：history() 的 byKey 段原来每次都是
+      -- 全表 GROUP BY（150K 行 p50=646ms、60 万行最坏 10s，期间所有在飞 SSE
+      -- 冻住）；15s 缓存只降频不降耗。现在 flush 在**同一事务**里 upsert 本
+      -- 表（口径与 byKey 一致：key_fp != '-' 且 endpoint 非 probe/count_tokens），
+      -- 读端 O(#keys) 即出。保留期语义：随 prune 重建（与 requests 表同窗口），
+      -- 不依赖清行 —— 聚合表是快照不是增量账本。
+      CREATE TABLE IF NOT EXISTS key_totals (
+        fingerprint TEXT PRIMARY KEY,
+        requests INTEGER NOT NULL DEFAULT 0,
+        ok INTEGER NOT NULL DEFAULT 0,
+        failed INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        last_at INTEGER NOT NULL DEFAULT 0,
+        min_at INTEGER NOT NULL DEFAULT 0
+      );
     `);
     // 旧库升级：accounts 表在早期版本没有 oauth_refresh_enc 列，缺了才 ALTER
     // （PRAGMA table_info 检查，幂等；列已存在时 ALTER 会报 duplicate column）。
@@ -630,6 +662,13 @@ export class UsageDb {
     // 旧库升级：admin_audit 表补 ip 列（面板审计视图展示「谁」）。失败只记
     // 日志 —— 审计是观测设施，缺 ip 只是那列恒 null，不影响其他列。
     this.ensureAdminAuditIpColumn();
+    // 聚合表建表后立即按 requests 现存量重建（旧库升级可见历史累计；幂等）。
+    // 失败只记日志：history() 会退化为空 byKey（面板降级显示），不影响主链路。
+    try {
+      this.rebuildTotals();
+    } catch (err) {
+      this.log(`[usagedb] key_totals 初始重建失败（history byKey 降级为空）: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   /** 旧库升级：admin_audit 表补 ip 列（幂等：已存在则不动）。 */
@@ -835,6 +874,7 @@ export class UsageDb {
       this.db.exec('BEGIN');
       try {
         for (const { args } of rows) this.insertRequest.run(...args);
+        this.upsertTotals(rows);
         this.db.exec('COMMIT');
       } catch (err) {
         try {
@@ -850,6 +890,69 @@ export class UsageDb {
     }
     this.maybePrune(lastAt);
     this.maybeCheckpoint(lastAt);
+  }
+
+  /** 把一批行按 byKey 口径聚合并 upsert 进 key_totals（必须在 flush 的事务内
+   *  调用 —— 与 requests 插入同事务，聚合表与明细永远原子一致）。口径与
+   *  queryHistory 的 byKey 段一致：key_fp != '-' 且 endpoint 非 probe/
+   *  count_tokens（探活与记账不是用户流量）。批量内同 key 先合并再单次 upsert，
+   *  避免同批 N 行对同 key 做 N 次 ON CONFLICT。 */
+  private upsertTotals(rows: Array<{ args: unknown[] }>): void {
+    const agg = new Map<
+      string,
+      { requests: number; ok: number; failed: number; inTokens: number; outTokens: number; lastAt: number; minAt: number }
+    >();
+    for (const { args } of rows) {
+      const fp = args[1];
+      const endpoint = args[4];
+      if (typeof fp !== 'string' || fp === '-' || fp === '') continue;
+      // endpoint 为 null（旧库行）时 SQL 语义 `NOT IN` 是排除的，JS 侧必须
+      // 对齐（否则 rebuild（SQL）与增量（JS）双口径漂移，同批行数字不一致）。
+      if (endpoint == null || endpoint === 'probe' || endpoint === 'count_tokens') continue;
+      const at = Number(args[0]) || 0;
+      const st = args[5];
+      const status = typeof st === 'number' ? st : -1;
+      const inTokens = Number(args[8]) || 0;
+      const outTokens = Number(args[9]) || 0;
+      let a = agg.get(fp);
+      if (!a) {
+        a = { requests: 0, ok: 0, failed: 0, inTokens: 0, outTokens: 0, lastAt: 0, minAt: Number.MAX_SAFE_INTEGER };
+        agg.set(fp, a);
+      }
+      a.requests++;
+      if (status >= 200 && status < 300) a.ok++;
+      else if (status >= 400 || status === 0) a.failed++;
+      a.inTokens += inTokens;
+      a.outTokens += outTokens;
+      if (at > a.lastAt) a.lastAt = at;
+      if (at < a.minAt) a.minAt = at;
+    }
+    if (agg.size === 0) return;
+    const upsert = this.upsertTotalsStmt;
+    for (const [fp, a] of agg) {
+      upsert.run(fp, a.requests, a.ok, a.failed, a.inTokens, a.outTokens, a.lastAt, a.minAt === Number.MAX_SAFE_INTEGER ? 0 : a.minAt);
+    }
+  }
+
+  /** 按 requests 现存量重建 key_totals（与 queryHistory 的 byKey 同口径）。幂等，
+   *  整表替换（避免与增量 upsert 叠加出双倍计数）。调用点：migrate 建表后
+   *  （旧库升级立即可见历史累计）+ prune 删旧行后（保持与 requests 同窗口的
+   *  30d 语义 —— 聚合表是快照不是不清零的永久账本）。 */
+  private rebuildTotals(): void {
+    this.db.exec(`
+      DELETE FROM key_totals;
+      INSERT INTO key_totals (fingerprint, requests, ok, failed, input_tokens, output_tokens, last_at, min_at)
+      SELECT key_fp,
+             COUNT(*),
+             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),
+             SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
+             COALESCE(SUM(input_tokens), 0),
+             COALESCE(SUM(output_tokens), 0),
+             MAX(at), MIN(at)
+        FROM requests
+       WHERE key_fp != '-' AND endpoint NOT IN ('probe', 'count_tokens')
+       GROUP BY key_fp
+    `);
   }
 
   /**
@@ -1290,33 +1393,27 @@ export class UsageDb {
 
   private queryHistory(): UsageHistory | null {
     try {
-      // 排除 key_fp = '-'：那是**还没选到 key 就被拒**的请求（客户端 400 格式
-      // 错误、401 鉴权失败、池空 503），它们不属于任何 key。混进 byKey 会在
-      // 面板上凭空多出一个「幽灵 key」—— 实测线上出现过 fp='-' 288 条排在
-      // 真 key 中间，让人以为池子里有三个号。
-      // 同时排除 endpoint = 'probe'：探活是后台维护动作（keyprobe 落库），
-      // 不是用户的「累计请求」—— 混进 byKey/totalRequests 会让面板累计数
-      // 虚高，且探针每轮都打会给「最近使用」制造假新鲜。
-      // 同口径排除 endpoint = 'count_tokens'：记账请求是纯本地估算（Claude Code
-      // 每条消息前都调一次），不是真实上游流量，混进按 key 的用量账本会虚高。
+      // byKey 段：读 key_totals 聚合表（flush 同事务维护），O(#keys) 即出 ——
+      // 不再每次全表 GROUP BY（150K 行 p50=646ms，60 万行最坏 10s，期间所有
+      // 在飞 SSE 冻住）。口径与聚合表一致：key_fp != '-' 且 endpoint 非
+      // probe/count_tokens（探活与记账不是用户流量；fp='-' 是没选到 key 就
+      // 被拒的请求，单独在 unattributed 里数）。
       const byKey = this.db
         .prepare(
-          `SELECT key_fp                                    AS fingerprint,
-                  COUNT(*)                                   AS requests,
-                  SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END) AS ok,
-                  SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END)    AS failed,
-                  COALESCE(SUM(input_tokens), 0)             AS inputTokens,
-                  COALESCE(SUM(output_tokens), 0)            AS outputTokens,
-                  MAX(at)                                    AS lastAt
-             FROM requests
-            WHERE key_fp != '-' AND endpoint NOT IN ('probe', 'count_tokens')
-            GROUP BY key_fp
+          `SELECT fingerprint,
+                  requests,
+                  ok,
+                  failed,
+                  input_tokens AS inputTokens,
+                  output_tokens AS outputTokens,
+                  last_at AS lastAt
+             FROM key_totals
             ORDER BY requests DESC`,
         )
         .all() as Array<Record<string, number | string>>;
 
-      // 未归属请求单独给一个数，面板可以显示「另有 N 条未到达上游」。
-      // 不能直接丢掉：它们是真实发生的请求，丢了总数就对不上。
+      // 未归属请求（key_fp = '-'）单独给一个数：真实发生的请求，丢了总数对不上。
+      // 走 (key_fp, at) 索引，只扫 '-' 行。
       const unattributed = this.db
         .prepare(
           `SELECT COUNT(*) AS requests,
@@ -1325,12 +1422,18 @@ export class UsageDb {
         )
         .get() as { requests: number; failed: number };
 
-      // 总数与 byKey 同口径：排除探活与记账请求（都是维护动作，不是用户流量）。
+      // 总数与 byKey 同口径：聚合表累计 + 未归属里排除探活/记账的部分。
+      // 未归属小查询走 (key_fp, at) 索引；since 取两路最早（LEAST）。
       const meta = this.db
         .prepare(
-          `SELECT COALESCE(MIN(at), 0) AS since, COUNT(*) AS total FROM requests WHERE endpoint NOT IN ('probe', 'count_tokens')`,
+          `SELECT COALESCE((SELECT SUM(requests) FROM key_totals), 0)            AS totals,
+                  COALESCE((SELECT MIN(min_at) FROM key_totals), 0)             AS totalsMinAt,
+                  COALESCE((SELECT COUNT(*) FROM requests
+                             WHERE key_fp = '-' AND endpoint NOT IN ('probe', 'count_tokens')), 0) AS unattrib,
+                  COALESCE((SELECT MIN(at) FROM requests
+                             WHERE key_fp = '-' AND endpoint NOT IN ('probe', 'count_tokens')), 0) AS unattribMinAt`,
         )
-        .get() as { since: number; total: number };
+        .get() as { totals: number; totalsMinAt: number; unattrib: number; unattribMinAt: number };
 
       const recent = this.db
         .prepare(
@@ -1339,9 +1442,13 @@ export class UsageDb {
         )
         .all() as Array<Record<string, never>>;
 
+      const totalsMinAt = Number(meta.totalsMinAt) || 0;
+      const unattribMinAt = Number(meta.unattribMinAt) || 0;
+      const since = totalsMinAt === 0 ? unattribMinAt : unattribMinAt === 0 ? totalsMinAt : Math.min(totalsMinAt, unattribMinAt);
+
       return {
-        since: Number(meta.since) || 0,
-        totalRequests: Number(meta.total) || 0,
+        since,
+        totalRequests: Number(meta.totals) + Number(meta.unattrib) || 0,
         unattributedRequests: Number(unattributed?.requests) || 0,
         unattributedFailed: Number(unattributed?.failed) || 0,
         byKey: byKey.map((r) => ({
@@ -1428,6 +1535,10 @@ export class UsageDb {
       this.db.prepare('DELETE FROM key_events WHERE at < ?').run(cutoff);
       // 管理审计与请求日志同一保留期（按 at）。
       this.db.prepare('DELETE FROM admin_audit WHERE at < ?').run(cutoff);
+      // 明细删了窗口，聚合表整表重建（快照语义，保持 30d 窗口；整表替换防
+      // 与增量 upsert 叠加双倍计数）。失败只记日志：聚合表停留在旧窗口，
+      // history 数字偏高直到下次 prune —— 观测数据，可接受。
+      this.rebuildTotals();
     } catch (err) {
       this.log(`[usagedb] 保留期清理失败（已忽略）: ${err instanceof Error ? err.message : err}`);
     }

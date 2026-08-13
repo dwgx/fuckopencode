@@ -196,7 +196,13 @@ export async function postUpstreamChat(
   } catch (err) {
     // fetch 阶段失败（网络错误/超时）：并发计数已 acquire，必须释放。
     releaseOnce();
-    pool.markFailure(key, 'transient');
+    // 客户端断开（调用方 signal abort，如用户在连接/响应头阶段取消）不是
+    // key 的错：不记 transient —— 否则累计 failThreshold 次会禁一个健康 key。
+    // 内部超时（header/idle/total 的 controller abort）与网络错误才记，
+    // 那才是 key/上游的真实失败信号。AbortSignal.any 不会把 abort 传播回源，
+    // 所以用两个源各自的 aborted 标志区分谁先 abort。
+    const clientAbort = signal?.aborted === true && controller.signal.aborted !== true;
+    if (!clientAbort) pool.markFailure(key, 'transient');
     throw err;
   }
 }

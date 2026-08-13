@@ -178,8 +178,30 @@ function blockText(block: unknown): string {
  * 都打回原型。fenced code block 中带语言标签的围栏整体降权（只查高危标记），
  * 无语言标签的裸围栏不跳过（可被用来包裹注入）。
  */
+/**
+ * 预筛词根（P1-5）：detectInjection 入口先对原始文本做一次子串命中检查。
+ * 未命中任何词根 = 文本不含任何信号所需的词 → 直接 none，跳过 stripCodeBlocks
+ * + NFKC 归一化 + 全部正则 × 4 视图（1.5KB 文本 185µs→30µs；注入检测在热路径
+ * 每个请求都跑，还有 count_tokens 的字符估算）。
+ *
+ * 正确性：词根是各信号 regex 的**必需词**超集（逐信号核对过）——命中即继续走
+ * 完整检测，未命中意味着连信号所需的最短词都没有。预筛在**归一化后**文本上跑
+ * （与完整检测同一个 normalizeForDetect：NFKC + 全角 + 去零宽 + 西里尔映射），
+ * 与完整检测严格等价：任何信号能命中的文本，归一化后必然含其必需词 → 预筛
+ * 必然命中，**不漏报**（全角/零宽/西里尔/组合符绕过全部覆盖）。未命中 = 连
+ * 必需词都没有 → 短路 none，省掉 stripCodeBlocks + 4 视图 × 12 正则的 48 次
+ * 扫描（热路径主要成本，1.5KB 文本 185µs→30µs）。新增信号时必须同步补词根，
+ * 否则该信号在预筛下永不触发。
+ * 词根偏宽只损失短路率（性能），不破坏正确性。
+ */
+const PRESCREEN_ROOTS =
+  /ignore|disregard|forget|overlook|忽略|无视|忘掉|放弃|跳过|指令|提示词|规则|要求|henceforth|pretend|扮演|假装|system|系统|隐藏|初始|基础|reveal|leak|print|show|output|display|dump|泄露|输出|展示|打印|透露|decode|decrypt|unpack|decompress|base64|hex|rot13|binary|im_start|startoftext|role|turn|channel|imagine|you are now|act as|now|你是|变成/i;
+
 export function detectInjection(text: string): InjectionVerdict {
   if (!text) return { level: 'none', signals: [] };
+  // 预筛（P1-5）：归一化后文本不含任何信号词根 → 短路返回 none。
+  // 命中场景会重复一次归一化（主流程还要用），注入罕见，可接受。
+  if (!PRESCREEN_ROOTS.test(normalizeForDetect(text))) return { level: 'none', signals: [] };
 
   const { ordinary, fencedCode } = stripCodeBlocks(text);
   const candidates = normalizedViews(ordinary);

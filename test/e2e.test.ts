@@ -1,11 +1,11 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApp, MAX_LOGIN_FAIL_KEYS, MAX_REVOKED_SESSIONS, loginFailKeyCount, pruneRevokedSessions, revokedSessionCount, revokeSessionForTest, type ConsoleClientLike, type ConsoleWriteResult, type LegacyBilling, type LegacyBillingReadResult, type LegacyClientLike, type LegacyGoReadResult, type LegacyGoStatus, type LegacyPlainKey, type LegacyReadResult, type LegacyWriteResult } from '../src/server.js';
+import { createApp, MAX_LOGIN_FAIL_KEYS, MAX_REVOKED_SESSIONS, loginFailKeyCount, pruneRevokedSessions, revokedSessionCount, revokeSessionForTest, LegacyTtlCache, LEGACY_TTL_MS, type ConsoleClientLike, type ConsoleWriteResult, type LegacyBilling, type LegacyBillingReadResult, type LegacyClientLike, type LegacyGoReadResult, type LegacyGoStatus, type LegacyPlainKey, type LegacyReadResult, type LegacyWriteResult } from '../src/server.js';
 import { AccountsStore } from '../src/accounts.js';
 import { LegacyPlainCache } from '../src/legacy.js';
 import { UsageDb } from '../src/usagedb.js';
@@ -310,6 +310,7 @@ describe('v1 代理端到端', () => {
   beforeAll(async () => {
     fake = await startFakeUpstream();
     cfg.anthropicBaseUrl = fake.baseUrl;
+    cfg.payAsYouGoBaseUrl = fake.baseUrl; // -free 模型（按量端点）也打到 fake
     proxy = createApp(cfg);
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
     const address = proxy.address();
@@ -379,6 +380,72 @@ describe('v1 代理端到端', () => {
     expect(sys.role).toBe('system');
     expect(String(sys.content)).toContain('你是助手');
     expect(String(sys.content)).toContain('不可信数据');
+  });
+
+  it('chat 路径 tool_choice 两路径对齐：-free（按量端点）剥掉，订阅模型保留（P1-C）', async () => {
+    // 回归：修复前 chat 路径原样转发 tool_choice，-free 模型走按量端点
+    // （/zen）实测 400 "Thinking mode does not support this tool_choice"；
+    // 直通路径无条件剥。修复后 chat 路径对 -free 模型剥、订阅模型保留。
+    const marker = 'toolchoice-' + Date.now();
+    // -free 模型：显式 tool_choice 必须被剥掉（否则上游 400）。
+    const payg = await call(
+      {
+        model: 'deepseek-v4-flash-free',
+        tool_choice: { type: 'function', function: { name: 'f1' } },
+        messages: [{ role: 'user', content: marker + '-payg' }],
+      },
+      'test-key',
+    );
+    expect(payg.status).toBe(200);
+    const paygUp = fake.received[fake.received.length - 1]!;
+    expect(paygUp.model).toBe('deepseek-v4-flash-free');
+    expect((paygUp as unknown as Record<string, unknown>).tool_choice).toBeUndefined();
+    // 订阅模型：tool_choice 保留（OpenAI 合法字段，不误剥）。
+    const sub = await call(
+      {
+        model: 'deepseek-v4-flash',
+        tool_choice: { type: 'function', function: { name: 'f1' } },
+        messages: [{ role: 'user', content: marker + '-sub' }],
+      },
+      'test-key',
+    );
+    expect(sub.status).toBe(200);
+    const subUp = fake.received[fake.received.length - 1]!;
+    expect(subUp.model).toBe('deepseek-v4-flash');
+    expect((subUp as unknown as Record<string, unknown>).tool_choice).toEqual({ type: 'function', function: { name: 'f1' } });
+  });
+
+  it('chat 路径 max_tokens 下限：小预算抬到 4096；JSON mode 不抬（P1-G）', async () => {
+    // 回归：2026-08-09 改造后该保护随 request.ts 退役丢失，chat 路径小预算 +
+    // thinking（默认开）会被吃光预算返回空正文；直通路径一直有（quirk 6）。
+    // 对齐语义：response_format（JSON mode，上游强制 thinking 关）不抬。
+    const marker = 'mintokens-' + Date.now();
+    // 小预算 → 抬到 4096（与直通同一取舍：空回复 vs 超预算，选后者）。
+    const r1 = await call(
+      { model: 'deepseek-v4-flash', max_tokens: 200, messages: [{ role: 'user', content: marker + '-a' }] },
+      'test-key',
+    );
+    expect(r1.status).toBe(200);
+    const up1 = fake.received[fake.received.length - 1]!;
+    expect((up1 as unknown as Record<string, unknown>).max_tokens).toBe(4096);
+    // JSON mode（response_format）：thinking 强制关，不抬、尊重客户端预算。
+    const r2 = await call(
+      {
+        model: 'deepseek-v4-flash',
+        max_tokens: 200,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: marker + '-b' }],
+      },
+      'test-key',
+    );
+    expect(r2.status).toBe(200);
+    const up2 = fake.received[fake.received.length - 1]!;
+    expect((up2 as unknown as Record<string, unknown>).max_tokens).toBe(200);
+    // 未传 max_tokens → 补 4096。
+    const r3 = await call({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: marker + '-c' }] }, 'test-key');
+    expect(r3.status).toBe(200);
+    const up3 = fake.received[fake.received.length - 1]!;
+    expect((up3 as unknown as Record<string, unknown>).max_tokens).toBe(4096);
   });
 
   it('流式：返回 OpenAI chunk SSE，结尾 [DONE]', async () => {
@@ -620,6 +687,118 @@ describe('v1 代理端到端', () => {
     // （去掉 isClientAbort 守卫这行会红：取消被记成 transient 失败）。
     await new Promise((r) => setTimeout(r, 150));
     expect(await poolFailCount()).toBe(before);
+  });
+});
+
+describe('并发在飞上限（P1-D：超限 503 + Retry-After，释放后恢复）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  const limCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['test-key'],
+    anthropicApiKey: 'sk-ant-fake',
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxConcurrentRequests: 2,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    limCfg.anthropicBaseUrl = fake.baseUrl;
+    proxy = createApp(limCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const addr = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  it('并发超限 → 503 overloaded_error + Retry-After；释放槽位后恢复', async () => {
+    // 回归：去掉并发门（或把 cfg.maxConcurrentRequests 设为 0）会红 —— 第 3
+    // 个请求不再 503。全链路无上限 + undici 无 per-origin 连接上限 + 大 body
+    // 多份拷贝滞留，是 2GB VPS 唯一的 OOM 向量（审计 P1-D）。
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const hangReq = (marker: string): Promise<http.IncomingMessage> =>
+      new Promise((resolve, reject) => {
+        const r = httpRequest(
+          {
+            host: '127.0.0.1',
+            port,
+            path: '/v1/chat/completions',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+          },
+          resolve,
+        );
+        r.on('error', reject);
+        r.write(JSON.stringify({ model: 'deepseek-v4-flash', stream: true, messages: [{ role: 'user', content: marker }] }));
+        r.end();
+      });
+    const waitChunk = (r: http.IncomingMessage): Promise<void> =>
+      new Promise((resolve) => r.once('data', () => resolve()));
+
+    // 两个挂起流占满 2 个槽位。
+    const h1 = await hangReq('挂起流测试');
+    await waitChunk(h1);
+    const h2 = await hangReq('挂起流测试');
+    await waitChunk(h2);
+
+    // 槽位已满 → 第三个请求 503 + Retry-After。
+    const third = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'third' }] }),
+    });
+    expect(third.status).toBe(503);
+    expect(((await third.json()) as { error: { type: string } }).error.type).toBe('overloaded_error');
+    expect(third.headers.get('retry-after')).toBe('1');
+
+    // 断开一个挂起流（客户端取消 → res close → 槽位释放）→ 普通请求恢复 200。
+    h1.destroy();
+    await new Promise((r) => setTimeout(r, 150)); // 等 close 事件释放槽位
+    const ok = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'after-release' }] }),
+    });
+    expect(ok.status).toBe(200);
+    h2.destroy();
   });
 });
 
@@ -4534,6 +4713,7 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
   let store: AccountsStore;
   let client: FakeLegacyClient;
   let plainCache: LegacyPlainCache;
+  let ttlCache: LegacyTtlCache;
   let notWired: Server; // 未接线 legacyClient 的对照组
   let aId = 0; // legacy workspace + auth cookie（成功路径）
   let bId = 0; // 无 legacy workspace（not configured）
@@ -4696,6 +4876,9 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
     client = new FakeLegacyClient();
     plainCache = new LegacyPlainCache();
     client.cache = plainCache;
+    // 服务端读 TTL 缓存：注入持有实例，beforeEach 清缓存防用例互相污染
+    // （修复后 keys/go/billing 成功响应会进缓存，下一个用例读同一端点会命中）。
+    ttlCache = new LegacyTtlCache(LEGACY_TTL_MS);
     const db0 = new UsageDb(path.join(tmpDir, 'legacy.db'), 30, () => {});
     const secret = loadSecret({ gatewaySecret: 'e2e-legacy-secret', secretFilePath: '/dev/null' } as unknown as AppConfig)!;
     const store0 = new AccountsStore(db0, secret, legacyCfg, () => {});
@@ -4703,7 +4886,7 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
       cooldownMs: legacyCfg.keyCooldownMs,
       failThreshold: legacyCfg.keyFailThreshold,
     });
-    proxy = createApp(legacyCfg, pool0, db0, store0, undefined, undefined, undefined, client, undefined, plainCache);
+    proxy = createApp(legacyCfg, pool0, db0, store0, undefined, undefined, undefined, client, undefined, plainCache, ttlCache);
     db = db0;
     store = store0;
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
@@ -4723,6 +4906,15 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
 
     notWired = createApp(legacyCfg, undefined, db, store, undefined);
     await new Promise<void>((resolve) => notWired.listen(0, '127.0.0.1', resolve));
+  });
+
+  beforeEach(() => {
+    // 服务端读 TTL 缓存按账号隔离：清掉上一用例写入的成功响应，防命中污染
+    // 下一个用例的 calls 断言（失败响应不缓存，无需处理）。写操作测试依赖
+    // 同用例内的顺序，beforeEach 只清跨用例状态。
+    ttlCache.clear(aId);
+    ttlCache.clear(cId);
+    client.calls = [];
   });
 
   afterAll(async () => {
@@ -4761,6 +4953,65 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
       cookie: 'auth=legacy-secret',
       ws: 'wrk_01KZEQCBJ59Y3T34CSJNRVQJV7',
     });
+  });
+
+  it('keys 列表服务端 TTL 缓存：30s 内重复读不重打上游（2 次 GET → listKeys 1 次）', async () => {
+    // 回归：修复前详情 2s tick 每次 GET keys 都打上游 HTML（每分钟 90 次）；
+    // 修复后 TTL 内命中缓存。去掉 handleLegacyKeysList 的缓存层会红。
+    const r1 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/keys`);
+    expect(r1.status).toBe(200);
+    expect(client.calls.filter((c) => c.method === 'listKeys')).toHaveLength(1);
+    const r2 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/keys`);
+    expect(r2.status).toBe(200);
+    expect(client.calls.filter((c) => c.method === 'listKeys')).toHaveLength(1); // 命中缓存
+    const b1 = (await r1.json()) as { data: { keys: unknown[] } };
+    const b2 = (await r2.json()) as { data: { keys: unknown[] } };
+    expect(b2.data.keys).toEqual(b1.data.keys);
+  });
+
+  it('go 状态服务端 TTL 缓存：重复读不重打上游', async () => {
+    const r1 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go`);
+    expect(r1.status).toBe(200);
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(1);
+    await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go`);
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(1);
+  });
+
+  it('billing 服务端 TTL 缓存：重复读不重打上游', async () => {
+    const r1 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/billing`);
+    expect(r1.status).toBe(200);
+    expect(client.calls.filter((c) => c.method === 'getBilling')).toHaveLength(1);
+    await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/billing`);
+    expect(client.calls.filter((c) => c.method === 'getBilling')).toHaveLength(1);
+  });
+
+  it('写操作成功后读缓存失效：createKey 后再 GET keys 重新打上游', async () => {
+    // 回归：写成功后不清缓存会红 —— 新建的 key 列表 TTL 内不会出现。
+    const r1 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/keys`);
+    expect(r1.status).toBe(200);
+    expect(client.calls.filter((c) => c.method === 'listKeys')).toHaveLength(1);
+    const created = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'cache-invalid' }),
+    });
+    expect(created.status).toBe(200);
+    const r2 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/keys`);
+    expect(r2.status).toBe(200);
+    expect(client.calls.filter((c) => c.method === 'listKeys')).toHaveLength(2); // 缓存已清，重新打
+  });
+
+  it('setGoToggle 成功后 go 缓存失效：重新打上游', async () => {
+    await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go`);
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(1);
+    const toggled = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go/use-balance`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(toggled.status).toBe(200);
+    await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go`);
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(2); // 缓存已清，重新打
   });
 
   it('账号未配 legacy workspace → 502 明确提示', async () => {
@@ -5587,6 +5838,33 @@ describe('postUpstreamChat 超时语义（B1：头超时不误伤长流，body �
       }),
     ).rejects.toThrow('network down');
     // 失败路径：releaseOnce 已执行（幂等），不抛、不泄漏。
+  });
+
+  it('客户端在响应头阶段断开：不记 transient（failCount 不变，P1-B）', async () => {
+    // 回归：修复前 postUpstreamChat 的 catch 无条件 markFailure('transient')。
+    // 客户端在「连接/响应头阶段」取消（res close → controller.abort，fetch 还
+    // 没 resolve）会被累计成 key 失败 —— failThreshold 次就禁一个健康 key。
+    // server 的 isClientAbort 只护 body 消费阶段，这个窗口是漏网。去掉 catch
+    // 里的 clientAbort 守卫（signal.aborted 且内部 controller 未 abort）会红。
+    const controller = new AbortController();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) => {
+        // 挂住响应头：fetch 不 resolve，直到信号 abort（模拟客户端断开）。
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('aborted by client')));
+        });
+      }),
+    );
+    const pool = makePool();
+    const before = pool.snapshot()[0]!.failCount;
+    const p = postUpstreamChat(upCfg, pool, { model: 'deepseek-v4-flash' }, controller.signal, {}, '/v1/chat/completions', {
+      timeouts: { headerMs: 10_000, idleMs: 10_000 },
+    });
+    // 响应头还没到就 abort 外部信号 = 客户端在连接阶段断开。
+    controller.abort();
+    await expect(p).rejects.toThrow('aborted by client');
+    expect(pool.snapshot()[0]!.failCount).toBe(before);
   });
 });
 

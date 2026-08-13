@@ -621,6 +621,25 @@ describe('账号级模型白名单（allowedModels）', () => {
     db.close();
   });
 
+  it('update（PATCH）不含 allowedModels 不清空白名单缓存（回归）', () => {
+    // 回归：修复前 update() 末尾无条件 allowedCache.set(id, dbPatch.allowedModels
+    // ?? null)，任何不含白名单字段的 PATCH（改 cookie/name/workspaceId 常见
+    // 操作）把内存缓存静默清成 null —— 账号级白名单内存态失效、零日志、
+    // 重启才恢复。去掉 `patch.allowedModels !== undefined` 守卫会红。
+    const { db, store } = makeStore();
+    const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });
+    expect(store.update(acc.id, { allowedModels: ['deepseek-v4-flash'] })).toBe(true);
+    expect(store.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash']);
+    // 改 cookie（不含 allowedModels）——白名单必须保持不变。
+    expect(store.update(acc.id, { cookie: 'auth=new-cookie' })).toBe(true);
+    expect(store.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash']);
+    expect(store.get(acc.id)!.allowedModels).toEqual(['deepseek-v4-flash']);
+    // 改名字同理。
+    expect(store.update(acc.id, { name: 'renamed' })).toBe(true);
+    expect(store.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash']);
+    db.close();
+  });
+
   it('remove 清缓存：删除账号后 allowedModelsOf 不再返回旧值', () => {
     const { db, store } = makeStore();
     const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });

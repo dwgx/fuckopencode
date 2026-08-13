@@ -120,6 +120,11 @@ export class ConsoleClient {
   /** refresh 单飞：同一账户同一时间只发一个 refresh（并发请求共享结果），
    *  彻底消除「多个请求同时用旧 token refresh → 轮换踩踏 → 全 400」。 */
   private readonly refreshInflight = new Map<number, Promise<{ ok: boolean; token: string; workspaceId: string } | null>>();
+  /** 读请求单飞：同缓存键并发 miss 只发一次上游（follower 共享 leader 结果）。
+   *  触发面不止 TTL 过期瞬间 —— 冷启动、慢上游（2s 轮询 × 15s 超时窗口可叠
+   *  5-7 个并发）都会集体 miss。invalidate 时同步清该账户条目（防新读搭上
+   *  旧凭据的在途请求，与读缓存同语义）。 */
+  private readonly inflight = new Map<string, Promise<unknown | null>>();
 
   constructor(
     cfg: AppConfig,
@@ -308,6 +313,12 @@ export class ConsoleClient {
     for (const key of this.cache.keys()) {
       if (key.startsWith(`${id}:`)) this.cache.delete(key);
     }
+    // 清该账户在途读：invalidate 之后的新读必须自己发起（拿新凭据/新数据），
+    // 不能搭上旧凭据的在途请求 —— 否则「换 cookie 后新读拿到旧 cookie 的结果」。
+    // 被清的 leader 响应回来时 gen 检查会丢弃缓存写入（代数已变）。
+    for (const key of this.inflight.keys()) {
+      if (key.startsWith(`${id}:`)) this.inflight.delete(key);
+    }
     // 代数 +1：发起于 invalidate 之前的挂起读，响应回来时发现代数变了，
     // 直接把旧数据丢弃、不写缓存（M2：写成功后 ≤30s 显示旧数据的竞态根因）。
     this.generations.set(id, (this.generations.get(id) ?? 0) + 1);
@@ -334,16 +345,29 @@ export class ConsoleClient {
     const hit = this.cache.get(key);
     const now = this.now();
     if (hit && now < hit.at + hit.ttl) return hit.data;
+    // 单飞：同键已有在途请求则共享 leader 结果，不再发一次上游。只有 leader
+    // 走写缓存路径（follower 永不触碰缓存写，保证 M2 竞态防护不被并发稀释）。
+    const pending = this.inflight.get(key);
+    if (pending) return pending;
     // 发起时记录代数；响应期间发生过 invalidate（写操作成功）则代数已变，
     // 旧值丢弃不写缓存（M2 竞态防护）。
     const gen = this.generations.get(id) ?? 0;
-    const data = await this.getJson(id, path);
-    // 注意两侧都要 ?? 0：从未 invalidate 过的账户 generations 里没有条目，
-    // get 返回 undefined —— 与发起时记录的 0 相等才算代数没变。
-    if (gen !== (this.generations.get(id) ?? 0)) return data;
-    // 只缓存成功响应 —— 失败永远重新打上游，不给面板喂过期真相。
-    if (data !== null) this.cache.set(key, { at: now, ttl: ttlMs ?? this.ttlMs, data });
-    return data;
+    const p = (async () => {
+      const data = await this.getJson(id, path);
+      // 注意两侧都要 ?? 0：从未 invalidate 过的账户 generations 里没有条目，
+      // get 返回 undefined —— 与发起时记录的 0 相等才算代数没变。
+      if (gen !== (this.generations.get(id) ?? 0)) return data;
+      // 只缓存成功响应 —— 失败永远重新打上游，不给面板喂过期真相。
+      if (data !== null) this.cache.set(key, { at: now, ttl: ttlMs ?? this.ttlMs, data });
+      return data;
+    })();
+    this.inflight.set(key, p);
+    try {
+      return await p;
+    } finally {
+      // 身份判断：invalidate 可能已清掉本条并建了新 leader，别误删新条目。
+      if (this.inflight.get(key) === p) this.inflight.delete(key);
+    }
   }
 
   private async getJson(id: number, path: string): Promise<unknown | null> {
