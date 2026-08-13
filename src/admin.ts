@@ -1699,6 +1699,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         <h1 data-i18n="detailRequests">Detailed requests</h1>
         <div class="req-tools">
           <input class="oc-input oc-grow" id="req-q" placeholder="search path/status/model/client/ua/error" autocomplete="off" spellcheck="false">
+          <label class="oc-check req-all" title="包含健康检查/记账等噪音请求">
+            <input type="checkbox" id="req-all">
+            <span data-i18n="reqShowAll">show all requests</span>
+          </label>
           <select class="oc-select oc-shrink" id="req-size" title="page size">
             <option value="20" selected>20</option>
             <option value="50">50</option>
@@ -2079,6 +2083,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       // 请求明细（分页 + 搜索 + 跳页 + 每页条数 + IP 统计）。
       detailRequests: 'Detailed requests', reqPrev: 'prev', reqNext: 'next', reqPage: 'page',
       reqGo: 'go',
+      reqShowAll: 'show all requests',
       ipStatsTitle: 'Top IPs', ipStatsSub: 'traffic aggregated by client IP',
       ipClients: 'clients', ipLast: 'last seen', ipEmpty: 'no traffic yet',
       ipFilterHint: 'filter detailed requests by this IP',
@@ -2316,6 +2321,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       // 请求明细（分页 + 搜索 + 跳页 + 每页条数 + IP 统计）。
       detailRequests: '详细请求', reqPrev: '上一页', reqNext: '下一页', reqPage: '页',
       reqGo: '跳转',
+      reqShowAll: '显示全部请求',
       ipStatsTitle: 'IP 统计', ipStatsSub: '按客户端 IP 聚合的流量',
       ipClients: '客户端', ipLast: '最近', ipEmpty: '暂无流量',
       ipFilterHint: '按该 IP 筛选详细请求',
@@ -3591,7 +3597,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // fingerprint, ua, client, endpoint, error}；client/ua 由服务端解析。
   // 分页/搜索：pageSize 可切 20/50/100，q 过滤 path/status/model/client/ua（不区分大小写）。
   var REQ_PAGE_SIZE = 20;
-  var reqPage = 1, reqTotal = 0, reqQuery = '';
+  var reqPage = 1, reqTotal = 0, reqQuery = '', reqShowAll = false;
   var reqSearchTimer = 0;
   function renderRequests(items) {
     var el = $('u-events');
@@ -3644,6 +3650,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
   function fetchRequests() {
     var url = '/__admin/api/requests?page=' + reqPage + '&pageSize=' + REQ_PAGE_SIZE +
+      '&filter=' + (reqShowAll ? 'all' : 'important') +
       (reqQuery ? '&q=' + encodeURIComponent(reqQuery) : '');
     api('GET', url, null).then(function (r) {
       if (r.ok && r.json && r.json.ok !== false && r.json.data) {
@@ -5173,6 +5180,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   $('req-go').addEventListener('click', goReqPage);
   $('req-page').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') goReqPage();
+  });
+  var reqAllEl = $('req-all');
+  if (reqAllEl) reqAllEl.addEventListener('change', function () {
+    reqShowAll = reqAllEl.checked;
+    reqPage = 1;
+    fetchRequests();
   });
   $('req-size').addEventListener('change', function () {
     var v = Number(this.value);

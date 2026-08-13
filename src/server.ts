@@ -694,6 +694,7 @@ async function handleRequestsRoute(req: IncomingMessage, res: ServerResponse, db
   let page = 1;
   let pageSize = 20;
   let q: string | undefined;
+  let filter: 'important' | 'all' = 'important';
   const qs = (req.url ?? '').split('?')[1];
   if (qs) {
     try {
@@ -704,18 +705,20 @@ async function handleRequestsRoute(req: IncomingMessage, res: ServerResponse, db
       if (Number.isFinite(rawSize) && rawSize >= 1) pageSize = Math.min(100, Math.floor(rawSize));
       const rawQ = params.get('q');
       if (rawQ != null && rawQ.trim() !== '') q = rawQ.slice(0, 200);
+      const rawFilter = params.get('filter');
+      if (rawFilter === 'all') filter = 'all';
     } catch {
       // 畸形 query 不解析，走默认分页。
     }
   }
-  const result = db.listRequests(page, pageSize, q);
+  const result = db.listRequests(page, pageSize, q, filter);
   if (result == null) {
     sendJson(res, 503, {
       error: { message: db.enabled ? 'usage db query failed' : `usage db unavailable: ${db.disabledReason ?? 'unknown'}`, type: 'server_error' },
     });
     return;
   }
-  sendJson(res, 200, { ok: true, data: { items: result.items, total: result.total, page, pageSize, q: q ?? null } });
+  sendJson(res, 200, { ok: true, data: { items: result.items, total: result.total, page, pageSize, q: q ?? null, filter } });
 }
 
 /**

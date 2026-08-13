@@ -1065,7 +1065,7 @@ describe('前端全量改造：删除确认原生化 + 类型下拉 + 请求明�
     const code = inlineScript();
     expect(code).toContain("'/__admin/api/requests?page=' + reqPage + '&pageSize=' + REQ_PAGE_SIZE");
     expect(code).toContain('var REQ_PAGE_SIZE = 20;');
-    expect(code).toContain('var reqPage = 1, reqTotal = 0, reqQuery = \'\';');
+    expect(code).toContain('var reqPage = 1, reqTotal = 0, reqQuery = \'\', reqShowAll = false;');
     expect(ADMIN_HTML).toContain('id="req-prev"');
     expect(ADMIN_HTML).toContain('id="req-next"');
     expect(ADMIN_HTML).toContain('id="req-info"');
