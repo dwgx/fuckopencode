@@ -206,6 +206,44 @@ describe('KeyPool 失败分级与禁用', () => {
   });
 });
 
+describe('KeyPool.quotaEmptyError（池空透传 GoUsageLimitError）', () => {
+  const QUOTA_BODY = { error: { type: 'GoUsageLimitError', message: 'Weekly usage limit reached. Resets in 3 days.' } };
+
+  it('整池额度耗尽：返回记过的上游错误（status + body）', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
+    pool.markFailure('a', 'quota-exhausted', 3 * 86_400_000);
+    pool.noteQuotaError(429, QUOTA_BODY);
+    pool.markFailure('b', 'quota-exhausted', 3 * 86_400_000);
+    pool.noteQuotaError(429, QUOTA_BODY);
+
+    expect(pool.healthyCount).toBe(0);
+    expect(pool.quotaEmptyError).toEqual({ status: 429, body: QUOTA_BODY });
+  });
+
+  it('禁用原因混着非额度（auth/transient）→ 不伪装成额度问题，返回 null', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
+    pool.markFailure('a', 'quota-exhausted', 3 * 86_400_000);
+    pool.noteQuotaError(429, QUOTA_BODY);
+    pool.markFailure('b', 'auth'); // 混入凭据失效禁用
+
+    expect(pool.healthyCount).toBe(0);
+    expect(pool.quotaEmptyError).toBeNull();
+  });
+
+  it('池里还有健康 key / 从未记过额度错误 → null（回通用 503）', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
+    // 没记过额度错误
+    expect(pool.quotaEmptyError).toBeNull();
+    // 记过但池没空
+    pool.noteQuotaError(429, QUOTA_BODY);
+    pool.markFailure('a', 'quota-exhausted', 3 * 86_400_000);
+    expect(pool.quotaEmptyError).toBeNull();
+  });
+});
+
 describe('KeyPool 状态变更回调（禁用/恢复可观测性）', () => {
   const events: string[] = [];
 

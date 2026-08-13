@@ -153,6 +153,11 @@ export class KeyPool {
   private readonly opts: Required<KeyPoolOptions>;
   /** 单调递增的选中序号，驱动公平轮转（见 PooledKey.lastUsedSeq）。 */
   private seq = 0;
+  /**
+   * 最近一次额度耗尽的完整上游错误（status + body），池空透传用。
+   * 只在分类为 quota-exhausted 时由 [`noteQuotaError`] 写入。
+   */
+  private lastQuotaError: { status: number; body: unknown } | null = null;
 
   constructor(
     rawKeys: string[],
@@ -221,6 +226,37 @@ export class KeyPool {
   /** 当前禁用（含冷却未到期）的 key 指纹列表，日志用。 */
   disabledFingerprints(): string[] {
     return this.keys.filter((k) => !this.isAvailable(k)).map((k) => keyFingerprint(k.key));
+  }
+
+  /**
+   * 记录一次真实的额度耗尽错误。调用方在 `classifyUpstreamFailure` 判出
+   * `quota-exhausted` 且持有上游错误体时调。
+   *
+   * 为什么要有它：整池同时额度耗尽时 `acquire` 直接抛 `PoolEmptyError`，
+   * 没有任何上游响应能带上错误信息 —— 下游（kirostudio 等）只看到通用 503
+   * 「all upstream keys are disabled」，不知道是额度问题、更不知道多久恢复。
+   * 池空时 [`quotaEmptyError`] 用它把上游的 GoUsageLimitError 原样透传出去。
+   */
+  noteQuotaError(status: number, body: unknown): void {
+    this.lastQuotaError = { status, body };
+  }
+
+  /**
+   * 池空且**所有**禁用 key 的原因都是额度耗尽时，返回要透传的上游错误；
+   * 否则返回 null（调用方回通用 503）。
+   *
+   * 只透传「纯额度耗尽」的场景 —— 混着 auth/transient 禁用的池空不该伪装成
+   * 额度问题，否则下游会误以为重置时间到了就恢复，实际可能另有故障。
+   */
+  get quotaEmptyError(): { status: number; body: unknown } | null {
+    if (this.lastQuotaError == null) return null;
+    const disabled = this.keys.filter((k) => !this.isAvailable(k));
+    // 只在「池真的空了」时透传：没有任何健康 key 可用（还有健康 key 的话
+    // 轮不到把额度耗尽当全池结论；池里没有 key 时也不该拿陈旧的额度错误）。
+    const poolEmpty = this.keys.length > 0 && disabled.length === this.keys.length;
+    if (!poolEmpty) return null;
+    const allQuota = disabled.every((k) => k.disabledReason === 'quota-exhausted');
+    return allQuota ? this.lastQuotaError : null;
   }
 
   /**

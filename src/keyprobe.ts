@@ -131,6 +131,8 @@ export async function probeKey(
     const kind = classifyUpstreamFailure(res.status, body);
     const resetMs = resetDelayMsFromError(body);
     pool.markFailure(key, kind, resetMs ?? undefined);
+    // 探活也能发现额度耗尽：记录上游错误，供池空时原样透传给下游。
+    if (kind === 'quota-exhausted') pool.noteQuotaError(res.status, body);
     return {
       fingerprint,
       ok: false,
@@ -221,53 +223,68 @@ export async function runProbeRound(
     const payg = acc.kind === 'payg';
     const model = payg ? PAYG_PROBE_MODEL : PROBE_MODEL;
     const baseUrl = payg ? cfg.payAsYouGoBaseUrl : cfg.anthropicBaseUrl;
-    const key = keys[0]!; // 上面已保证 keys.length >= 1
-    const r = await probeKey(cfg, pool, key, keyFingerprint(key), cfg.keyProbeTimeoutMs, baseUrl, model);
-    results.push(r);
-
-    // 探针结论写账（§4.4）：成功 → ok + retry_until 推到空闲阈值之后（闲置
-    // 60min 再探）；失败 → 按 §4.2 表分流，retry_until = now + retryMs。
+    // 每个 key 都要探，不只 keys[0]。env 种子把整组 OPENSEA_KEYS 塞进一个账户，
+    // 只探第一个会让排在后边的 key 的「额度已耗尽」永远不被发现 —— 池内存是
+    // 进程级，重启即清零，坏 key 会一直挂着 healthy 被 least-loaded 选中派发
+    // 流量（2026-08-14 线上实测：probe 只打 env 账户 keys[0]，其余 key 从未被
+    // 验证，GoUsageLimitError 的 key 一直 healthy）。
     // pool 侧的成功/失败已由 probeKey 处理（markSuccess/markFailure）。
-    if (r.ok) {
+    let firstFail: ProbeResult | null = null;
+    let lastOk: ProbeResult | null = null;
+    for (const key of keys) {
+      const r = await probeKey(cfg, pool, key, keyFingerprint(key), cfg.keyProbeTimeoutMs, baseUrl, model);
+      results.push(r);
+      if (r.ok) lastOk = r;
+      else if (firstFail === null) firstFail = r;
+
+      // 探活结果也落库，这样面板的「累计」和历史里能看出哪些请求是探活产生的
+      // （endpoint = 'probe'），不会和真实流量混淆。
+      db?.recordRequest({
+        at: now,
+        keyFingerprint: r.fingerprint,
+        model,
+        upstreamModel: model,
+        endpoint: 'probe',
+        status: r.status,
+        durationMs: r.durationMs,
+        stream: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        thinkingTokens: 0,
+        error: r.error ?? null,
+        // 探针是后台维护动作：path 记实际请求路径，ua 不记（node fetch 默认 UA
+        // 无信息量；client 会因此落 'unknown'，靠 endpoint='probe' 区分）。
+        path: '/v1/chat/completions',
+        ua: '',
+      });
+    }
+
+    // 探针结论写账（§4.4）：全部 key 通过 → ok + retry_until 推到空闲阈值之后
+    // （闲置 60min 再探）；任一失败 → 按 §4.2 表分流（取第一个失败，最严重的
+    // 语义），retry_until = now + retryMs。
+    if (firstFail === null) {
       accounts.setProbeResult(acc.id, {
         status: 'ok',
         detail: null,
         retryUntil: now + cfg.keyProbeIdleMs,
         lastProbeAt: now,
       });
-      log(`[keyprobe] account=${acc.name} probe ok ${r.status}（${r.durationMs}ms）`);
+      const ok = lastOk;
+      log(
+        `[keyprobe] account=${acc.name} probe ok ` +
+          (keys.length === 1 && ok ? `${ok.status}（${ok.durationMs}ms）` : `${keys.length} keys`),
+      );
     } else {
-      const acct = classifyAccountError(r.status, r.body, cfg.keyCooldownMs);
-      const detail = probeDetail(r.body) || r.error || null;
+      const acct = classifyAccountError(firstFail.status, firstFail.body, cfg.keyCooldownMs);
+      const detail = probeDetail(firstFail.body) || firstFail.error || null;
       accounts.setProbeResult(acc.id, {
         status: acct.status,
         detail,
         retryUntil: now + acct.retryMs,
         lastProbeAt: now,
       });
-      log(`[keyprobe] account=${acc.name} probe fail ${r.status} ${acct.status}（${r.error ?? ''}）`);
+      log(`[keyprobe] account=${acc.name} probe fail ${firstFail.status} ${acct.status}（${firstFail.error ?? ''}）`);
     }
-
-    // 探活结果也落库，这样面板的「累计」和历史里能看出哪些请求是探活产生的
-    // （endpoint = 'probe'），不会和真实流量混淆。
-    db?.recordRequest({
-      at: now,
-      keyFingerprint: r.fingerprint,
-      model,
-      upstreamModel: model,
-      endpoint: 'probe',
-      status: r.status,
-      durationMs: r.durationMs,
-      stream: false,
-      inputTokens: 0,
-      outputTokens: 0,
-      thinkingTokens: 0,
-      error: r.error ?? null,
-      // 探针是后台维护动作：path 记实际请求路径，ua 不记（node fetch 默认 UA
-      // 无信息量；client 会因此落 'unknown'，靠 endpoint='probe' 区分）。
-      path: '/v1/chat/completions',
-      ua: '',
-    });
   }
   return results;
 }

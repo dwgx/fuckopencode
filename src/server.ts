@@ -1635,6 +1635,21 @@ function logPoolEmpty(pool: KeyPool): void {
 }
 
 /**
+ * 池空时的统一出口。整池都是额度耗尽 → 把上游的 GoUsageLimitError 原样透传
+ * （保留 type + "Resets in ..."，让 kirostudio 这类下游知道是额度问题、何时
+ * 恢复）；否则回通用 503（auth/transient 禁用、或从未记录过额度错误）。
+ */
+function sendPoolEmpty(res: ServerResponse, pool: KeyPool): void {
+  const quota = pool.quotaEmptyError;
+  if (quota) {
+    const err = anthropicErrorToOpenAI(quota.status, quota.body);
+    sendJson(res, err.status, err.body);
+    return;
+  }
+  sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
+}
+
+/**
  * console 数据层（src/console.ts 的 ConsoleClient）的最小接口假设。
  * 与 admin.ts 的 BillingAccounts 同一套路：duck typing，不 import console.ts，
  * 避免两个模块互相依赖。签名对齐 src/console.ts 实际导出（读方法失败返回
@@ -2409,7 +2424,7 @@ async function handleChatCompletion(
   } catch (err) {
     if (err instanceof PoolEmptyError) {
       logPoolEmpty(pool);
-      sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
+      sendPoolEmpty(res, pool);
       return;
     }
     // 池内所有 key 瞬时失败（fetch 网络错误），postAnthropic 已自动 release + 上报。
@@ -2438,6 +2453,9 @@ async function handleChatCompletion(
     firstErrBody = errBody;
     const kind = classifyUpstreamFailure(upstream.response.status, errBody);
     upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+    // 额度耗尽记下上游原文（type + Resets in ...）：整池同时耗尽时 pool empty
+    // 没有响应可读，靠它把 GoUsageLimitError 原样透传给下游。
+    if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
     failureReported = true;
     // 在这里记：body 只能读一次，下面那个统一错误出口再 .json() 会拿到空。
     // 记下的是「第一个 key 上到底出了什么」—— 恰是换 key 重试会掩盖掉的证据。
@@ -2460,7 +2478,7 @@ async function handleChatCompletion(
       } catch (err) {
         if (err instanceof PoolEmptyError) {
           logPoolEmpty(pool);
-          sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
+          sendPoolEmpty(res, pool);
           return;
         }
         sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
@@ -2488,6 +2506,7 @@ async function handleChatCompletion(
     if (!failureReported) {
       const kind = classifyUpstreamFailure(upstream.response.status, errBody);
       upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+      if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
     }
     const err = anthropicErrorToOpenAI(upstream.response.status, errBody);
     const retryAfter = upstream.response.headers.get('retry-after');
@@ -2753,7 +2772,7 @@ async function handleMessagesPassThrough(
   } catch (err) {
     if (err instanceof PoolEmptyError) {
       logPoolEmpty(pool);
-      sendJson(res, 503, { error: { message: 'all upstream keys are disabled', type: 'server_error' } });
+      sendPoolEmpty(res, pool);
       return;
     }
     sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
@@ -2772,6 +2791,7 @@ async function handleMessagesPassThrough(
     }
     const kind = classifyUpstreamFailure(upstream.response.status, errBody);
     upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+    if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
     noteUpstreamError(ctx, upstream.response.status, errBody);
     const requestId = upstream.response.headers.get('request-id');
     const retryAfter = upstream.response.headers.get('retry-after');

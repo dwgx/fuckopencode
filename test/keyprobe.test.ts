@@ -370,6 +370,60 @@ describe('runProbeRound：账户驱动（MULTI-ACCOUNT.md §4.4）', () => {
     expect(snap.disabledReason).toBe('quota-exhausted');
   });
 
+  it('多 key 账户：每个 key 都探，不只 keys[0]', async () => {
+    // 回归（故障 A）：env 种子把整组 OPENSEA_KEYS 塞进一个账户，只探 keys[0]
+    // 会让排在后边的 key 从没被验证过 —— 额度已耗尽的 key 会一直挂着 healthy。
+    const accts: FakeAccountDef[] = [
+      { id: 1, name: 'env', kind: 'unknown', retryUntil: 0, keys: ['sk-key-aaaa', 'sk-key-bbbb'] },
+    ];
+    const { store, calls } = fakeAccounts(accts);
+    const p = acctPool(accts);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await runProbeRound(cfg(), p, null, store, () => {});
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // 打到的是指定的两个 key（探活不走 least-loaded），不是只打第一个
+    const auths = fetchMock.mock.calls.map(
+      (c) => ((c[1] as RequestInit).headers as Record<string, string>).authorization,
+    );
+    expect(auths).toEqual(['Bearer sk-key-aaaa', 'Bearer sk-key-bbbb']);
+    // 全过 → 账户 ok，两个 key 都不再是 stale（避免每轮重复探）
+    expect(calls[0]!.result.status).toBe('ok');
+    const stale = p.staleKeys(1_800_000).map((s) => s.fingerprint);
+    expect(stale).not.toContain('****aaaa');
+    expect(stale).not.toContain('****bbbb');
+  });
+
+  it('多 key 账户：排在后边的 key 额度耗尽也被禁用（不再只探 keys[0]）', async () => {
+    // 故障 A 的线上形态：keys[0] 正常、后边某个 key 已 GoUsageLimitError。
+    // 修复前 probe 只打 keys[0]，坏 key 永远不被发现、一直 healthy。
+    const accts: FakeAccountDef[] = [
+      { id: 1, name: 'env', kind: 'unknown', retryUntil: 0, keys: ['sk-key-aaaa', 'sk-key-bbbb'] },
+    ];
+    const { store } = fakeAccounts(accts);
+    const p = acctPool(accts);
+    const okBody = JSON.stringify({ choices: [{ message: { content: 'hi' } }] });
+    const quotaBody = JSON.stringify({
+      error: { type: 'GoUsageLimitError', message: 'Weekly usage limit reached. Resets in 3 days.' },
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(okBody, { status: 200 }))
+      .mockResolvedValueOnce(new Response(quotaBody, { status: 429 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await runProbeRound(cfg(), p, null, store, () => {});
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const aaaa = p.snapshot().find((s) => s.fingerprint === '****aaaa')!;
+    const bbbb = p.snapshot().find((s) => s.fingerprint === '****bbbb')!;
+    // 正常 key 保持健康；额度耗尽的 key 立即被禁用（不等真实流量去踩）
+    expect(aaaa.healthy).toBe(true);
+    expect(bbbb.healthy).toBe(false);
+    expect(bbbb.disabledReason).toBe('quota-exhausted');
+    expect(bbbb.recoverInMs).toBeGreaterThan(3 * 86_400_000);
+  });
+
   it('裸 429 限流 → 账户 cooldown + 15min 重探', async () => {
     const accts: FakeAccountDef[] = [{ id: 1, name: 'env', kind: 'unknown', retryUntil: 0, keys: ['sk-key-aaaa'] }];
     const { store, calls } = fakeAccounts(accts);
