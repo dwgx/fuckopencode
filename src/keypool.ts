@@ -142,6 +142,25 @@ export class PoolEmptyError extends Error {
   }
 }
 
+/**
+ * 选号过滤把全部健康 key 都滤掉时抛出的错误。server 层应转成 400。
+ *
+ * 与 PoolEmptyError 的区别：池空是**健康问题**（key 全被禁/没配），回 503 让
+ * 客户端重试；模型拒绝是**配置问题**（该账号的模型白名单/被动学习排除了所有
+ * key），回 400 让客户端换模型，重试没有意义。
+ */
+export class ModelNotAllowedError extends Error {
+  readonly model: string;
+  constructor(model: string) {
+    super(`model "${model}" is not allowed`);
+    this.name = 'ModelNotAllowedError';
+    this.model = model;
+  }
+}
+
+/** 被动学习 (account, model) blocked 的默认 TTL：1 小时（内存态，重启清零）。 */
+export const MODEL_BLOCK_TTL_MS = 3_600_000;
+
 /** 从 key 派生指纹（末 4 位），日志用，不落原文。 */
 export function keyFingerprint(key: string): string {
   if (key.length <= 4) return '****';
@@ -158,6 +177,12 @@ export class KeyPool {
    * 只在分类为 quota-exhausted 时由 [`noteQuotaError`] 写入。
    */
   private lastQuotaError: { status: number; body: unknown } | null = null;
+  /**
+   * 被动学习：上游对某账号某模型判定「永久不可用」（401 ModelError / not
+   * supported，见 errors.isModelUnsupported）后，记 (accountId, model) blocked，
+   * 选号时排除该组合。TTL 到期自动失效（探测豁免，见 blockModel）。
+   */
+  private modelBlocks = new Map<string, number>();
 
   constructor(
     rawKeys: string[],
@@ -260,6 +285,36 @@ export class KeyPool {
   }
 
   /**
+   * 记录 (accountId, model) 为被动学习 blocked（模型不可用 ≠ key 不可用）。
+   *
+   * 调用方在 `isModelUnsupported(status, body)` 判定后调 —— 此时**不**调
+   * markFailure（那是 key 的问题，这里 key 是好的，只是该账号端点不带这个
+   * 模型）。TTL 由调用方传（默认 MODEL_BLOCK_TTL_MS 1h），内存态重启清零。
+   */
+  blockModel(accountId: number, model: string, ttlMs: number = MODEL_BLOCK_TTL_MS): void {
+    if (!model) return;
+    this.modelBlocks.set(`${accountId}:${model}`, this.now() + ttlMs);
+  }
+
+  /** (accountId, model) 是否处于被动学习 blocked 期。 */
+  isModelBlocked(accountId: number, model: string): boolean {
+    if (!model) return false;
+    const until = this.modelBlocks.get(`${accountId}:${model}`);
+    if (until == null) return false;
+    if (until <= this.now()) {
+      this.modelBlocks.delete(`${accountId}:${model}`);
+      return false;
+    }
+    return true;
+  }
+
+  /** 成功请求清除该组合（模型在该账号实际可用，恢复选号）。 */
+  clearModelBlock(accountId: number, model: string): void {
+    if (!model) return;
+    this.modelBlocks.delete(`${accountId}:${model}`);
+  }
+
+  /**
    * 冷却策略描述，喂 `/__metrics` 与面板。
    *
    * 每个 `ms` 都用和 `markFailure` **同一套算式**从当前配置算出来，
@@ -350,8 +405,13 @@ export class KeyPool {
    *
    * @param excludeKey 本次不参与选路的 key（换 key 重试用：刚失败的 key 刚 release，
    *   inFlight 归 0 会被 least-loaded 立即重选，白撞一次错误再换号）。
+   * @param isEligible 账号级过滤（账号模型白名单 + 被动学习 block）。健康过滤后再
+   *   逐 key 按 accountId 判断；未提供 = 不过滤。全部健康 key 都被滤掉 → 抛
+   *   ModelNotAllowedError（配置问题，区别于池空的健康问题）。
+   * @param model 携带进 ModelNotAllowedError 的模型名（选号过滤是账号归属知道后
+   *   才做的，error 要能告诉调用方「哪个模型被拒」）。
    */
-  acquire(excludeKey?: string): string {
+  acquire(excludeKey?: string, isEligible?: (accountId: number) => boolean, model = ''): string {
     const now = this.now();
     this.reapRecovered(now);
     const healthy = this.keys.filter((k) => this.isAvailable(k) && k.key !== excludeKey);
@@ -359,12 +419,17 @@ export class KeyPool {
       // 池空：抛 typed error，server 层转 503。
       throw new PoolEmptyError();
     }
+    const eligible = isEligible == null ? healthy : healthy.filter((k) => isEligible(k.accountId));
+    if (eligible.length === 0) {
+      // 有健康 key 但全被账号级过滤排除：模型拒绝（配置问题），不是池空（健康问题）。
+      throw new ModelNotAllowedError(model);
+    }
 
     let minInFlight = Infinity;
-    for (const k of healthy) {
+    for (const k of eligible) {
       if (k.inFlight < minInFlight) minInFlight = k.inFlight;
     }
-    const candidates = healthy.filter((k) => k.inFlight === minInFlight);
+    const candidates = eligible.filter((k) => k.inFlight === minInFlight);
     // 并发并列最闲：按单调序号最旧优先，实现真正均匀的轮转（不能用毫秒时间戳，
     // 串行请求同毫秒会导致永远选第一个 —— 实测 3 key 分布 10/1/1）。
     let selected = candidates[0]!;

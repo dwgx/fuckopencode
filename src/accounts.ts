@@ -51,6 +51,8 @@ export interface AccountView {
   createdAt: number;
   /** 解密后的 key 数量（明文本身不外发）。 */
   keyCount: number;
+  /** 账号级模型白名单；null = 未配置（用全局白名单）。 */
+  allowedModels: string[] | null;
 }
 
 /** 管理面可更新字段（§6.3 PATCH）。cookie 传 null = 清除。 */
@@ -61,6 +63,8 @@ export interface AccountPatch {
   legacyWorkspaceId?: string | null;
   cookie?: string | null;
   legacyCookie?: string | null;
+  /** 账号级模型白名单；null/空数组 = 清除（退回全局白名单）。 */
+  allowedModels?: string[] | null;
 }
 
 /** buildAccountsSection 的输出（§6.2 JSON 契约）。 */
@@ -90,6 +94,8 @@ export interface AccountSectionItem {
   monthlyUsage: number | null;
   monthlyPercent: number | null;
   lastBillingAt: number;
+  /** 账号级模型白名单；null = 未配置（用全局白名单）。 */
+  allowedModels: string[] | null;
   /** 该账户的 key 卡片（来自 pool 快照，服务端组装，不解密任何东西）。 */
   keys: AccountKeyView[];
 }
@@ -148,6 +154,12 @@ export class AccountsStore {
   /** 降级原因（面板「degraded」字段的数据源）。 */
   readonly disabledReason: string | null;
   private readonly log: (msg: string) => void;
+  /**
+   * 账号级模型白名单的内存缓存。选号过滤（postUpstreamChat 的 isEligible）是
+   * 每请求热路径，node:sqlite 同步读每请求一次不可接受 —— 首次读 db，之后走
+   * 缓存；setAllowedModels/update/remove 同步更新。启动后首次请求前自动填充。
+   */
+  private allowedCache = new Map<number, string[] | null>();
 
   constructor(
     private readonly db: UsageDb,
@@ -254,7 +266,16 @@ export class AccountsStore {
       // cookie 只能整体替换：空串/null 都是清除，非空才加密。
       dbPatch.cookieEnc = patch.cookie === null || patch.cookie === '' ? null : secret.encrypt(patch.cookie);
     }
-    return this.db.updateAccount(id, dbPatch);
+    if (patch.allowedModels !== undefined) {
+      // 空数组 = 清除（与 null 同语义，退回全局白名单）；非空去空去重后落库。
+      dbPatch.allowedModels =
+        patch.allowedModels == null || patch.allowedModels.length === 0
+          ? null
+          : [...new Set(patch.allowedModels.map((m) => m.trim()).filter(Boolean))];
+    }
+    const ok = this.db.updateAccount(id, dbPatch);
+    if (ok) this.allowedCache.set(id, dbPatch.allowedModels ?? null);
+    return ok;
   }
 
   /**
@@ -266,6 +287,7 @@ export class AccountsStore {
     const row = this.db.getAccount(id);
     if (!row) return null;
     if (!this.db.deleteAccount(id)) return null;
+    this.allowedCache.delete(id);
     return this.decryptKeys(row) ?? [];
   }
 
@@ -409,6 +431,35 @@ export class AccountsStore {
     return this.db.getAccount(id)?.workspaceId ?? null;
   }
 
+  /**
+   * 账号级模型白名单（选号过滤热路径读这个缓存）。null/空 = 不限制（退回
+   * 全局白名单）。首次读 db 后进缓存，之后不再碰同步 sqlite。
+   */
+  allowedModelsOf(id: number): string[] | null {
+    if (!this.enabled) return null;
+    if (this.allowedCache.has(id)) return this.allowedCache.get(id) ?? null;
+    const val = this.db.getAccount(id)?.allowedModels ?? null;
+    this.allowedCache.set(id, val);
+    return val;
+  }
+
+  /**
+   * 设置账号级模型白名单（落库 + 内存缓存热生效）。null/空数组 = 清除
+   * （退回全局白名单）。非空去空去重后精确匹配（大小写不敏感在配置侧收敛）。
+   * 账户不存在/降级/落库失败返回 false。
+   */
+  setAllowedModels(id: number, models: string[] | null): boolean {
+    if (!this.enabled) return false;
+    if (!this.db.getAccount(id)) return false;
+    const clean =
+      models == null || models.length === 0
+        ? null
+        : [...new Set(models.map((m) => m.trim()).filter(Boolean))];
+    if (!this.db.updateAccount(id, { allowedModels: clean })) return false;
+    this.allowedCache.set(id, clean);
+    return true;
+  }
+
   /** 旧版控制台 workspace id（wrk_ 前缀，legacy 通道用）。无/不存在返回 null。 */
   legacyWorkspaceIdOf(id: number): string | null {
     if (!this.enabled) return null;
@@ -497,6 +548,7 @@ export class AccountsStore {
       monthlyUsageUnits: row.monthlyUsageUnits,
       createdAt: row.createdAt,
       keyCount: this.decryptKeys(row)?.length ?? 0,
+      allowedModels: row.allowedModels,
     };
   }
 
@@ -602,6 +654,7 @@ export function buildAccountsSection(store: AccountsStore, pool: KeyPool, now: n
           ? null
           : Number(((acc.monthlyUsageUnits / acc.monthlyLimitUnits) * 100).toFixed(1)),
       lastBillingAt: acc.lastBillingAt,
+      allowedModels: acc.allowedModels,
       keys: snap
         .filter((k) => k.accountId === acc.id)
         .map((k) => ({

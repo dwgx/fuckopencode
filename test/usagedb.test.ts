@@ -690,6 +690,85 @@ describe('UsageDb legacy_workspace_id 列（旧版控制台通道）', () => {
   });
 });
 
+describe('UsageDb allowed_models 列（账号级模型白名单）', () => {
+  it('新库：建表即带 allowed_models，roundtrip 读写', () => {
+    const db = new UsageDb(path.join(tmpDir, 'am.db'), 30, log);
+    const id = db.insertAccount({ name: 'a', kind: 'unknown', keysEnc: '[]' });
+    if (id === false) throw new Error('insert failed');
+    // 默认 null（未配置 = 用全局白名单）。
+    expect(db.getAccount(id)!.allowedModels).toBeNull();
+    expect(db.updateAccount(id, { allowedModels: ['deepseek-v4-flash', 'deepseek-v4-flash-free'] })).toBe(true);
+    expect(db.getAccount(id)!.allowedModels).toEqual(['deepseek-v4-flash', 'deepseek-v4-flash-free']);
+    // null = 清除回全局。
+    expect(db.updateAccount(id, { allowedModels: null })).toBe(true);
+    expect(db.getAccount(id)!.allowedModels).toBeNull();
+    // 不存在的 id 更新 → false。
+    expect(db.updateAccount(9999, { allowedModels: ['x'] })).toBe(false);
+    db.close();
+  });
+
+  it('insertAccount 带 allowedModels 直接落库', () => {
+    const db = new UsageDb(path.join(tmpDir, 'am-insert.db'), 30, log);
+    const id = db.insertAccount({ name: 'a', kind: 'unknown', keysEnc: '[]', allowedModels: ['deepseek-v4-flash'] });
+    if (id === false) throw new Error('insert failed');
+    expect(db.getAccount(id)!.allowedModels).toEqual(['deepseek-v4-flash']);
+    db.close();
+  });
+
+  it('坏数据容错：非 JSON / 空数组 → null（= 不限制，不拖垮账户读取）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'am-bad.db'), 30, log);
+    const id = db.insertAccount({ name: 'a', kind: 'unknown', keysEnc: '[]' });
+    if (id === false) throw new Error('insert failed');
+    const sqlite = db.sqlite();
+    sqlite.prepare('UPDATE accounts SET allowed_models = ? WHERE id = ?').run('not-json{{', id);
+    expect(db.getAccount(id)!.allowedModels).toBeNull();
+    expect(db.getAccount(id)!.name).toBe('a'); // 其他字段不受影响
+    sqlite.prepare('UPDATE accounts SET allowed_models = ? WHERE id = ?').run('[]', id);
+    expect(db.getAccount(id)!.allowedModels).toBeNull();
+    db.close();
+  });
+
+  it('旧库迁移：无该列的 accounts 表打开即 ALTER，补列后读写正常（幂等）', () => {
+    const p = path.join(tmpDir, 'am-old.db');
+    // 手工建一张早期版本的表（没有 allowed_models），模拟线上已存在的旧库。
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string, opts?: { readOnly?: boolean }) => any;
+    };
+    const raw = new DatabaseSync(p);
+    raw.exec(`CREATE TABLE accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL DEFAULT 'account',
+      kind TEXT NOT NULL DEFAULT 'unknown',
+      workspace_id TEXT,
+      keys_enc TEXT NOT NULL DEFAULT '[]',
+      cookie_enc TEXT,
+      status TEXT NOT NULL DEFAULT 'unknown',
+      status_detail TEXT,
+      retry_until INTEGER NOT NULL DEFAULT 0,
+      last_probe_at INTEGER NOT NULL DEFAULT 0,
+      last_billing_at INTEGER NOT NULL DEFAULT 0,
+      balance_units INTEGER,
+      monthly_limit_units INTEGER,
+      monthly_usage_units INTEGER,
+      created_at INTEGER NOT NULL
+    );`);
+    raw.close();
+
+    const db = new UsageDb(p, 30, log);
+    expect(db.enabled).toBe(true);
+    const id = db.insertAccount({ name: 'a', kind: 'unknown', keysEnc: '[]' });
+    if (id === false) throw new Error('insert failed');
+    expect(db.updateAccount(id, { allowedModels: ['deepseek-v4-flash'] })).toBe(true);
+    expect(db.getAccount(id)!.allowedModels).toEqual(['deepseek-v4-flash']);
+    db.close();
+
+    // 幂等：再开一次（migrate 重复跑）不炸，列还在、数据还在。
+    const db2 = new UsageDb(p, 30, log);
+    expect(db2.getAccount(id)!.allowedModels).toEqual(['deepseek-v4-flash']);
+    db2.close();
+  });
+});
+
 describe('ESM 兼容（回归测试）', () => {
   /**
    * 这里防的是一个真实事故：原实现在构造函数里写了裸 `require('node:module')`。

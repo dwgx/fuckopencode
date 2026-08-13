@@ -151,13 +151,20 @@ export function validateCreateAccount(body: unknown): ValidateResult<CreateAccou
   };
 }
 
+/**
+ * PATCH 契约（服务端 accounts.ts 会给 AccountPatch 加 `allowedModels?: string[] | null`）。
+ * 本文件先走 `AccountPatch & {...}` 交并类型：契约落地前后都能编译，落地后多余字段
+ * 与基类字段合并，无任何副作用。
+ */
+export type PatchWithAllowedModels = AccountPatch & { allowedModels?: string[] | null };
+
 /** PATCH /__admin/api/accounts/:id 的字段校验（§6.3）。undefined 不更新。 */
-export function validatePatchAccount(body: unknown): ValidateResult<AccountPatch> {
+export function validatePatchAccount(body: unknown): ValidateResult<PatchWithAllowedModels> {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     return fail('request body must be a JSON object');
   }
   const b = body as Record<string, unknown>;
-  const patch: AccountPatch = {};
+  const patch: PatchWithAllowedModels = {};
 
   if (b.name !== undefined) {
     if (typeof b.name !== 'string') {
@@ -213,6 +220,13 @@ export function validatePatchAccount(body: unknown): ValidateResult<AccountPatch
     }
   }
 
+  // 可用模型覆盖：null / 空数组 / 全空串 = 清除（回全局默认），非空数组原样。
+  if (b.allowedModels !== undefined) {
+    const allowedModels = parseAllowedModels(b.allowedModels);
+    if (!allowedModels.ok) return allowedModels;
+    patch.allowedModels = allowedModels.value;
+  }
+
   if (Object.keys(patch).length === 0) return fail('nothing to update');
   return { ok: true, value: patch };
 }
@@ -230,6 +244,26 @@ function parseKeys(raw: unknown): ValidateResult<string[]> {
     if (!out.includes(k)) out.push(k);
   }
   return { ok: true, value: out };
+}
+
+/**
+ * allowedModels：可选。null / 空数组 / 全空串项 → null（清除，回全局默认）。
+ * 数组项 trim、≤ 100 字符、去重、≤ 50 项（与 keys 的校验口径一致）。
+ * 不做白名单校验——别名模型（model_aliases 表）同样是合法输入，交给服务端处理。
+ */
+function parseAllowedModels(raw: unknown): ValidateResult<string[] | null> {
+  if (raw === null || raw === undefined) return { ok: true, value: null };
+  if (!Array.isArray(raw)) return fail('allowedModels must be an array of strings');
+  if (raw.length > 50) return fail('allowedModels must have at most 50 entries');
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') return fail('each allowed model must be a string');
+    const t = item.trim();
+    if (!t) return fail('allowedModels must not contain empty entries');
+    if (t.length > 100) return fail('each allowed model must be at most 100 characters');
+    if (!out.includes(t)) out.push(t);
+  }
+  return { ok: true, value: out.length ? out : null };
 }
 
 /**
@@ -1659,6 +1693,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           </div>
         </div>
         <div id="detail-workspace"></div>
+        <div id="detail-models"></div>
         <div id="detail-billing"></div>
         <div id="detail-usage"></div>
         <div id="detail-models-usage"></div>
@@ -2021,6 +2056,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       wsManual: 'enter workspace id manually…', wsManualHint: 'switch uses the new console workspace (org_...) — console data reloads after switching',
       wsSwitch: 'switch', wsSwitchTitle: 'Switch workspace',
       wsSwitched: 'workspace switched', wsIdRequired: 'select or enter a workspace id',
+      // 可用模型区块（账号配置的模型列表 + 全局默认 + 目录状态）。
+      allowedModelsTitle: 'Allowed models', allowedModelsSub: 'models this account may request',
+      globalDefault: 'global default', accountOverride: 'account override',
+      clearToGlobal: 'clear to global', clearToGlobalHint: 'leave empty to use the global default',
+      modelCatalog: 'model catalog', catalogModels: 'models loaded', catalogRefreshed: 'last refresh',
+      modelsBlocked: 'blocked by passive learning', modelsSaved: 'allowed models saved',
+      modelsPlaceholder: 'comma separated model names',
       balanceTitle: 'Balance', balanceSub: 'console balance, ledger and payment methods',
       currentBalance: 'Current balance', promotional: 'promotional',
       ledger: 'ledger', paymentMethods: 'payment methods', none: 'none',
@@ -2259,6 +2301,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       wsManual: '手动输入工作区 id…', wsManualHint: '切换走新版控制台 workspace（org_...），切换后控制台数据重新加载',
       wsSwitch: '切换', wsSwitchTitle: '切换工作区',
       wsSwitched: '工作区已切换', wsIdRequired: '请选择或输入工作区 id',
+      // 可用模型区块（账号配置的模型列表 + 全局默认 + 目录状态）。
+      allowedModelsTitle: '可用模型', allowedModelsSub: '该账号可请求的模型',
+      globalDefault: '全局默认', accountOverride: '账号覆盖',
+      clearToGlobal: '清除回全局', clearToGlobalHint: '留空 = 使用全局默认',
+      modelCatalog: '模型目录', catalogModels: '个模型已加载', catalogRefreshed: '上次刷新',
+      modelsBlocked: '被动学习 blocked', modelsSaved: '可用模型已保存',
+      modelsPlaceholder: '逗号分隔的模型名',
       balanceTitle: '余额', balanceSub: '控制台余额、账单与支付方式',
       currentBalance: '当前余额', promotional: '促销余额',
       ledger: '账单明细', paymentMethods: '支付方式', none: '无',
@@ -2832,6 +2881,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     return JSON.stringify(d.degraded) + '|' + (d.list || []).map(function (a) {
       return [a.id, a.name, a.kind, a.status, a.statusDetail, a.retryUntil, a.balance,
         a.monthlyLimit, a.monthlyUsage, a.lastProbeAt, a.lastBillingAt,
+        JSON.stringify(a.allowedModels || null), JSON.stringify(a.blockedModels || null),
         JSON.stringify((a.keys || []).map(function (k) {
           return [k.fingerprint, k.healthy, k.disabledReason, k.nickname];
         }))].join(':');
@@ -4285,6 +4335,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
    *  静态检查看不见）。 */
   var DETAIL_BLOCK_KEYS = [
     ['detail-workspace', 'workspaceTitle', 'workspaceSub'],
+    ['detail-models', 'allowedModelsTitle', 'allowedModelsSub'],
     ['detail-billing', 'balanceTitle', 'balanceSub'],
     ['detail-usage', 'usageTitle', 'usageSub'],
     ['detail-models-usage', 'modelUsageTitle', 'modelUsageSub'],
@@ -4308,6 +4359,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     });
     loadBilling(id);
     loadUsage();
+    loadModels(id);
     loadModelsUsage(id);
     loadUsersUsage(id);
     loadMembers(id);
@@ -4410,6 +4462,83 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         else flash(errMsg(r), true);
       }
     });
+  }
+
+  // ── 可用模型区块（detail-models）────────────────────
+  // 数据源（不发起新请求，全读已拉取的数据）：
+  // - 账号覆盖 / 被动学习 blocked：accounts 列表的 allowedModels / blockedModels
+  //   （服务端契约会给 AccountSectionItem 加这两项；落地前缺字段显示 —）。
+  // - 模型目录状态：/__metrics 的 catalog 段，服务端契约形状
+  //   { count, lastRefreshAt, error }（字段名以实际实现为准，缺字段显示 —）。
+  // - 全局默认：只读列表，镜像 src/deepseek.ts 的 ALLOWED_MODELS（面板是自包含
+  //   模板，无法 import 服务端常量；两边需保持同步）。
+  function renderModels(id) {
+    var a = findAccount(id);
+    if (!a) return;
+    var ov = Array.isArray(a.allowedModels) ? a.allowedModels : null;
+    var now = Date.now();
+    var gm = ['deepseek-v4-flash', 'deepseek-v4-flash-free'];
+    var globalHtml = '<div class="keys"><div class="keys-hd">' + T('globalDefault') + '</div>' +
+      gm.map(function (m) { return '<div class="key-row"><span class="fp">' + esc(m) + '</span></div>'; }).join('') +
+      '</div>';
+    var overrideHtml = '<div class="oc-form">' +
+      '<div class="oc-field oc-full"><label>' + T('accountOverride') + '</label>' +
+        '<input class="oc-input" id="models-in-' + id + '" value="' + esc((ov || []).join(', ')) + '"' +
+          ' placeholder="' + esc(T('modelsPlaceholder')) + '" autocomplete="off" spellcheck="false">' +
+        '<div class="oc-hint">' + T('clearToGlobalHint') + '</div>' +
+      '</div>' +
+      '<button class="oc-btn oc-btn-primary" data-action="save-models" data-id="' + id + '">' + T('save') + '</button>' +
+      '<button class="oc-btn oc-btn-ghost" data-action="clear-models" data-id="' + id + '">' + T('clearToGlobal') + '</button>' +
+    '</div>';
+    var cat = lastMetrics && lastMetrics.catalog;
+    var catCount = cat ? Number(cat.count) : NaN;
+    var catHtml = '<div class="keys"><div class="keys-hd">' + T('modelCatalog') + '</div>' +
+      '<div class="key-row"><span class="fp">' +
+        (isFinite(catCount) && catCount > 0 ? fmt(catCount) + ' ' + T('catalogModels') : '—') +
+        (cat && cat.lastRefreshAt
+          ? ' <span class="w">· ' + T('catalogRefreshed') + ' ' + hhmmss(cat.lastRefreshAt) + '</span>'
+          : '') +
+      '</span>' +
+      (cat && cat.error ? '<span class="k-meta s-bad">' + esc(cat.error) + '</span>' : '') +
+      '</div></div>';
+    var bm = Array.isArray(a.blockedModels) ? a.blockedModels : null;
+    var blockedHtml = '<div class="keys"><div class="keys-hd">' + T('modelsBlocked') + '</div>' +
+      '<div class="key-row"><span class="fp">' +
+        (bm && bm.length
+          ? bm.map(function (b) {
+              if (typeof b === 'string') return esc(b);
+              var name = b.model || b.name || '—';
+              var until = Number(b.until || b.retryUntil || 0);
+              return esc(name) + (until > now ? ' · ' + hms(until - now) : '');
+            }).join(' · ')
+          : '—') +
+      '</span></div></div>';
+    $('detail-models').innerHTML = dBlock('allowedModelsTitle', 'allowedModelsSub',
+      globalHtml + overrideHtml + catHtml + blockedHtml);
+  }
+  function loadModels(id) {
+    if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
+    renderModels(id);
+  }
+  /** 保存账号可用模型覆盖：逗号分隔 → 数组；空 → null（清除回全局）。 */
+  function saveModels(id) {
+    var input = $('models-in-' + id);
+    var parts = (input && input.value || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    api('PATCH', '/__admin/api/accounts/' + id, { allowedModels: parts.length ? parts : null })
+      .then(function (r) {
+        if (r.ok) { flash(T('modelsSaved')); tick(true); loadModels(id); }
+        else flash(errMsg(r), true);
+      });
+  }
+  /** 一键清除回全局：清空输入 + PATCH null。 */
+  function clearModels(id) {
+    var input = $('models-in-' + id);
+    if (input) input.value = '';
+    api('PATCH', '/__admin/api/accounts/' + id, { allowedModels: null })
+      .then(function (r) {
+        if (r.ok) { flash(T('modelsSaved')); tick(true); loadModels(id); }
+        else flash(errMsg(r), true);
+      });
   }
 
   function loadGo(id, fromTick) {
@@ -5413,6 +5542,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       if (act === 'copy-legacy-key') { copyLegacyKey(btn.getAttribute('data-keyid')); return; }
       if (act === 'refresh-legacy-keys') { loadLegacyKeys(detailState.id); return; }
       if (act === 'ws-switch') { switchWorkspace(Number(btn.getAttribute('data-id'))); return; }
+      if (act === 'save-models') { saveModels(Number(btn.getAttribute('data-id'))); return; }
+      if (act === 'clear-models') { clearModels(Number(btn.getAttribute('data-id'))); return; }
       return;
     }
     var rb = e.target.closest('.range-btn');

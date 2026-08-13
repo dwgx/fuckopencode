@@ -3,10 +3,18 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { DEFAULT_ADMIN_PASS, type AppConfig } from './config.js';
 import { fetchUpstreamModels, postUpstreamChat, type UpstreamCall } from './upstream.js';
-import { KeyPool, PoolEmptyError, keyFingerprint, type KeyStateEvent } from './keypool.js';
+import {
+  KeyPool,
+  ModelNotAllowedError,
+  MODEL_BLOCK_TTL_MS,
+  PoolEmptyError,
+  keyFingerprint,
+  type KeyStateEvent,
+} from './keypool.js';
 import {
   anthropicErrorToOpenAI,
   classifyUpstreamFailure,
+  isModelUnsupported,
   resetDelayMsFromError,
   INTERNAL_SERVER_ERROR,
   rejectionError,
@@ -36,7 +44,7 @@ import {
   ALLOWED_MODELS,
   filterThinkingFromStream,
   normalizeAnthropicRequest,
-  resolveModelName,
+  resolveModel,
 } from './deepseek.js';
 import type { OpenAIChatRequest, OpenAIChatResponse } from './types.js';
 
@@ -204,9 +212,11 @@ function badBodyError(empty: boolean): { error: { message: string; type: string 
 }
 
 /**
- * 上游已知模型清单。启动时异步拉一次，用于判断客户端请求的模型名能否直传
- * （上游支持 61 个模型，不该被 fallback 一律吃掉）。拉取失败保持为空集，
- * 此时退化成老行为：只认 MODEL_MAP，其余回落 fallback。
+ * 上游订阅端点已知模型清单。启动时异步拉一次（fetchUpstreamModels 走 /zen/go，
+ * 25 个订阅模型），之后按 modelCatalogRefreshMs 定时刷新 + /__admin/api/models/refresh
+ * 手动刷新。用途：resolveModel 的**目录门** —— 白名单模型若不在订阅端点目录里
+ * （not-in-catalog）则明确拒绝。目录空（未加载/拉取失败）时目录门 fail-open，
+ * 不拦 —— 目录是观测/防御设施，不是代理链路的前置依赖。
  */
 let upstreamModels: ReadonlySet<string> = new Set();
 
@@ -1653,6 +1663,46 @@ function sendPoolEmpty(res: ServerResponse, pool: KeyPool): void {
 }
 
 /**
+ * 模型拒绝（全局门 not-allowed/not-in-catalog，或账号级 ModelNotAllowedError）
+ * 的统一 400 出口。message 列出当前全局白名单（ALLOWED_MODELS），提示可用模型。
+ */
+function sendModelNotAllowed(res: ServerResponse, model: string): void {
+  const supported = [...ALLOWED_MODELS].sort().join(', ');
+  sendJson(res, 400, {
+    error: {
+      message: `model "${model}" is not allowed (supported models: ${supported})`,
+      type: 'invalid_request_error',
+    },
+  });
+}
+
+/**
+ * 全局模型门（白名单 + 目录门）。调用方在把请求发给上游前调一次。
+ *
+ * 顺序语义：**池空优先于模型拒绝** —— 池空是运维态（503 让客户端重试）；
+ * 模型拒绝是配置问题（400，重试无意义），等池恢复后再暴露。返回 true 表示
+ * 已发出 400 响应（调用方 return）；false 表示放行（模型可用）。
+ */
+function checkModelGate(
+  res: ServerResponse,
+  model: string | undefined,
+  cfg: AppConfig,
+  pool: KeyPool,
+  ctx: MetricsCtx,
+): boolean {
+  // 池空优先于模型拒绝：池空（无 key 或全部禁用）是运维态，让 postUpstreamChat
+  // 抛 PoolEmptyError（503 / 额度耗尽透传 429），客户端按 5xx 重试；模型拒绝是
+  // 配置问题（400），等池恢复后再暴露。
+  if (pool.size === 0 || pool.healthyCount === 0) return false;
+  const d = resolveModel(model, cfg.modelMap, cfg.fallbackModel, upstreamModels);
+  if (d.ok) return false;
+  // 观测：拒绝原因记进 ctx.error（落库/面板可见）。
+  ctx.error = `model ${JSON.stringify(model ?? '')} ${d.reason}`;
+  sendModelNotAllowed(res, model ?? '');
+  return true;
+}
+
+/**
  * console 数据层（src/console.ts 的 ConsoleClient）的最小接口假设。
  * 与 admin.ts 的 BillingAccounts 同一套路：duck typing，不 import console.ts，
  * 避免两个模块互相依赖。签名对齐 src/console.ts 实际导出（读方法失败返回
@@ -1732,6 +1782,12 @@ export function createApp(
   // 管理面数据层：未接线（main.ts 下一轮接）时 /__metrics 不含 accounts 段，
   // /__admin 页面照常渲染但显示 degraded。管理面是观测设施，绝不阻塞代理链路。
   const store = accounts ?? null;
+  // 账号级模型白名单查询（选号过滤热路径）：未接线/降级时返回 null（不限制，
+  // 只走全局白名单）。postUpstreamChat 通过 opts.allowedModelsOf 读到它。
+  const allowedModelsOf =
+    store != null && store.enabled
+      ? (accountId: number): string[] | null => store.allowedModelsOf(accountId)
+      : (): string[] | null => null;
   // billing 抓取的 fetch 注入点（测试用 fake；生产走默认全局 fetch）。
   // OAuth device flow 复用同一个注入点（任务契约：沿用 adminFetch 参数）。
   const adminFetchImpl = adminFetch;
@@ -1759,13 +1815,33 @@ export function createApp(
       onStateChange: keyStateHandler(db),
     });
 
-  // 后台拉一次上游模型清单，失败不影响服务启动。
-  void fetchUpstreamModels(cfg, keyPool).then((models) => {
-    if (models?.length) {
+  // 上游模型目录（/zen/go 订阅模型清单）：启动拉一次 + 按 modelCatalogRefreshMs
+  // 定时刷新 + POST /__admin/api/models/refresh 手动刷新。拉取失败保留旧目录
+  // （fail-open：目录空时目录门不拦），观测状态（数量/上次刷新/失败原因）喂
+  // /__metrics 的 catalog 段。timer unref 不拖进程退出。
+  const catalogState = { count: 0, lastRefreshAt: 0, lastError: null as string | null, lastErrorAt: 0 };
+  const refreshCatalog = async (): Promise<void> => {
+    const models = await fetchUpstreamModels(cfg, keyPool);
+    if (models && models.length > 0) {
       upstreamModels = new Set(models);
+      catalogState.count = models.length;
+      catalogState.lastRefreshAt = Date.now();
+      catalogState.lastError = null;
       console.log(`[proxy] upstream models: ${models.length}`);
+    } else {
+      // 失败保留旧目录（fail-open）。不覆盖 lastRefreshAt —— 那表示「上次成功」。
+      catalogState.lastError = 'fetch failed';
+      catalogState.lastErrorAt = Date.now();
     }
-  });
+  };
+  void refreshCatalog();
+  const catalogRefreshMs = cfg.modelCatalogRefreshMs ?? 6 * 3_600_000;
+  if (catalogRefreshMs > 0) {
+    const catalogTimer = setInterval(() => {
+      void refreshCatalog();
+    }, catalogRefreshMs);
+    if (typeof catalogTimer.unref === 'function') catalogTimer.unref();
+  }
 
   return createServer(async (req, res) => {
     const startTime = Date.now();
@@ -1897,6 +1973,11 @@ export function createApp(
               // cfg.modelMap）：展示当前生效的映射，白名单模型跟在后面。
               upstreamModels: [...Object.keys(cfg.modelMap), ...ALLOWED_MODELS],
               aliases: { ...cfg.modelMap },
+            },
+            catalog: {
+              count: catalogState.count,
+              lastRefreshAt: catalogState.lastRefreshAt,
+              lastError: catalogState.lastError,
             },
           });
           return;
@@ -2169,6 +2250,25 @@ export function createApp(
           await handleAuditRoute(req, res, db);
           return;
         }
+        // 手动刷新上游模型目录（/zen/go 订阅模型清单）。失败保留旧目录
+        // （fail-open），响应带当前目录观测状态。
+        if (path === '/__admin/api/models/refresh') {
+          if (req.method !== 'POST') {
+            sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+            return;
+          }
+          if (!adminOriginAllowed(req)) {
+            sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+            return;
+          }
+          await refreshCatalog();
+          sendJson(res, 200, {
+            count: catalogState.count,
+            lastRefreshAt: catalogState.lastRefreshAt,
+            lastError: catalogState.lastError,
+          });
+          return;
+        }
         await handleAdminRoutes(req, res, { cfg, store, pool: keyPool, fetchImpl: adminFetchImpl, db, consoleClient: consoleClientImpl });
         return;
       }
@@ -2210,7 +2310,7 @@ export function createApp(
         }
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
         if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
-        await handleChatCompletion(req, res, cfg, keyPool, auth.keyId, ctx);
+        await handleChatCompletion(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf);
         return;
       }
 
@@ -2221,7 +2321,7 @@ export function createApp(
         }
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
         if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
-        await handleMessagesPassThrough(req, res, cfg, keyPool, auth.keyId, ctx);
+        await handleMessagesPassThrough(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf);
         return;
       }
 
@@ -2361,6 +2461,7 @@ async function handleChatCompletion(
   pool: KeyPool,
   keyId: string,
   ctx: MetricsCtx,
+  allowedModelsOf: (accountId: number) => string[] | null,
 ): Promise<void> {
   const read = await readBody(req, cfg.maxBodyBytes);
   if (!read.ok) {
@@ -2403,6 +2504,12 @@ async function handleChatCompletion(
     }
   }
 
+  // 全局模型门：白名单外明确拒绝（不再静默回落 flash）。池空时跳过 ——
+  // 池空是运维态（503），模型拒绝是配置问题（400），等池恢复后再暴露。
+  if (checkModelGate(res, typeof body.model === 'string' ? body.model : undefined, cfg, pool, ctx)) {
+    return;
+  }
+
   // 上游本身就是 OpenAI 协议，这条路径不再绕 Anthropic：只做模型名解析、
   // 剥不支持的字段、加 system 护栏，然后原样转发。
   const upstreamReq = prepareOpenAIUpstreamRequest(body as unknown as OpenAIChatRequest, cfg);
@@ -2422,12 +2529,17 @@ async function handleChatCompletion(
   // 用 key 池转发。非流式在「未写出任何响应字节」时可换 key 重试一次。
   let upstream: UpstreamCall;
   try {
-    upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal);
+    upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal, {}, undefined, { allowedModelsOf });
     ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
     if (err instanceof PoolEmptyError) {
       logPoolEmpty(pool);
       sendPoolEmpty(res, pool);
+      return;
+    }
+    // 账号级模型白名单/被动学习把全部健康 key 排除：模型拒绝是配置问题，400。
+    if (err instanceof ModelNotAllowedError) {
+      sendModelNotAllowed(res, err.model);
       return;
     }
     // 池内所有 key 瞬时失败（fetch 网络错误），postAnthropic 已自动 release + 上报。
@@ -2445,6 +2557,10 @@ async function handleChatCompletion(
   let failureReported = false;
 
   // 非流式：上游返回错误状态时，若尚未写响应字节，可换 key 重试一次。
+  // 「该账号不支持该模型」（401 ModelError / not supported）例外：模型不可用
+  // ≠ key 不可用，不 markFailure、不换 key（永久不可用），记被动学习 block 后
+  // 原样透传 —— 否则每次请求都会先撞一次错误再换号，还误伤好 key。
+  let modelUnsupported = false;
   if (!upstream.response.ok && !res.headersSent) {
     // 读取错误体用于分级（余额不足 → rate-limit，而非 auth 长期禁用）。
     let errBody: unknown = null;
@@ -2454,41 +2570,51 @@ async function handleChatCompletion(
       // body 不是 JSON（如空/HTML）：忽略，按状态码分级。
     }
     firstErrBody = errBody;
-    const kind = classifyUpstreamFailure(upstream.response.status, errBody);
-    upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
-    // 额度耗尽记下上游原文（type + Resets in ...）：整池同时耗尽时 pool empty
-    // 没有响应可读，靠它把 GoUsageLimitError 原样透传给下游。
-    if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
-    failureReported = true;
-    // 在这里记：body 只能读一次，下面那个统一错误出口再 .json() 会拿到空。
-    // 记下的是「第一个 key 上到底出了什么」—— 恰是换 key 重试会掩盖掉的证据。
-    noteUpstreamError(ctx, upstream.response.status, errBody);
-    if (pool.healthyCount > 0 && !res.headersSent) {
-      upstream.release();
-      // 换 key 重试（最多一次）。排除刚失败的 key：它刚 release、inFlight=0，
-      // 并发场景下 least-loaded 会把「最闲」的它再选回来，白撞一次错误。
-      try {
-        upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal, {}, undefined, {
-          excludeKey: upstream.key,
-        });
-        ctx.keyFingerprint = keyFingerprint(upstream.key);
-        // 换了 key 就是一个全新的响应：上一个 key 的错误体不能再用来描述它。
-        firstErrBody = null;
-        // 新 key 的失败还没上报过，统一错误出口要补（见 failureReported 注释）。
-        failureReported = false;
-        // 重试成功就不该在这条 200 记录上留着上一个 key 的错误文案。
-        if (upstream.response.ok) ctx.error = null;
-      } catch (err) {
-        if (err instanceof PoolEmptyError) {
-          logPoolEmpty(pool);
-          sendPoolEmpty(res, pool);
+    modelUnsupported = isModelUnsupported(upstream.response.status, errBody);
+    if (modelUnsupported) {
+      pool.blockModel(pool.accountIdOf(upstream.key), ctx.upstreamModel || upstreamReq.model as string, MODEL_BLOCK_TTL_MS);
+    } else {
+      const kind = classifyUpstreamFailure(upstream.response.status, errBody);
+      upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+      // 额度耗尽记下上游原文（type + Resets in ...）：整池同时耗尽时 pool empty
+      // 没有响应可读，靠它把 GoUsageLimitError 原样透传给下游。
+      if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
+      failureReported = true;
+      // 在这里记：body 只能读一次，下面那个统一错误出口再 .json() 会拿到空。
+      // 记下的是「第一个 key 上到底出了什么」—— 恰是换 key 重试会掩盖掉的证据。
+      noteUpstreamError(ctx, upstream.response.status, errBody);
+      if (pool.healthyCount > 0 && !res.headersSent) {
+        upstream.release();
+        // 换 key 重试（最多一次）。排除刚失败的 key：它刚 release、inFlight=0，
+        // 并发场景下 least-loaded 会把「最闲」的它再选回来，白撞一次错误。
+        try {
+          upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal, {}, undefined, {
+            excludeKey: upstream.key,
+            allowedModelsOf,
+          });
+          ctx.keyFingerprint = keyFingerprint(upstream.key);
+          // 换了 key 就是一个全新的响应：上一个 key 的错误体不能再用来描述它。
+          firstErrBody = null;
+          // 新 key 的失败还没上报过，统一错误出口要补（见 failureReported 注释）。
+          failureReported = false;
+          // 重试成功就不该在这条 200 记录上留着上一个 key 的错误文案。
+          if (upstream.response.ok) ctx.error = null;
+        } catch (err) {
+          if (err instanceof PoolEmptyError) {
+            logPoolEmpty(pool);
+            sendPoolEmpty(res, pool);
+            return;
+          }
+          if (err instanceof ModelNotAllowedError) {
+            sendModelNotAllowed(res, err.model);
+            return;
+          }
+          sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
           return;
         }
-        sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
-        return;
+      } else {
+        upstream.release();
       }
-    } else {
-      upstream.release();
     }
   }
 
@@ -2506,7 +2632,8 @@ async function handleChatCompletion(
     noteUpstreamError(ctx, upstream.response.status, errBody);
     // 统一错误出口：首 key 的失败已在换 key 判断块上报过（failureReported=true），
     // 只有换出来的第二个 key 失败（或重试前上游就 !ok 的路径）需要在这里补报。
-    if (!failureReported) {
+    // modelUnsupported 分支已经跳过 markFailure（模型不可用 ≠ key 不可用）。
+    if (!failureReported && !modelUnsupported) {
       const kind = classifyUpstreamFailure(upstream.response.status, errBody);
       upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
       if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
@@ -2634,7 +2761,13 @@ function prepareOpenAIUpstreamRequest(
   cfg: AppConfig,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...(req as unknown as Record<string, unknown>) };
-  out.model = resolveModelName(req.model, cfg.modelMap, cfg.fallbackModel, upstreamModels);
+  // 全局门已在 handleChatCompletion 里检查过（checkModelGate，400 已在未通过时
+  // 返回），这里 resolveModel 必然 ok；留一个安全回落防「目录在两次调用间变化」
+  // 这种理论分叉 —— 白名单/目录门是防御设施，落到 fallback 总比透传坏名安全。
+  const decision = resolveModel(req.model, cfg.modelMap, cfg.fallbackModel, upstreamModels);
+  out.model = decision.ok
+    ? decision.model
+    : (ALLOWED_MODELS.has(cfg.fallbackModel) ? cfg.fallbackModel : 'deepseek-v4-flash');
 
   // system 护栏：已有 system 消息就追加，没有就插一条到最前面。
   const messages = Array.isArray(req.messages) ? [...req.messages] : [];
@@ -2662,6 +2795,7 @@ async function handleMessagesPassThrough(
   pool: KeyPool,
   keyId: string,
   ctx: MetricsCtx,
+  allowedModelsOf: (accountId: number) => string[] | null,
 ): Promise<void> {
   const read = await readBody(req, cfg.maxBodyBytes);
   if (!read.ok) {
@@ -2684,6 +2818,12 @@ async function handleMessagesPassThrough(
   // 映射成 deepseek 名，见 OOM 修复注释），这里再读 body.model 会拿到改后值 ——
   // 大请求与小请求的响应 model 回显会分叉。快照对 <512KB 也一致（原样回显客户端模型名）。
   const requestedModel = typeof body.model === 'string' ? body.model : undefined;
+
+  // 全局模型门：白名单外明确拒绝（不再静默回落 flash）。池空时跳过 ——
+  // 池空是运维态（503），模型拒绝是配置问题（400），等池恢复后再暴露。
+  if (checkModelGate(res, requestedModel, cfg, pool, ctx)) {
+    return;
+  }
 
   const v = validateAnthropicRequest(body, cfg);
   if (!v.ok) {
@@ -2770,12 +2910,19 @@ async function handleMessagesPassThrough(
       openAIReq as unknown as Record<string, unknown>,
       controller.signal,
       extraHeaders,
+      undefined,
+      { allowedModelsOf },
     );
     ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
     if (err instanceof PoolEmptyError) {
       logPoolEmpty(pool);
       sendPoolEmpty(res, pool);
+      return;
+    }
+    // 账号级模型白名单/被动学习把全部健康 key 排除：模型拒绝是配置问题，400。
+    if (err instanceof ModelNotAllowedError) {
+      sendModelNotAllowed(res, err.model);
       return;
     }
     sendJson(res, 502, { error: { message: 'upstream unavailable', type: 'server_error' } });
@@ -2792,9 +2939,15 @@ async function handleMessagesPassThrough(
     } catch {
       /* 非 JSON，按状态码分级 */
     }
-    const kind = classifyUpstreamFailure(upstream.response.status, errBody);
-    upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
-    if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
+    // 模型不可用（401 ModelError / not supported）≠ key 不可用：不 markFailure，
+    // 记被动学习 (account, model) blocked —— 否则该账号每请求都撞一次错误。
+    if (isModelUnsupported(upstream.response.status, errBody)) {
+      pool.blockModel(pool.accountIdOf(upstream.key), openAIReq.model, MODEL_BLOCK_TTL_MS);
+    } else {
+      const kind = classifyUpstreamFailure(upstream.response.status, errBody);
+      upstream.markFailure(kind, resetDelayMsFromError(errBody) ?? undefined);
+      if (kind === 'quota-exhausted') pool.noteQuotaError(upstream.response.status, errBody);
+    }
     noteUpstreamError(ctx, upstream.response.status, errBody);
     const requestId = upstream.response.headers.get('request-id');
     const retryAfter = upstream.response.headers.get('retry-after');

@@ -551,3 +551,83 @@ describe('隐私：落盘文件不含明文', () => {
     expect(raw).toContain('1:'); // 密文确实落盘了
   });
 });
+
+describe('账号级模型白名单（allowedModels）', () => {
+  it('allowedModelsOf 默认 null（未配置 = 用全局白名单）', () => {
+    const { db, store } = makeStore();
+    const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });
+    expect(store.allowedModelsOf(acc.id)).toBeNull();
+    expect(store.get(acc.id)!.allowedModels).toBeNull();
+    db.close();
+  });
+
+  it('setAllowedModels 落库 + 内存缓存热生效（trim + 去重）', () => {
+    const { db, store } = makeStore();
+    const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });
+    expect(store.setAllowedModels(acc.id, ['deepseek-v4-flash', ' deepseek-v4-flash-free ', 'deepseek-v4-flash'])).toBe(true);
+    // 缓存热生效：立即读。
+    expect(store.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash', 'deepseek-v4-flash-free']);
+    // 视图也带（/__metrics 与 /__admin 展示用）。
+    expect(store.get(acc.id)!.allowedModels).toEqual(['deepseek-v4-flash', 'deepseek-v4-flash-free']);
+    db.close();
+  });
+
+  it('空数组/全空 → 清除回全局（null）', () => {
+    const { db, store } = makeStore();
+    const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });
+    store.setAllowedModels(acc.id, ['deepseek-v4-flash']);
+    expect(store.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash']);
+    // 空数组 = 清除。
+    expect(store.setAllowedModels(acc.id, [])).toBe(true);
+    expect(store.allowedModelsOf(acc.id)).toBeNull();
+    // 再设置后传 null 也清除。
+    store.setAllowedModels(acc.id, ['x']);
+    expect(store.allowedModelsOf(acc.id)).toEqual(['x']);
+    expect(store.setAllowedModels(acc.id, null)).toBe(true);
+    expect(store.allowedModelsOf(acc.id)).toBeNull();
+    db.close();
+  });
+
+  it('重启（新 store 同一 db）缓存重建，白名单仍在', () => {
+    const { db, store } = makeStore();
+    const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });
+    store.setAllowedModels(acc.id, ['deepseek-v4-flash']);
+    // 模拟重启：新 store 同一 db，allowedModelsOf 懒加载重建缓存。
+    const store2 = new AccountsStore(db, secret, cfg({}), log);
+    expect(store2.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash']);
+    db.close();
+  });
+
+  it('账户不存在 → set false / allowedModelsOf null；降级 → null', () => {
+    const { db, store } = makeStore();
+    expect(store.setAllowedModels(9999, ['x'])).toBe(false);
+    expect(store.allowedModelsOf(9999)).toBeNull();
+    // 降级（无 secret）：整体 no-op。
+    const db2 = new UsageDb(path.join(tmpDir, 'degraded.db'), 30, log);
+    const degraded = new AccountsStore(db2, null, cfg({}), log);
+    expect(degraded.allowedModelsOf(1)).toBeNull();
+    expect(degraded.setAllowedModels(1, ['x'])).toBe(false);
+    db2.close();
+    db.close();
+  });
+
+  it('update（PATCH）传 allowedModels：数组写入、空数组清除，缓存同步', () => {
+    const { db, store } = makeStore();
+    const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });
+    expect(store.update(acc.id, { allowedModels: ['deepseek-v4-flash'] })).toBe(true);
+    expect(store.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash']);
+    expect(store.update(acc.id, { allowedModels: [] })).toBe(true);
+    expect(store.allowedModelsOf(acc.id)).toBeNull();
+    db.close();
+  });
+
+  it('remove 清缓存：删除账号后 allowedModelsOf 不再返回旧值', () => {
+    const { db, store } = makeStore();
+    const acc = createOk(store, { name: 'a', kind: 'subscription', workspaceId: null, keys: ['sk-1'], cookie: null });
+    store.setAllowedModels(acc.id, ['deepseek-v4-flash']);
+    expect(store.allowedModelsOf(acc.id)).toEqual(['deepseek-v4-flash']);
+    store.remove(acc.id);
+    expect(store.allowedModelsOf(acc.id)).toBeNull();
+    db.close();
+  });
+});

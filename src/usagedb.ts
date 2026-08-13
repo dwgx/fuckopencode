@@ -224,6 +224,12 @@ export interface AccountRow {
   legacyCookieEnc: string | null;
   /** OAuth refresh_token 的密文（AES-256-GCM，`1:...` 格式）。access_token 从不落库。 */
   oauthRefreshEnc: string | null;
+  /**
+   * 账号级模型白名单（JSON 字符串数组）。null = 未配置（用全局白名单）。
+   * 账号不能突破全局 ALLOWED_MODELS —— 交集在选号时天然成立（全局门先拒，
+   * 账号过滤只窄化）。
+   */
+  allowedModels: string[] | null;
   status: string;
   statusDetail: string | null;
   retryUntil: number;
@@ -244,6 +250,7 @@ export interface InsertAccountParams {
   keysEnc: string;
   cookieEnc?: string | null;
   legacyCookieEnc?: string | null;
+  allowedModels?: string[] | null;
   status?: string;
   statusDetail?: string | null;
   retryUntil?: number;
@@ -267,6 +274,7 @@ export interface AccountUpdate {
   cookieEnc?: string | null;
   legacyCookieEnc?: string | null;
   oauthRefreshEnc?: string | null;
+  allowedModels?: string[] | null;
   status?: string;
   statusDetail?: string | null;
   retryUntil?: number;
@@ -578,6 +586,7 @@ export class UsageDb {
         balance_units INTEGER,                         -- 余额（units，1e8 units = $1）；null = 未知
         monthly_limit_units INTEGER,
         monthly_usage_units INTEGER,
+        allowed_models TEXT,                           -- 账号级模型白名单（JSON 数组）；null = 用全局白名单
         created_at INTEGER NOT NULL                    -- 代码里传 Date.now()，与 requests.at 同风格
       );
 
@@ -611,6 +620,7 @@ export class UsageDb {
     this.ensureOauthColumn();
     this.ensureLegacyWorkspaceColumn();
     this.ensureLegacyCookieColumn();
+    this.ensureAllowedModelsColumn();
     // requests 表补详细请求列（path/ua/client）。补列失败只记日志：历史聚合
     // 不依赖这三列；失败时 listRequests 会因缺列走 catch 返回 null（503），
     // 代理链路与面板累计都不受影响 —— 观测设施降级哲学。
@@ -733,6 +743,22 @@ export class UsageDb {
       }
     } catch (err) {
       this.log(`[usagedb] accounts 表补 legacy_workspace_id 列失败（旧版控制台通道不可用）: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  /**
+   * 给旧库的 accounts 表补 allowed_models 列（幂等：已存在则不动）。
+   * 失败只记日志 —— 账号级模型白名单是管理面的配置功能，补列失败时
+   * 该列恒 NULL（= 不限制，用全局白名单），代理链路与全局白名单不受影响。
+   */
+  private ensureAllowedModelsColumn(): void {
+    try {
+      const cols = this.db.prepare('PRAGMA table_info(accounts)').all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'allowed_models')) {
+        this.db.exec('ALTER TABLE accounts ADD COLUMN allowed_models TEXT');
+      }
+    } catch (err) {
+      this.log(`[usagedb] accounts 表补 allowed_models 列失败（账号级模型白名单不可用）: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -1459,8 +1485,8 @@ export class UsageDb {
           `INSERT INTO accounts
              (name, kind, workspace_id, legacy_workspace_id, keys_enc, cookie_enc, status, status_detail,
               retry_until, last_probe_at, last_billing_at, balance_units,
-              monthly_limit_units, monthly_usage_units, legacy_cookie_enc, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              monthly_limit_units, monthly_usage_units, legacy_cookie_enc, allowed_models, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           row.name,
@@ -1478,6 +1504,7 @@ export class UsageDb {
           row.monthlyLimitUnits ?? null,
           row.monthlyUsageUnits ?? null,
           row.legacyCookieEnc ?? null,
+          row.allowedModels == null ? null : JSON.stringify(row.allowedModels),
           Date.now(),
         );
       return Number(res.lastInsertRowid);
@@ -1499,7 +1526,8 @@ export class UsageDb {
       const v = patch[field];
       if (v === undefined) continue;
       sets.push(`${col} = ?`);
-      vals.push(v);
+      // allowedModels 是数组，落库序列化成 JSON 字符串（null 保留 null = 清除）。
+      vals.push(field === 'allowedModels' && v != null ? JSON.stringify(v) : v);
     }
     if (sets.length === 0) return true;
     try {
@@ -1578,6 +1606,7 @@ const ACCOUNT_COLUMNS: Array<[keyof AccountUpdate, string]> = [
   ['balanceUnits', 'balance_units'],
   ['monthlyLimitUnits', 'monthly_limit_units'],
   ['monthlyUsageUnits', 'monthly_usage_units'],
+  ['allowedModels', 'allowed_models'],
 ];
 
 /** SQLite 行 → AccountRow。全部显式转换（node:sqlite 会返回 bigint/string/null）。 */
@@ -1600,8 +1629,22 @@ function mapAccountRow(r: Record<string, unknown>): AccountRow {
     balanceUnits: r.balance_units == null ? null : Number(r.balance_units),
     monthlyLimitUnits: r.monthly_limit_units == null ? null : Number(r.monthly_limit_units),
     monthlyUsageUnits: r.monthly_usage_units == null ? null : Number(r.monthly_usage_units),
+    allowedModels: parseAllowedModels(r.allowed_models),
     createdAt: Number(r.created_at),
   };
+}
+
+/** 解析 accounts.allowed_models 列的 JSON 数组；null/坏数据返回 null（= 不限制）。 */
+function parseAllowedModels(raw: unknown): string[] | null {
+  if (raw == null || String(raw).trim() === '') return null;
+  try {
+    const arr = JSON.parse(String(raw));
+    if (!Array.isArray(arr)) return null;
+    const models = arr.filter((m): m is string => typeof m === 'string' && m.length > 0);
+    return models.length > 0 ? models : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 默认 db 路径：代码目录旁的 `data/usage.db`。 */

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   normalizeAnthropicRequest,
+  resolveModel,
   resolveModelName,
   filterThinkingFromStream,
   DEFAULT_FALLBACK_MODEL,
@@ -70,6 +71,58 @@ describe('resolveModelName', () => {
 
   it('未命中回落 fallback（opencodezen 只认 deepseek-v4-flash）', () => {
     expect(resolveModelName('claude-opus-4-6', EMPTY_MAP, DEFAULT_FALLBACK_MODEL)).toBe('deepseek-v4-flash');
+  });
+});
+
+describe('resolveModel（全局模型门：白名单外明确拒绝）', () => {
+  it('白名单内直传 ok', () => {
+    expect(resolveModel('deepseek-v4-flash', {}, 'deepseek-v4-flash')).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+    expect(resolveModel('deepseek-v4-flash-free', {}, 'deepseek-v4-flash')).toEqual({ ok: true, model: 'deepseek-v4-flash-free' });
+  });
+
+  it('白名单外 → not-allowed（不再回落 flash —— 核心）', () => {
+    // 这些名字在旧行为里会静默回落 flash；现在必须明确拒绝。
+    for (const m of ['claude-sonnet-4-6', 'claude-opus-5', 'gpt-5.5', 'glm-5.2', 'kimi-k3', 'deepseek-v4-pro']) {
+      expect(resolveModel(m, {}, 'deepseek-v4-flash'), m).toEqual({ ok: false, reason: 'not-allowed' });
+    }
+  });
+
+  it('alias 映射进白名单 → ok；映射到白名单外值 → not-allowed（防配错绕过）', () => {
+    expect(resolveModel('gpt-4o', { 'gpt-4o': 'deepseek-v4-flash' }, 'deepseek-v4-flash')).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+    expect(resolveModel('x', { x: 'claude-opus-5' }, 'deepseek-v4-flash')).toEqual({ ok: false, reason: 'not-allowed' });
+  });
+
+  it('缺省/空 → fallback（fallback 是唯一允许的回落场景）', () => {
+    expect(resolveModel(undefined, {}, 'deepseek-v4-flash')).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+    expect(resolveModel('', {}, 'deepseek-v4-flash')).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+    expect(resolveModel('   ', {}, 'deepseek-v4-flash')).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+    // fallback 本身非法时强制回 flash（与 resolveModelName 旧行为一致）。
+    expect(resolveModel(undefined, {}, 'claude-opus-5')).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+  });
+
+  it('目录门：knownModels 非空且不在其中 → not-in-catalog', () => {
+    // 白名单模型但订阅端点目录里没有（如只拉到了按量模型的目录）。
+    expect(resolveModel('deepseek-v4-flash', {}, 'deepseek-v4-flash', new Set(['glm-5.2']))).toEqual({
+      ok: false,
+      reason: 'not-in-catalog',
+    });
+  });
+
+  it('目录门：目录空/未加载 → 跳过（fail-open）', () => {
+    expect(resolveModel('deepseek-v4-flash', {}, 'deepseek-v4-flash', new Set())).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+    expect(resolveModel('deepseek-v4-flash', {}, 'deepseek-v4-flash', undefined)).toEqual({ ok: true, model: 'deepseek-v4-flash' });
+  });
+
+  it('-free 豁免目录门（按量变体不在订阅端点目录）', () => {
+    expect(resolveModel('deepseek-v4-flash-free', {}, 'deepseek-v4-flash', new Set(['deepseek-v4-flash']))).toEqual({
+      ok: true,
+      model: 'deepseek-v4-flash-free',
+    });
+  });
+
+  it('resolveModelName 仍是兼容封装：白名单外回落 fallback（旧行为不变）', () => {
+    expect(resolveModelName('claude-opus-4-6', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    expect(resolveModelName('claude-opus-4-6', {}, 'claude-opus-5')).toBe('deepseek-v4-flash');
   });
 });
 

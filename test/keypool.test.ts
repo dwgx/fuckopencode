@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { KeyPool, PoolEmptyError, keyFingerprint } from '../src/keypool.js';
+import { KeyPool, ModelNotAllowedError, PoolEmptyError, keyFingerprint } from '../src/keypool.js';
 import { classifyUpstreamFailure } from '../src/errors.js';
 
 /** 可控时间源，避免测试依赖真实时钟。 */
@@ -779,5 +779,93 @@ describe('KeyPool 账户归属（多账号面板）', () => {
     expect(pool.healthyCount).toBe(1);
     // 剩余 key 正常工作。
     expect(pool.acquire()).toBe('sk-bbb-2');
+  });
+});
+
+describe('KeyPool acquire(isEligible)（账号级选号过滤）', () => {
+  const ids = (m: Record<string, number>): Map<string, number> => new Map(Object.entries(m));
+
+  it('isEligible 把不符合账号的 key 排除出候选集', () => {
+    const pool = new KeyPool(['sk-a-1', 'sk-b-2', 'sk-c-3'], OPTS, ids({ 'sk-a-1': 1, 'sk-b-2': 2, 'sk-c-3': 3 }));
+    const picked: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      picked.push(pool.acquire(undefined, (acc) => acc === 2));
+    }
+    // 三个请求全落到 accountId=2 的 key 上（账号白名单语义：该号模型不匹配 → 排除）。
+    expect(picked.every((k) => pool.accountIdOf(k) === 2)).toBe(true);
+  });
+
+  it('全部健康 key 被过滤 → ModelNotAllowedError（携带 model），不是 PoolEmptyError', () => {
+    const pool = new KeyPool(['sk-a-1', 'sk-b-2'], OPTS, ids({ 'sk-a-1': 1, 'sk-b-2': 2 }));
+    // 池健康（有 2 个可用 key），但账号过滤把它们全排除 —— 配置问题，抛模型拒绝。
+    expect(() => pool.acquire(undefined, () => false, 'deepseek-v4-flash')).toThrow(ModelNotAllowedError);
+    try {
+      pool.acquire(undefined, () => false, 'deepseek-v4-flash');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ModelNotAllowedError);
+      expect((err as ModelNotAllowedError).model).toBe('deepseek-v4-flash');
+    }
+    // 与 PoolEmptyError 可区分（instanceof 不同）。
+    try {
+      pool.acquire(undefined, () => false, 'deepseek-v4-flash');
+      expect.unreachable();
+    } catch (err) {
+      expect(err).not.toBeInstanceOf(PoolEmptyError);
+    }
+  });
+
+  it('池内无健康 key（全禁用）→ PoolEmptyError 优先（健康问题），不是模型拒绝', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['sk-a-1'], { ...OPTS, now: clock.now }, ids({ 'sk-a-1': 1 }));
+    pool.markFailure('sk-a-1', 'auth');
+    // isEligible 即便全滤，池空也要先报 PoolEmptyError（503）而不是模型拒绝（400）。
+    expect(() => pool.acquire(undefined, () => false, 'm')).toThrow(PoolEmptyError);
+  });
+
+  it('未提供 isEligible 时行为不变（兼容旧调用点）', () => {
+    const pool = new KeyPool(['a', 'b'], OPTS);
+    expect(['a', 'b']).toContain(pool.acquire());
+    expect(() => pool.acquire('a')).not.toThrow();
+  });
+});
+
+describe('KeyPool 被动学习模型 block（(account, model) 永久不可用）', () => {
+  it('blockModel → isModelBlocked 命中；TTL 过期自动失效', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['sk-a-1'], { ...OPTS, now: clock.now }, new Map([['sk-a-1', 1]]));
+    expect(pool.isModelBlocked(1, 'deepseek-v4-flash')).toBe(false);
+    pool.blockModel(1, 'deepseek-v4-flash', 1000);
+    expect(pool.isModelBlocked(1, 'deepseek-v4-flash')).toBe(true);
+    // 组合隔离：其他账号 / 其他模型不受影响。
+    expect(pool.isModelBlocked(2, 'deepseek-v4-flash')).toBe(false);
+    expect(pool.isModelBlocked(1, 'deepseek-v4-pro')).toBe(false);
+    clock.advance(1001);
+    expect(pool.isModelBlocked(1, 'deepseek-v4-flash')).toBe(false);
+  });
+
+  it('clearModelBlock 清除（成功请求恢复选号）', () => {
+    const pool = new KeyPool(['sk-a-1'], OPTS, new Map([['sk-a-1', 1]]));
+    pool.blockModel(1, 'deepseek-v4-flash');
+    expect(pool.isModelBlocked(1, 'deepseek-v4-flash')).toBe(true);
+    pool.clearModelBlock(1, 'deepseek-v4-flash');
+    expect(pool.isModelBlocked(1, 'deepseek-v4-flash')).toBe(false);
+  });
+
+  it('调用方把 pool.isModelBlocked 与账号白名单合并进 isEligible：被 block 组合排除', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(
+      ['sk-a-1', 'sk-b-2'],
+      { ...OPTS, now: clock.now },
+      new Map([['sk-a-1', 1], ['sk-b-2', 2]]),
+    );
+    pool.blockModel(1, 'deepseek-v4-flash');
+    // postUpstreamChat 的闭包语义：isEligible = 未被 block 且账号白名单匹配。
+    const eligible = (acc: number): boolean => !pool.isModelBlocked(acc, 'deepseek-v4-flash') && acc === 1;
+    // account 1 被 block + account 2 不匹配白名单 → 全滤 → 模型拒绝。
+    expect(() => pool.acquire(undefined, eligible, 'deepseek-v4-flash')).toThrow(ModelNotAllowedError);
+    // account 2 匹配 → 正常选中（block 只作用于 account 1）。
+    expect(
+      pool.acquire(undefined, (acc) => !pool.isModelBlocked(acc, 'deepseek-v4-flash') && acc === 2, 'deepseek-v4-flash'),
+    ).toBe('sk-b-2');
   });
 });
