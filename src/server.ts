@@ -19,7 +19,7 @@ import { isJsonContentType, validateAnthropicRequest, validateChatRequest } from
 import { extractDevice, recordEvent, snapshot, type RequestEvent } from './metrics.js';
 import { UsageDb } from './usagedb.js';
 import { applySettingsToConfig, SETTINGS_META, SettingsStore, validateSetting } from './settings.js';
-import { TokensStore } from './tokens.js';
+import { TokensStore, fingerprintOf } from './tokens.js';
 import { RpmLimiter } from './ratelimit.js';
 import { buildAccountsSection, type AccountsStore } from './accounts.js';
 import { handleAdminRoutes, LOGIN_HTML, parseAccountId } from './admin.js';
@@ -1029,6 +1029,7 @@ type TokenPatchInput = {
   status?: 'active' | 'disabled';
   note?: string | null;
   rpmLimit?: number;
+  tokenPlain?: string | null;
 };
 
 /** tokens 数据面不可用（未接线 / db 挂）的统一 503。 */
@@ -1073,6 +1074,19 @@ function validateTokenPatch(body: Record<string, unknown>): { ok: true; patch: T
       return { ok: false, error: `rpmLimit must be an integer 0-${TOKEN_RPM_MAX}` };
     }
     patch.rpmLimit = body.rpmLimit;
+  }
+  if (body.tokenPlain !== undefined) {
+    // 补录明文（老 token 创建时未存）。指纹匹配校验在 handler（需要现有 fingerprint）。
+    if (body.tokenPlain !== null && typeof body.tokenPlain !== 'string') {
+      return { ok: false, error: 'tokenPlain must be a string or null' };
+    }
+    if (typeof body.tokenPlain === 'string') {
+      const t = body.tokenPlain.trim();
+      if (t.length === 0 || t.length > 256) return { ok: false, error: 'tokenPlain must be 1-256 characters' };
+      patch.tokenPlain = t;
+    } else {
+      patch.tokenPlain = null;
+    }
   }
   return { ok: true, patch };
 }
@@ -1272,6 +1286,18 @@ async function handlePatchToken(
   if (fields.length === 0) {
     sendJson(res, 400, { error: { message: 'no fields to update', type: 'invalid_request_error' } });
     return;
+  }
+  if (patch.tokenPlain != null) {
+    // 补录明文必须与该 token 的指纹匹配（防把别的 key 填进这个条目）。
+    const row = deps.tokens.get(id);
+    if (row == null) {
+      sendJson(res, 404, { error: { message: 'token not found', type: 'not_found_error' } });
+      return;
+    }
+    if (fingerprintOf(patch.tokenPlain) !== row.fingerprint) {
+      sendJson(res, 400, { error: { message: 'tokenPlain fingerprint does not match this token', type: 'invalid_request_error' } });
+      return;
+    }
   }
   const r = deps.tokens.update(id, patch);
   if (r === false) {
@@ -1982,6 +2008,26 @@ export function createApp(
             ? path.slice('/__admin/api/tokens/'.length)
             : null;
           if (tRest != null) {
+            // /plain 子路径提前处理（否则 '5/plain' 会被 parseAccountId 拒成 400）。
+            if (tRest.endsWith('/plain')) {
+              const pid = parseAccountId(tRest.slice(0, -'/plain'.length));
+              if (pid == null) { sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } }); return; }
+              if (req.method !== 'GET' || !adminOriginAllowed(req)) {
+                sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+                return;
+              }
+              if (tokens == null || db == null || !db.enabled) {
+                sendJson(res, 503, { error: { message: tokensUnavailable({ db, tokens }), type: 'server_error' } });
+                return;
+              }
+              const plain = tokens.plainOf(pid);
+              if (plain == null) {
+                sendJson(res, 404, { error: { message: 'token plaintext not stored (created before plaintext storage)', type: 'not_found_error' } });
+                return;
+              }
+              sendJson(res, 200, { ok: true, data: { id: pid, token: plain } });
+              return;
+            }
             const tokenId = parseAccountId(tRest);
             if (tokenId == null) {
               sendJson(res, 400, { error: { message: 'token id must be a positive integer', type: 'invalid_request_error' } });

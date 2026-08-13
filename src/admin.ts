@@ -2129,6 +2129,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       tokenCountInvalid: 'count must be 1-10', tokenCreated: 'tokens created',
       tokenPlainOnlyOnce: 'shown only once — copy each key now; it cannot be recovered later',
       tokenCopy: 'copy', tokenCopied: 'copied', tokenClose: 'close',
+      tokenCopyTitle: 'copy full token',
+      tokenPlainMissing: 'plaintext not stored (created before plaintext storage) — re-create the token to keep it viewable',
       tokenActive: 'active', tokenDisabled: 'disabled',
       tokenUsage: 'usage', tokenCreatedAt: 'created',
       tokenEditTitle: 'Edit token', tokenNote: 'note', tokenNotePlaceholder: 'optional',
@@ -2364,6 +2366,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       tokenCountInvalid: '数量需在 1-10 之间', tokenCreated: '密钥已创建',
       tokenPlainOnlyOnce: '仅显示这一次 —— 请立即复制，关闭后无法找回',
       tokenCopy: '复制', tokenCopied: '已复制', tokenClose: '关闭',
+      tokenCopyTitle: '复制完整密钥',
+      tokenPlainMissing: '该密钥未存明文（旧版本创建）——重新创建后即可随时查看',
       tokenActive: '启用', tokenDisabled: '已禁用',
       tokenUsage: '用量', tokenCreatedAt: '创建时间',
       tokenEditTitle: '编辑密钥', tokenNote: '备注', tokenNotePlaceholder: '可选',
@@ -3400,7 +3404,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     return '<tr>' +
       '<td class="t-name">' + esc(t.name) + '</td>' +
       '<td>' + stBadge + '</td>' +
-      '<td class="tok-mask">' + esc(t.mask) + '</td>' +
+      '<td class="tok-mask">' + esc(t.mask) +
+        ' <button class="oc-btn oc-btn-ghost oc-btn-sm" data-action="copy-token" data-id="' + t.id + '" title="' + T('tokenCopyTitle') + '">' + T('tokenCopy') + '</button>' +
+      '</td>' +
       '<td>' + cost + ' · ' + req + ' · ' + tok + '</td>' +
       '<td class="t-hide">' + dateFmt(t.createdAt) + '</td>' +
       rpm +
@@ -5208,6 +5214,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (act === 'edit-token') { editToken(id); return; }
     if (act === 'del-token') { delToken(id); return; }
     // RPM 保存：读同行输入框的值 → PATCH rpmLimit（0 = 不限流）。
+    if (act === 'copy-token') {
+      api('GET', '/__admin/api/tokens/' + id + '/plain', null).then(function (r) {
+        if (!r.ok || !r.json || !r.json.data || typeof r.json.data.token !== 'string') {
+          flash(r.status === 404 ? T('tokenPlainMissing') : errMsg(r), true);
+          return;
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(r.json.data.token).then(function () { flash(T('tokenCopied')); }, function () { flash(T('opFail'), true); });
+        } else {
+          flash(r.json.data.token, false);  // 无剪贴板权限时直接显示明文（管理面内）
+        }
+      });
+      return;
+    }
     if (act === 'set-rpm') {
       var rp = document.querySelector('[data-rpm-id="' + id + '"]');
       var rv = rp ? String(rp.value).trim() : '';
