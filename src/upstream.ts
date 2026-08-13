@@ -59,6 +59,14 @@ export interface UpstreamCallOptions {
    * （150s）封顶整体时长；流式仍靠 idle watchdog。测试注入短值验证行为。
    */
   timeouts?: { headerMs?: number; idleMs?: number; totalMs?: number };
+  /**
+   * 账号级模型白名单查询（选号过滤用）。未提供 = 只走全局白名单（账号不限制）。
+   *
+   * 返回 null/空数组 = 该账号不限制（退回全局白名单）；非空 = 精确匹配（大小写
+   * 不敏感在配置侧收敛，这里按字符串比较）。isEligible 闭包同时检查账号白名单
+   * 与池的被动学习 block（pool.isModelBlocked）。
+   */
+  allowedModelsOf?: (accountId: number) => string[] | null;
 }
 
 /**
@@ -86,10 +94,23 @@ export async function postUpstreamChat(
     throw new PoolEmptyError();
   }
 
-  const model = typeof body.model === 'string' ? body.model : '';
+  const model = typeof body.model === 'string' && body.model ? body.model : '';
   const baseUrl = resolveUpstreamBaseUrl(model, cfg.anthropicBaseUrl, cfg.payAsYouGoBaseUrl);
 
-  const key = pool.acquire(opts.excludeKey);
+  // 账号级选号过滤：健康过滤后逐 key 按 accountId 判断。两个条件都读的是
+  // 「账号归属知道后」才可见的信息 —— 账号模型白名单（accounts.allowedModelsOf
+  // 缓存）与被动学习 block（pool.isModelBlocked）。空模型（缺省走 fallback，
+  // 正常由 server 层在 body.model 里解析完）不做账号级过滤 —— 没有任何
+  // 白名单能匹配空串，硬过滤会把所有配了白名单的账号排除掉。
+  const eligible = (accountId: number): boolean => {
+    if (!model) return true;
+    if (pool.isModelBlocked(accountId, model)) return false;
+    const allowed = opts.allowedModelsOf?.(accountId);
+    if (allowed != null && allowed.length > 0 && !allowed.includes(model)) return false;
+    return true;
+  };
+
+  const key = pool.acquire(opts.excludeKey, eligible, model);
   // release 的契约是幂等（见文件头注释）。`pool.release` 只防负数，防不住重复调用
   // 偷减**别的在飞请求**的计数 —— 错误路径上确实存在连续两次 release 的调用序列
   // （整池无健康 key 时先 release，再落到统一错误出口又 release），会把面板
@@ -164,7 +185,13 @@ export async function postUpstreamChat(
       touch: resetIdle,
       release: releaseOnce,
       markFailure: (kind: UpstreamFailureKind, resetDelayMs?: number) => pool.markFailure(key, kind, resetDelayMs),
-      markSuccess: () => pool.markSuccess(key),
+      // 成功请求清除 (account, model) 被动学习 block：模型在该账号实际可用，
+      // 恢复选号。blockModel 的调用方（server）只在上游明确「不支持」时记录，
+      // 所以任何一次成功都足以证明该组合可用。
+      markSuccess: () => {
+        pool.markSuccess(key);
+        pool.clearModelBlock(pool.accountIdOf(key), model);
+      },
     };
   } catch (err) {
     // fetch 阶段失败（网络错误/超时）：并发计数已 acquire，必须释放。

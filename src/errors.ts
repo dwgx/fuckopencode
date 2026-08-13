@@ -243,6 +243,25 @@ export function classifyUpstreamFailure(
 }
 
 /**
+ * 判定上游错误是否为「该账号不支持该模型」（端点/订阅不含此模型）。
+ *
+ * 研究结论：订阅端点 /zen/go 只有 25 个可用模型，其余（按量独有）在订阅端点
+ * 全 401 ModelError/"not supported"。这类错误是**模型不可用，不是 key 不可用**
+ * —— 不该调 pool.markFailure（会把好 key 误禁），而应被动学习记成
+ * (account, model) blocked，选号时排除该组合。
+ *
+ * 判定刻意收敛到「ModelError 类型」与「not supported 措辞」两类，避免把普通
+ * authentication_error / 5xx 误判成模型问题。
+ */
+export function isModelUnsupported(status: number, body: unknown): boolean {
+  if (status !== 401 && status !== 400 && status !== 404) return false;
+  const errorType = extractUpstreamErrorType(body);
+  const errorMessage = extractUpstreamErrorMessage(body);
+  if (errorType === 'ModelError') return true;
+  return /not supported/i.test(errorMessage) || /model[\s_-]*not[\s_-]*supported/i.test(errorType ?? '');
+}
+
+/**
  * 账户级错误分流（探针结论），返回账户状态 + 距下次探针的时间。
  *
  * 与 [`classifyUpstreamFailure`] 共用同一个错误体解析，两张分类表必须一致

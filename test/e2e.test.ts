@@ -200,6 +200,14 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
         res.end(
           JSON.stringify({ error: { type: 'authentication_error', message: 'invalid api key' } }),
         );
+      } else if (messagesJson.includes('ModelError测试')) {
+        // 测试钩子（被动学习）：该账号不支持该模型 —— 401 + ModelError（订阅端点
+        // 对不支持模型的实测形态）。模型不可用 ≠ key 不可用：网关不 markFailure，
+        // 记 (account, model) 被动学习 block，选号时排除该账号。
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({ error: { type: 'ModelError', message: 'Model deepseek-v4-flash is not supported' } }),
+        );
       } else if (messagesJson.includes('上下文超限测试')) {
         // 测试钩子：DeepSeek 风格的上下文超限 400 —— 网关必须把它改写成
         // Claude Code 认识的 "prompt is too long"（rewriteContextOverflow），
@@ -424,7 +432,7 @@ describe('v1 代理端到端', () => {
         'x-claude-code-session-id': 'sess-1',
       },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'gpt-4o',
         max_tokens: 50,
         thinking: { type: 'adaptive', budget_tokens: 1024 },
         reasoning_effort: 'high',
@@ -435,7 +443,7 @@ describe('v1 代理端到端', () => {
 
     const idx = fake.received.length - 1;
     const sent = fake.received[idx]!;
-    // claude-opus-4-6 不在假上游清单里 → 回落 fallback。
+    // gpt-4o 经 modelMap 映射成 deepseek-v4-flash（全局白名单内才生效）。
     expect(sent.model).toBe('deepseek-v4-flash');
     // 已转成 OpenAI：reasoning_effort 透传，Anthropic 的 thinking/output_config 不再出现。
     expect(sent.reasoning_effort).toBe('high');
@@ -630,7 +638,8 @@ describe('非流式上游 body 非法（第 1 项回归）', () => {
     keyCooldownMs: 300_000,
     anthropicBaseUrl: 'http://placeholder',
     payAsYouGoBaseUrl: 'http://placeholder-payg',
-    modelMap: {},
+    // 全局模型门只放行白名单模型；测试要打到上游就用 alias 映射进白名单。
+    modelMap: { 'gpt-4o': 'deepseek-v4-flash' },
     fallbackModel: 'deepseek-v4-flash',
     injectionMode: 'block',
     allowUnauthenticated: false,
@@ -640,7 +649,7 @@ describe('非流式上游 body 非法（第 1 项回归）', () => {
     trustClaudeCodeHeaders: false,
     dashboardOpen: false,
     dashboardPublic: false,
-    usageDbPath: '',
+    usageDbPath: '',  // 单测不落盘（专门的用量持久化用例在下面自建临时库）
     usageDbRetentionDays: 30,
     keyProbeIntervalMs: 0,
     keyProbeIdleMs: 1_800_000,
@@ -1162,7 +1171,7 @@ describe('观测计数接线（真实请求 -> /__metrics summary）', () => {
     keyCooldownMs: 300_000,
     anthropicBaseUrl: 'http://placeholder',
     payAsYouGoBaseUrl: 'http://placeholder-payg',
-    modelMap: {},
+    modelMap: { 'gpt-4o': 'deepseek-v4-flash' },
     fallbackModel: 'deepseek-v4-flash',
     injectionMode: 'block',
     allowUnauthenticated: true,
@@ -1218,7 +1227,7 @@ describe('观测计数接线（真实请求 -> /__metrics summary）', () => {
     return fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer sk-obs-fake', 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 50, ...extra }),
+      body: JSON.stringify({ model: 'gpt-4o', max_tokens: 50, ...extra }),
     });
   }
 
@@ -1306,7 +1315,8 @@ describe('大 body（>512KB 跳过克隆）：不污染入参的模型名（第 
     keyCooldownMs: 300_000,
     anthropicBaseUrl: 'http://placeholder',
     payAsYouGoBaseUrl: 'http://placeholder-payg',
-    modelMap: {},
+    // claude-sonnet-4-6 通过 alias 映射进白名单（全局模型门只放行白名单模型）。
+    modelMap: { 'claude-sonnet-4-6': 'deepseek-v4-flash' },
     fallbackModel: 'deepseek-v4-flash',
     injectionMode: 'block',
     allowUnauthenticated: false,
@@ -1349,7 +1359,7 @@ describe('大 body（>512KB 跳过克隆）：不污染入参的模型名（第 
     await new Promise<void>((resolve) => fake.server.close(() => resolve()));
   });
 
-  // claude-sonnet-4-6 不在白名单 → 会映射成 fallback deepseek-v4-flash。
+  // claude-sonnet-4-6 经 alias 映射成 flash（客户端名 ≠ 上游名，验证回显快照）。
   const BIG = { model: 'claude-sonnet-4-6', max_tokens: 16 };
 
   it('非流式：>512KB 请求响应回显客户端模型名（不是被映射的名字）', async () => {
@@ -1407,7 +1417,7 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     keyCooldownMs: 300_000,
     anthropicBaseUrl: 'http://placeholder',
     payAsYouGoBaseUrl: 'http://placeholder-payg',
-    modelMap: {},
+    modelMap: { 'gpt-4o': 'deepseek-v4-flash' },
     fallbackModel: 'deepseek-v4-flash',
     injectionMode: 'block',
     allowUnauthenticated: true,
@@ -5652,7 +5662,7 @@ describe('池空透传 GoUsageLimitError（故障 B）', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'deepseek-v4-flash',
         max_tokens: 50,
         messages: [{ role: 'user', content: 'GoError透传测试' }],
       }),
@@ -5663,7 +5673,7 @@ describe('池空透传 GoUsageLimitError（故障 B）', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'deepseek-v4-flash',
         max_tokens: 50,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -5716,7 +5726,7 @@ describe('非额度原因导致的池空仍回通用 503（不伪装成额度问
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'deepseek-v4-flash',
         max_tokens: 50,
         messages: [{ role: 'user', content: 'AuthError透传测试' }],
       }),
@@ -5727,7 +5737,7 @@ describe('非额度原因导致的池空仍回通用 503（不伪装成额度问
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-opus-4-6',
+        model: 'deepseek-v4-flash',
         max_tokens: 50,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -5735,5 +5745,304 @@ describe('非额度原因导致的池空仍回通用 503（不伪装成额度问
     expect(second.status).toBe(503);
     const json = (await second.json()) as { error: { message: string } };
     expect(json.error.message).toBe('all upstream keys are disabled');
+  });
+});
+
+// ─── 全局模型门 + 账号级模型白名单 + 被动学习（选号过滤） ───────────────────
+// 核心行为变化：白名单外模型不再静默回落 flash，改为明确 400。账号级白名单是
+// 选号过滤（账号归属在 acquire 后才知道）：模型不在该号白名单 → 排除该号；
+// 全池都不允许 → 终态拒绝（400）。上游 401 ModelError → 被动学习 (account,
+// model) blocked（1h TTL），选号排除，成功请求清除。
+
+describe('全局模型门（白名单外明确拒绝，不再回落 flash）', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+
+  // 主 e2e cfg 同款：modelMap 只含 gpt-4o → flash，其余白名单外名字必须 400。
+  const cfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['test-key'],
+    anthropicApiKey: 'sk-ant-fake',
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: { 'gpt-4o': 'deepseek-v4-flash' },
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    cfg.anthropicBaseUrl = fake.baseUrl;
+    cfg.payAsYouGoBaseUrl = fake.baseUrl;
+    proxy = createApp(cfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+  });
+
+  const POST = (path: string, body: unknown): Promise<Response> =>
+    fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify(body),
+    });
+
+  it('chat 路径：白名单外模型 → 400（核心：不再 200 flash）', async () => {
+    const before = fake.received.length;
+    const res = await POST('/v1/chat/completions', {
+      model: 'gpt-5.6-luna',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string; type: string } };
+    expect(json.error.message).toBe(
+      'model "gpt-5.6-luna" is not allowed (supported models: deepseek-v4-flash, deepseek-v4-flash-free)',
+    );
+    expect(json.error.type).toBe('invalid_request_error');
+    // 没打到上游（拒绝发生在网关内）。
+    expect(fake.received.length).toBe(before);
+  });
+
+  it('直通路径：白名单外模型 → 400（不再静默回落 flash）', async () => {
+    const before = fake.received.length;
+    const res = await POST('/v1/messages', {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string } };
+    expect(json.error.message).toContain('model "claude-sonnet-4-6" is not allowed');
+    expect(json.error.message).toContain('deepseek-v4-flash, deepseek-v4-flash-free');
+    expect(fake.received.length).toBe(before);
+  });
+
+  it('alias 映射进白名单的模型仍 200（白名单语义不受影响）', async () => {
+    const res = await POST('/v1/chat/completions', {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('账号级模型白名单（选号过滤）与被动学习', () => {
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let baseUrl: string;
+  let tmpDir: string;
+  let db: UsageDb;
+  let store: AccountsStore;
+  let pool: KeyPool;
+  let acc1Id: number;
+  let acc2Id: number;
+  const KEY1 = 'sk-model-block-1';
+  const KEY2 = 'sk-model-block-2';
+
+  const cfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: [],
+    anthropicApiKey: null,
+    upstreamKeys: [],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: true,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: true,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: 'e2e-model-gate-secret',
+    secretFilePath: '/dev/null',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-e2e-modelgate-'));
+    fake = await startFakeUpstream();
+    cfg.anthropicBaseUrl = fake.baseUrl;
+    cfg.payAsYouGoBaseUrl = fake.baseUrl;
+    db = new UsageDb(path.join(tmpDir, 'mg.db'), 30, () => {});
+    const secret = loadSecret({ gatewaySecret: 'e2e-model-gate-secret', secretFilePath: '/dev/null' } as unknown as AppConfig)!;
+    store = new AccountsStore(db, secret, cfg, () => {});
+    const a1 = store.create({ name: 'a1', kind: 'subscription', workspaceId: null, keys: [KEY1], cookie: null });
+    const a2 = store.create({ name: 'a2', kind: 'subscription', workspaceId: null, keys: [KEY2], cookie: null });
+    if (!a1.ok || !a2.ok) throw new Error('account create failed');
+    acc1Id = a1.value.id;
+    acc2Id = a2.value.id;
+    const accountIds = store.keysForPool();
+    pool = new KeyPool([...accountIds.keys()], {
+      cooldownMs: cfg.keyCooldownMs,
+      failThreshold: cfg.keyFailThreshold,
+    }, accountIds);
+    proxy = createApp(cfg, pool, db, store);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const chat = (body: unknown): Promise<Response> =>
+    fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  it('未配置白名单：flash 请求 200（全局白名单兜底）', async () => {
+    const res = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    expect(res.status).toBe(200);
+  });
+
+  it('账号白名单配置后模型不匹配 → 400；匹配 → 200（选号过滤）', async () => {
+    // 两账号都只允许 flash-free：flash 请求全池被滤 → 终态拒绝 400。
+    expect(store.setAllowedModels(acc1Id, ['deepseek-v4-flash-free'])).toBe(true);
+    expect(store.setAllowedModels(acc2Id, ['deepseek-v4-flash-free'])).toBe(true);
+    const before = fake.received.length;
+    const rejected = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    expect(rejected.status).toBe(400);
+    const json = (await rejected.json()) as { error: { message: string; type: string } };
+    expect(json.error.message).toBe(
+      'model "deepseek-v4-flash" is not allowed (supported models: deepseek-v4-flash, deepseek-v4-flash-free)',
+    );
+    expect(json.error.type).toBe('invalid_request_error');
+    // 没打到上游（选号在网关内终止）。
+    expect(fake.received.length).toBe(before);
+
+    // 账号 2 改为允许 flash：flash 请求落到账号 2 → 200（账号 1 仍排除）。
+    expect(store.setAllowedModels(acc2Id, ['deepseek-v4-flash'])).toBe(true);
+    const ok = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    expect(ok.status).toBe(200);
+    // 用的是账号 2 的 key。
+    const lastAuth = fake.receivedHeaders[fake.receivedHeaders.length - 1]!.authorization;
+    expect(lastAuth).toBe(`Bearer ${KEY2}`);
+    expect(pool.accountIdOf(KEY2)).toBe(acc2Id);
+  });
+
+  it('上游 ModelError → 被动 block → 选号跳过 → TTL 恢复', async () => {
+    // 账号 1 先命中 ModelError（fake 只对带标记的消息回 401 ModelError），
+    // 账号 2 正常。least-loaded 串行下第一发走 key1（数组第一个）。
+    expect(store.setAllowedModels(acc1Id, null)).toBe(true);
+    expect(store.setAllowedModels(acc2Id, null)).toBe(true);
+    const first = await chat({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'ModelError测试' }],
+    });
+    expect(first.status).toBe(401);
+    // 被动学习已记录 (acc1, flash)。
+    expect(pool.isModelBlocked(acc1Id, 'deepseek-v4-flash')).toBe(true);
+    expect(pool.isModelBlocked(acc2Id, 'deepseek-v4-flash')).toBe(false);
+
+    // 选号跳过账号 1：第二发走账号 2 → 200。
+    const second = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    expect(second.status).toBe(200);
+    const lastAuth = fake.receivedHeaders[fake.receivedHeaders.length - 1]!.authorization;
+    expect(lastAuth).toBe(`Bearer ${KEY2}`);
+
+    // TTL 恢复：block 到期后账号 1 重新参与选号（服务器用 1h TTL，这里用一个
+    // 短 TTL 的 block 模拟「到期」这一时间推进，然后验证选号恢复）。
+    pool.blockModel(acc1Id, 'deepseek-v4-flash', 30);
+    expect(pool.isModelBlocked(acc1Id, 'deepseek-v4-flash')).toBe(true);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(pool.isModelBlocked(acc1Id, 'deepseek-v4-flash')).toBe(false);
+    const recovered = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    // 账号 1 重新可选中（无 ModelError 标记 → fake 正常 200）。
+    expect(recovered.status).toBe(200);
+    const recoveredAuth = fake.receivedHeaders[fake.receivedHeaders.length - 1]!.authorization;
+    expect(recoveredAuth).toBe(`Bearer ${KEY1}`);
+  });
+
+  it('被动 block 是 (account, model) 组合隔离的：其他账号的成功请求不清掉它', async () => {
+    // acc2 被 block 后，flash 请求被引导到 acc1（key1）并成功 —— 但这不该清掉
+    // acc2 的 block（成功清除只作用于「被使用且成功」的那个账号组合）。
+    pool.blockModel(acc2Id, 'deepseek-v4-flash');
+    expect(pool.isModelBlocked(acc2Id, 'deepseek-v4-flash')).toBe(true);
+    const res = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    expect(res.status).toBe(200);
+    expect(pool.isModelBlocked(acc2Id, 'deepseek-v4-flash')).toBe(true);
+    expect(pool.isModelBlocked(acc1Id, 'deepseek-v4-flash')).toBe(false);
+  });
+
+  it('模型目录：手动刷新端点（Origin 校验）+ /__metrics catalog', async () => {
+    const res = await fetch(`${baseUrl}/__admin/api/models/refresh`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { count: number; lastRefreshAt: number; lastError: string | null };
+    expect(body.count).toBe(2); // fake /v1/models 返回 flash + flash-free
+    expect(body.lastRefreshAt).toBeGreaterThan(0);
+    expect(body.lastError).toBeNull();
+
+    const cs = await fetch(`${baseUrl}/__admin/api/models/refresh`, {
+      method: 'POST',
+      headers: { origin: 'https://evil.example' },
+    });
+    expect(cs.status).toBe(403);
+
+    const m = (await (await fetch(`${baseUrl}/__metrics`)).json()) as {
+      catalog: { count: number; lastRefreshAt: number; lastError: string | null };
+    };
+    expect(m.catalog.count).toBe(2);
+    expect(m.catalog.lastRefreshAt).toBeGreaterThan(0);
+    expect(m.catalog.lastError).toBeNull();
   });
 });

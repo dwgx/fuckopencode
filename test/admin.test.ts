@@ -232,6 +232,56 @@ describe('UI v3：账户详情视图（console 数据展示）', () => {
   });
 });
 
+describe('可用模型区块（detail-models：账号 allowedModels + 全局默认 + 目录状态）', () => {
+  it('详情页挂载点 + DETAIL_BLOCK_KEYS 注册（骨架标题/副标题键与渲染一致）', () => {
+    expect(ADMIN_HTML).toContain('id="detail-models"');
+    const code = inlineScript();
+    expect(code).toContain("['detail-models', 'allowedModelsTitle', 'allowedModelsSub']");
+    expect(code).toContain('loadModels(id);');  // loadAccountDetail 里接线
+  });
+
+  it('渲染/加载/保存/清除函数都在，保存走 PATCH allowedModels（null/空 = 清除回全局）', () => {
+    const code = inlineScript();
+    for (const fn of ['renderModels', 'loadModels', 'saveModels', 'clearModels']) {
+      expect(code, `缺 ${fn}`).toContain(`function ${fn}(`);
+    }
+    expect(code).toContain("api('PATCH', '/__admin/api/accounts/' + id, { allowedModels: parts.length ? parts : null })");
+    expect(code).toContain("api('PATCH', '/__admin/api/accounts/' + id, { allowedModels: null })");
+    expect(code).toContain('data-action="save-models"');
+    expect(code).toContain('data-action="clear-models"');
+    expect(code).toContain("if (act === 'save-models') { saveModels(Number(btn.getAttribute('data-id'))); return; }");
+    expect(code).toContain("if (act === 'clear-models') { clearModels(Number(btn.getAttribute('data-id'))); return; }");
+  });
+
+  it('区块数据源：账号 allowedModels/blockedModels + /__metrics catalog（缺字段显示 —）', () => {
+    const code = inlineScript();
+    expect(code).toContain('Array.isArray(a.allowedModels)');
+    expect(code).toContain('lastMetrics && lastMetrics.catalog');
+    expect(code).toContain('Array.isArray(a.blockedModels)');
+    // 全局默认只读列表 + 覆盖输入 + 清除提示。
+    expect(code).toContain("var gm = ['deepseek-v4-flash', 'deepseek-v4-flash-free'];");
+    expect(code).toContain("T('globalDefault')");
+    expect(code).toContain("T('clearToGlobalHint')");
+  });
+
+  it('allowedModels/blockedModels 变化会触发面板重建（renderFingerprint 元组含两者）', () => {
+    const code = inlineScript();
+    expect(code).toContain('JSON.stringify(a.allowedModels || null)');
+    expect(code).toContain('JSON.stringify(a.blockedModels || null)');
+  });
+
+  it('可用模型词条 en/zh 都有', () => {
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    for (const k of ['allowedModelsTitle', 'allowedModelsSub', 'globalDefault', 'accountOverride',
+                     'clearToGlobal', 'clearToGlobalHint', 'modelCatalog', 'catalogModels',
+                     'catalogRefreshed', 'modelsBlocked', 'modelsSaved', 'modelsPlaceholder']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
+  });
+});
+
 describe('UI v3：写操作 confirm 流程（自动充值/月限额/建删 key/导入 cookie）', () => {
   it('confirm 弹层骨架与流程函数存在', () => {
     expect(ADMIN_HTML).toContain('id="confirm-overlay"');
@@ -626,6 +676,25 @@ describe('PATCH 部分更新校验（§6.3）', () => {
   it('workspaceId 空串归一为 null（宽松清除），超长 → 400', () => {
     expect(validatePatchAccount({ workspaceId: '  ' })).toEqual({ ok: true, value: { workspaceId: null } });
     expect(validatePatchAccount({ workspaceId: 'x'.repeat(201) }).ok).toBe(false);
+  });
+
+  it('allowedModels：数组 trim/去重，null/空数组/全空串 = 清除回全局', () => {
+    expect(validatePatchAccount({
+      allowedModels: [' deepseek-v4-flash ', 'deepseek-v4-flash-free', 'deepseek-v4-flash'],
+    })).toEqual({
+      ok: true,
+      value: { allowedModels: ['deepseek-v4-flash', 'deepseek-v4-flash-free'] },
+    });
+    expect(validatePatchAccount({ allowedModels: null })).toEqual({ ok: true, value: { allowedModels: null } });
+    expect(validatePatchAccount({ allowedModels: [] })).toEqual({ ok: true, value: { allowedModels: null } });
+    // 非数组 / 含非字符串 / 空串项（含纯空白）/ 超长 → 400（与 parseKeys 同口径）。
+    expect(validatePatchAccount({ allowedModels: 'deepseek-v4-flash' }).ok).toBe(false);
+    expect(validatePatchAccount({ allowedModels: [42] }).ok).toBe(false);
+    expect(validatePatchAccount({ allowedModels: [''] }).ok).toBe(false);
+    expect(validatePatchAccount({ allowedModels: ['  '] }).ok).toBe(false);
+    expect(validatePatchAccount({ allowedModels: ['x'.repeat(101)] }).ok).toBe(false);
+    expect(validatePatchAccount({ allowedModels: Array.from({ length: 51 }, (_, i) => `m${i}`) }).ok).toBe(false);
+    expect(validatePatchAccount({ allowedModels: Array.from({ length: 50 }, (_, i) => `m${i}`) }).ok).toBe(true);
   });
 });
 

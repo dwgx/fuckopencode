@@ -129,6 +129,12 @@ export interface AppConfig {
   compactTriggerBytes: number;
   /** 实验性：被动压缩的单条消息字符上限（COMPACT_MAX_MESSAGE_CHARS，超长截断）。 */
   compactMaxMessageChars: number;
+  /**
+   * 上游模型目录（/zen/go 订阅模型清单）的刷新周期（毫秒）。0 = 关闭定时刷新。
+   * 目录只用于「白名单模型不在订阅端点 → 拒绝」的目录门，且目录空（未加载）
+   * 时该门 fail-open —— 拉取失败保留旧目录，不影响代理链路。
+   */
+  modelCatalogRefreshMs?: number;
 }
 
 function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
@@ -266,6 +272,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     compactEnabled: boolFromEnv(env.COMPACT_ENABLED, false),
     compactTriggerBytes: intFromEnv(env.COMPACT_TRIGGER_BYTES, 4 * 1024 * 1024, 1),
     compactMaxMessageChars: intFromEnv(env.COMPACT_MAX_MESSAGE_CHARS, 8_000, 1),
+    // 上游模型目录定时刷新：默认 6h，0 = 关闭（只做启动时一次拉取）。
+    modelCatalogRefreshMs: intFromEnv(env.MODEL_CATALOG_REFRESH_MS, 6 * 3_600_000, 0),
   };
 }
 

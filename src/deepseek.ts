@@ -40,6 +40,20 @@ export const ALLOWED_MODELS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * 全局模型门的判定结果。
+ *
+ * - `{ok:true, model}`：最终可发给上游的上游名（别名映射后、过完两道门）。
+ * - `{ok:false, reason:'not-allowed'}`：最终名不在 ALLOWED_MODELS —— **核心变化：
+ *   白名单外不再静默回落 flash，调用方（server）应明确拒绝（400）。**
+ * - `{ok:false, reason:'not-in-catalog'}`：在 ALLOWED_MODELS 里但不在上游模型
+ *   目录（knownModels，订阅端点拉取）里 —— 端点不支持该模型（fail-open：目录
+ *   未加载时跳过此门）。
+ */
+export type ModelDecision =
+  | { ok: true; model: string }
+  | { ok: false; reason: 'not-allowed' | 'not-in-catalog' };
+
+/**
  * 对外别名：已从代码移除，改为 db 配置清单（model_aliases 表 + 后台设置页）。
  *
  * 原本 claude-mythos-5 / claude-fable-5 两个 Anthropic 风格名字内置在代码里，
@@ -48,27 +62,61 @@ export const ALLOWED_MODELS: ReadonlySet<string> = new Set([
  *
  * 注意这些名字**刻意不与真实 Anthropic 模型重名**（不叫 claude-opus-5 之类），
  * 否则 Claude Code 发它自己的默认模型名时会被误当成别名，语义就乱了。
- *
- * 模型名解析：MODEL_MAP（env + 后台运行时映射）→ 白名单直传 → 回落 fallback。
- *
- * 只有 ALLOWED_MODELS 里的名字能真正发给上游（映射的结果要过白名单），
- * 其余全部回落 —— Claude Code 会发 claude-sonnet-4-6 这类真实 Anthropic 名字，
- * 正好被这条吃掉并落到 fallback 上。
  */
 export function resolveModelName(
   model: string,
   modelMap: Record<string, string>,
   fallbackModel: string,
-  _knownModels?: ReadonlySet<string>,
+  knownModels?: ReadonlySet<string>,
 ): string {
-  // 1. 显式映射优先（env MODEL_MAP + 后台设置合并进来的运行时映射，运行时 > env；
-  //    seed 的默认别名也在其中 —— 未配置的别名自然走回落，行为与旧内置一致）。
-  const mapped = modelMap[model];
-  if (mapped && ALLOWED_MODELS.has(mapped)) return mapped;
-  // 2. 直接用真名。
-  if (ALLOWED_MODELS.has(model)) return model;
-  // 3. 白名单外（含 claude-*/gpt-* 等）一律回落；fallback 非法则强制到 flash。
+  // 兼容封装：旧调用点（normalizeAnthropicRequest / 库用户）保持「白名单外回落
+  // fallback」的旧行为；白名单外的**明确拒绝**由 server 层改用 resolveModel 做。
+  const d = resolveModel(model, modelMap, fallbackModel, knownModels);
+  if (d.ok) return d.model;
+  // fallback 本身非法时强制到 flash（与旧实现一致）。
   return ALLOWED_MODELS.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL;
+}
+
+/**
+ * 全局模型门：决定一个客户端模型名最终发给上游的名字，或在哪个门被拒。
+ *
+ * 这是「白名单外明确拒绝」的核心实现。解析顺序：
+ * 1. **缺省/空** → 用 fallback（fallback 是唯一允许的回落场景 —— 客户端没给
+ *    模型名时不该拒绝，落到默认模型即可）。
+ * 2. **alias 映射**（MODEL_MAP，env + 后台运行时映射合并）→ 最终上游名；映射
+ *    结果必须本身在 ALLOWED_MODELS 里（防配错把白名单外值引入）。
+ * 3. **白名单门**：最终名 ∉ ALLOWED_MODELS → `not-allowed`（**不再静默回落**）。
+ * 4. **目录门**：knownModels 非空且最终名 ∉ knownModels 且不 endsWith('-free')
+ *    → `not-in-catalog`（`-free` 是按量变体，订阅端点目录里没有，刻意豁免；
+ *    目录空 = 未加载，跳过此门 fail-open）。
+ */
+export function resolveModel(
+  model: string | undefined,
+  modelMap: Record<string, string>,
+  fallbackModel: string,
+  knownModels?: ReadonlySet<string>,
+): ModelDecision {
+  // 1. 缺省/空 → fallback（唯一允许的回落场景；fallback 非法则强制 flash）。
+  if (model == null || model.trim() === '') {
+    return { ok: true, model: ALLOWED_MODELS.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL };
+  }
+  // 2+3. 别名映射 → 最终上游名 → 白名单门。
+  const mapped = modelMap[model];
+  const finalName =
+    mapped != null && ALLOWED_MODELS.has(mapped) ? mapped : ALLOWED_MODELS.has(model) ? model : null;
+  if (finalName === null) {
+    return { ok: false, reason: 'not-allowed' };
+  }
+  // 4. 目录门（fail-open：knownModels 空/未加载跳过；-free 豁免）。
+  if (
+    knownModels != null &&
+    knownModels.size > 0 &&
+    !knownModels.has(finalName) &&
+    !finalName.endsWith('-free')
+  ) {
+    return { ok: false, reason: 'not-in-catalog' };
+  }
+  return { ok: true, model: finalName };
 }
 
 /**
