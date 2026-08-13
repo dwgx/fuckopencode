@@ -839,20 +839,25 @@ export class UsageDb {
    * 由调用方兜底，本方法不做防御 —— 观测设施，参数错就 503，不拖垮代理。
    * 查询失败返回 null（调用方 503），db 不可用同样返回 null。
    */
-  listRequests(page: number, pageSize: number, q?: string): RequestPage | null {
+  listRequests(page: number, pageSize: number, q?: string, filter: 'important' | 'all' = 'important'): RequestPage | null {
     if (!this.enabled) return null;
     // 批量写入是异步的：读前先把积压 flush，保证查询读到已落库数据。
     this.flush();
     const offset = Math.max(0, (page - 1) * pageSize);
+    // 噪音排除（important 默认）：探活 probe、记账 count_tokens、健康检查 /（FurCDN 之类）。
+    // all 模式只排除探活（保留 count_tokens/健康检查供排查）。
+    const noise = filter === 'all'
+      ? `endpoint != 'probe'`
+      : `endpoint NOT IN ('probe', 'count_tokens') AND path != '/'`;
     // LIKE 的 %/_/\ 是模式字符；用户输入是字面关键词，先转义再包 %（ESCAPE '\'）。
     const like = escapeLike(q ?? '');
     const where = like
-      ? `WHERE endpoint != 'probe' AND (
+      ? `WHERE ${noise} AND (
            path LIKE ? ESCAPE '\\' OR CAST(status AS TEXT) LIKE ? ESCAPE '\\' OR
            model LIKE ? ESCAPE '\\' OR COALESCE(client, '') LIKE ? ESCAPE '\\' OR
            COALESCE(ua, '') LIKE ? ESCAPE '\\' OR COALESCE(ip, '') LIKE ? ESCAPE '\\' OR
            COALESCE(error, '') LIKE ? ESCAPE '\\')`
-      : `WHERE endpoint != 'probe'`;
+      : `WHERE ${noise}`;
     const bind = like ? [like, like, like, like, like, like, like] : [];
     try {
       const totalRow = this.db.prepare(`SELECT COUNT(*) AS n FROM requests ${where}`).get(...bind) as { n: number };

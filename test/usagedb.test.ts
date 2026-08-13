@@ -858,13 +858,18 @@ describe('listRequests 详细请求分页', () => {
     db.close();
   });
 
-  it('count_tokens 记账请求仍可见于详细请求列表（endpoint 标记区分）', () => {
+  it('count_tokens 记账请求默认被 important 过滤、filter=all 时可见（endpoint 标记区分）', () => {
     const db = new UsageDb(path.join(tmpDir, 'detail-count.db'), 30, log);
     db.recordRequest(row({ at: 1000, endpoint: 'count_tokens', path: '/v1/messages/count_tokens', inputTokens: 4321 }));
     db.recordRequest(row({ at: 2000, path: '/v1/messages', ua: 'claude-cli/1.0.27' }));
+    // 默认 important 过滤：count_tokens 被排除，只剩真实请求
     const page = db.listRequests(1, 20)!;
-    expect(page.total).toBe(2);
-    expect(page.items.some((r) => r.endpoint === 'count_tokens' && r.inputTokens === 4321)).toBe(true);
+    expect(page.total).toBe(1);
+    expect(page.items[0]!.endpoint).not.toBe('count_tokens');
+    // filter=all 保留 count_tokens（endpoint 标记区分）
+    const all = db.listRequests(1, 20, undefined, 'all')!;
+    expect(all.total).toBe(2);
+    expect(all.items.some((r) => r.endpoint === 'count_tokens' && r.inputTokens === 4321)).toBe(true);
     db.close();
   });
 
@@ -908,18 +913,18 @@ describe('listRequests 详细请求分页', () => {
     const db = new UsageDb(p, 30, log);
     expect(db.enabled).toBe(true);
     // 旧数据三列 null（查得到，不炸）。
-    const page = db.listRequests(1, 20)!;
+    const page = db.listRequests(1, 20, undefined, 'all')!;
     expect(page.total).toBe(1);
     expect(page.items[0]).toMatchObject({ path: null, ua: null, client: null });
     // 补列后写入正常（新数据带 path/ua/client）。
     db.recordRequest(row({ at: 2000, path: '/v1/messages', ua: 'cursor/0.42' }));
-    const page2 = db.listRequests(1, 20)!;
+    const page2 = db.listRequests(1, 20, undefined, 'all')!;
     expect(page2.items[0]).toMatchObject({ path: '/v1/messages', ua: 'cursor/0.42', client: 'Cursor' });
     db.close();
 
     // 幂等：再开一次（migrate/补列重复跑）不炸。
     const db2 = new UsageDb(p, 30, log);
-    expect(db2.listRequests(1, 20)!.total).toBe(2);
+    expect(db2.listRequests(1, 20, undefined, 'all')!.total).toBe(2);
     db2.close();
   });
 });
@@ -1137,7 +1142,7 @@ describe('requests 表 ip / cost_micro_cents 列', () => {
 
     const db = new UsageDb(p, 30, log);
     expect(db.enabled).toBe(true);
-    const page = db.listRequests(1, 20)!;
+    const page = db.listRequests(1, 20, undefined, 'all')!;
     expect(page.items[0]!.ip).toBeNull();
     // 旧数据 cost 为 NULL，聚合按 0 处理。
     expect(db.usageByKeyFingerprints(['old'], 0).costMicroCents).toBe(0);
