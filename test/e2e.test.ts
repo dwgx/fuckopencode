@@ -204,6 +204,19 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
         // 网关必须把这次 body 读失败记成失败（markFailure）而不是成功。
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('<html>502 Bad Gateway</html>');
+      } else if (messagesJson.includes('慢响应测试')) {
+        // 测试钩子：上游延迟 ~150ms 再回 200 JSON —— 验证「长响应」的可观测性
+        // （duration 落库/进 /__metrics events，面板能按耗时看到慢请求）。
+        const body = JSON.stringify({
+          id: 'chatcmpl-slow',
+          object: 'chat.completion',
+          created: 1,
+          model: 'deepseek-v4-flash',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'slow' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        setTimeout(() => res.end(body), 150);
       } else {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(
@@ -677,6 +690,38 @@ describe('非流式上游 body 非法（第 1 项回归）', () => {
     });
     expect(res.status).toBe(502);
     expect(await failCount()).toBe(2);
+  });
+
+  it('非法 body 的 502 文案仍是「malformed body」，不泛化（网关主动断开才有超时文案）', async () => {
+    // 回归（第十九轮口径 + 本轮分级）：只有 watchdog 掐断才给「upstream response
+    // timed out」；上游 200 + 非法 JSON（连接健康、非超时）保持原文案，否则客户端
+    // 分不清是「上游挂了」还是「响应坏了」。
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'malformed-body测试' }] }),
+    });
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: { message: string } };
+    expect(body.error.message).toBe('upstream returned malformed body');
+  });
+
+  it('慢响应可观测：duration 落 /__metrics events，面板能看到长请求', async () => {
+    // 观测（本轮第 2 项）：长响应（>60s 是生产阈值，这里用 ~150ms 模拟）的耗时
+    // 必须进 /__metrics events（面板按 durationMs 显示）且不误记失败 —— 慢 ≠ 坏。
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: '慢响应测试' }] }),
+    });
+    expect(res.status).toBe(200);
+    // 给 150ms 延迟 + 记账留出完成时间。
+    await new Promise((r) => setTimeout(r, 300));
+    const json = (await (await fetch(`${baseUrl}/__metrics`, { headers: { authorization: 'Bearer test-key' } })).json()) as {
+      events: Array<{ status: number; durationMs: number; error: string | null }>;
+    };
+    const slow = json.events.filter((e) => e.status === 200 && e.durationMs >= 150);
+    expect(slow.length).toBeGreaterThan(0);
   });
 });
 
@@ -1334,6 +1379,8 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
   let proxy: Server;
   let baseUrl: string;
   let tmpDir: string;
+  /** 与 createApp 共用的 UsageDb 实例（批量异步落库后测试要显式 flush 才能直读）。 */
+  let usageDb: UsageDb;
 
   const dbCfg: AppConfig = {
     host: '127.0.0.1',
@@ -1379,7 +1426,9 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     dbCfg.usageDbPath = path.join(tmpDir, 'usage.db');
     fake = await startFakeUpstream();
     dbCfg.anthropicBaseUrl = fake.baseUrl;
-    proxy = createApp(dbCfg);
+    // 显式注入 UsageDb：请求记账是异步批量落库，直读库文件前测试要能 flush。
+    usageDb = new UsageDb(dbCfg.usageDbPath, dbCfg.usageDbRetentionDays);
+    proxy = createApp(dbCfg, undefined, usageDb);
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
     const a = proxy.address();
     baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
@@ -1388,6 +1437,7 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
   afterAll(async () => {
     await new Promise<void>((resolve) => proxy.close(() => resolve()));
     await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+    usageDb.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -1455,6 +1505,7 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     await res.text();
 
     if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    usageDb.flush();  // 请求记账是异步批量落库：直读前先让最后一批提交
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
     try {
@@ -1483,6 +1534,7 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     expect(res.status).toBeGreaterThanOrEqual(400);
 
     if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    usageDb.flush();  // 请求记账是异步批量落库：直读前先让最后一批提交
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
     try {
@@ -1502,6 +1554,7 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     // 回归：handleCountTokens 此前没被 await —— finally 先于 .then() 记账，
     // ctx.inputTokens 还没赋值就落库，requests 行 input_tokens 恒 0。
     if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    usageDb.flush();  // 上一测试的积压先提交，aggBefore 才是准确的基线
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
     let aggBefore = 0;
@@ -1522,6 +1575,7 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     expect(res.status).toBe(200);
     expect(((await res.json()) as { input_tokens: number }).input_tokens).toBeGreaterThan(0);
 
+    usageDb.flush();  // 请求记账是异步批量落库：直读前先让最后一批提交
     const db2 = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
     try {
       const row = db2
@@ -1561,6 +1615,7 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
     }).catch(() => {});  // socket close 是预期的
 
     if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    usageDb.flush();  // 请求记账是异步批量落库：直读前先让最后一批提交
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
     try {
@@ -5424,7 +5479,7 @@ describe('postUpstreamChat 超时语义（B1：头超时不误伤长流，body �
 
   it('响应头已到后 body 慢速流动：不触发头超时', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(slowStreamBody([20, 20]), { status: 200 })));
-    const call = await postUpstreamChat(upCfg, makePool(), { model: 'deepseek-v4-flash' }, undefined, {}, '/v1/chat/completions', {
+    const call = await postUpstreamChat(upCfg, makePool(), { model: 'deepseek-v4-flash', stream: true }, undefined, {}, '/v1/chat/completions', {
       timeouts: { headerMs: 60, idleMs: 10_000 },
     });
     // 头超时 60ms：fetch 立即 resolve（远早于 60ms），头超时必须已撤下，
@@ -5434,12 +5489,12 @@ describe('postUpstreamChat 超时语义（B1：头超时不误伤长流，body �
     call.release();
   });
 
-  it('body 阶段空闲超时：超过 idleMs 无新数据 → 读取被中止', async () => {
+  it('body 阶段空闲超时（流式）：超过 idleMs 无新数据 → 读取被中止', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn((_url: string, init?: RequestInit) => new Response(slowStreamBody([20, 300], init?.signal), { status: 200 })),
     );
-    const call = await postUpstreamChat(upCfg, makePool(), { model: 'deepseek-v4-flash' }, undefined, {}, '/v1/chat/completions', {
+    const call = await postUpstreamChat(upCfg, makePool(), { model: 'deepseek-v4-flash', stream: true }, undefined, {}, '/v1/chat/completions', {
       timeouts: { headerMs: 10_000, idleMs: 100 },
     });
     const reader = call.response.body!.getReader();
@@ -5447,6 +5502,36 @@ describe('postUpstreamChat 超时语义（B1：头超时不误伤长流，body �
     expect(first.done).toBe(false);
     // 第二个 chunk 隔 300ms > idleMs=100：中途被 idle watchdog 掐断。
     await expect(reader.read()).rejects.toThrow('aborted by signal');
+    call.release();
+  });
+
+  it('非流式总超时：超过 totalMs 未完成 → 读取被中止（idle 不适用一次性 JSON）', async () => {
+    // 非流式（body.stream !== true）不用 idle watchdog，改用从请求起算的总超时。
+    // 这里 totalMs=100，第二个 chunk 隔 300ms —— 总超时先触发。
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) => new Response(slowStreamBody([20, 300], init?.signal), { status: 200 })),
+    );
+    const call = await postUpstreamChat(upCfg, makePool(), { model: 'deepseek-v4-flash' }, undefined, {}, '/v1/chat/completions', {
+      timeouts: { headerMs: 10_000, totalMs: 100 },
+    });
+    const reader = call.response.body!.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    // 非流式没有 idle 续命：totalMs=100 从请求起算，第二个 chunk 到不了就 abort。
+    await expect(reader.read()).rejects.toThrow('aborted by signal');
+    call.release();
+  });
+
+  it('非流式总超时比 idle 更宽：totalMs 内能读完的慢 body 不误杀', async () => {
+    // 生产非流式默认 totalMs=150s（比 idle 90s 宽）：两个 20ms chunk 在 totalMs 内
+    // 完成就正常返回；idle 对非流式不再生效（一次性 JSON 没有 chunk 续命语义）。
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(slowStreamBody([20, 20]), { status: 200 })));
+    const call = await postUpstreamChat(upCfg, makePool(), { model: 'deepseek-v4-flash' }, undefined, {}, '/v1/chat/completions', {
+      timeouts: { headerMs: 10_000, totalMs: 1_000 },
+    });
+    const text = await call.response.text();
+    expect(text).toContain('data:');
     call.release();
   });
 

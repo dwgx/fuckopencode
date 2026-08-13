@@ -8,6 +8,7 @@ import {
   resetDelayMsFromError,
   stripSecrets,
   RESET_CLAMP_MS,
+  UPSTREAM_TIMEOUT_ERROR,
   type AccountStatus,
 } from '../src/errors.js';
 import type { UpstreamFailureKind } from '../src/keypool.js';
@@ -218,6 +219,21 @@ describe('anthropicErrorToOpenAI 脱敏（m1：上游 key 明文不回显客户�
       error: { type: 'rate_limit_error', message: 'Weekly usage limit reached. Resets in 19hr 22min.' },
     });
     expect(err.body.error.message).toBe('Weekly usage limit reached. Resets in 19hr 22min.');
+  });
+});
+
+describe('UPSTREAM_TIMEOUT_ERROR（网关主动断开的超时文案）', () => {
+  it('文案是「上游响应超时」而非泛化 internal error（客户端可读）', () => {
+    expect(UPSTREAM_TIMEOUT_ERROR.message).toBe('upstream response timed out');
+    // 刻意与内部错误区分：超时是「上游挂了/太慢」，不是网关内部故障。
+    expect(UPSTREAM_TIMEOUT_ERROR.message).not.toBe('internal server error');
+    expect(UPSTREAM_TIMEOUT_ERROR.type).toBe('server_error');
+  });
+
+  it('该文案是给客户端看的（可经 sendJson 直接序列化）', () => {
+    const json = JSON.parse(JSON.stringify(UPSTREAM_TIMEOUT_ERROR)) as { message: string; type: string };
+    expect(json.message).toBe('upstream response timed out');
+    expect(json.type).toBe('server_error');
   });
 });
 

@@ -58,6 +58,15 @@ export function stripSecrets(value: string): string {
 /** 内部错误的固定响应文案：只进日志，绝不向调用方回显内部异常/配置细节。 */
 export const INTERNAL_SERVER_ERROR = { message: 'internal server error', type: 'server_error' };
 
+/**
+ * 上游响应超时（网关主动掐断 idle watchdog / 非流式总超时）的客户端文案。
+ *
+ * 为什么单独一条而不是用 INTERNAL_SERVER_ERROR：超时是「网关主动断开」不是
+ * 网关内部故障，客户端（Claude Code/curl）看到明确的「上游响应超时」能理解
+ * 是上游太慢/挂了，而不是网关出了问题。可读性是有意的（第二十三轮审计口径）。
+ */
+export const UPSTREAM_TIMEOUT_ERROR = { message: 'upstream response timed out', type: 'server_error' };
+
 // Anthropic 错误 type → OpenAI 常见 type。透传语义但收敛到 OpenAI 客户端认识的枚举。
 const TYPE_MAP: Record<string, string> = {
   invalid_request_error: 'invalid_request_error',
