@@ -118,6 +118,23 @@ OpenAI ↔ Anthropic 协议转换网关（上游 opencode Zen 订阅 + DeepSeek�
 - 生产 env 改 MAX_BODY_BYTES（P1-E）
 - 全面 review：对比本地 gateway 项目 + 本轮改动实用性 + 前端便捷功能
 
+## 七、review 波 2 结论 + 版本收尾（2026-08-14）
+
+**review 波 2（4 个并行：对比本地 gateway 项目 / 对抗式审查 / 实用性审视 / 前端便捷功能盘点）**：
+
+对抗式审查（reviewer）结论：无 BLOCKER。已修 MAJOR M-1（shutdown 关库推迟到 exitOnce——开头关库会让窗口期 recordRequest 落到 null 库丢行刷屏）+ MINOR m-1（预筛补 startoftext）/ m-2（聚合表 endpoint null 跳过，JS 与 SQL 口径对齐）/ m-3（max_tokens 抬升兼容 max_completion_tokens，防双字段并存 400）/ m-4（legacy 缓存条目存 ws，切换 workspace 不命中旧数据）/ m-5（并发门 503 记 ctx.error，finally 统一落观测）/ m-6（auth 哈希缓存上限 16 清空重建）/ m-7（UA 结果 Object.freeze）/ m-8（upsertTotals prepared 缓存）/ m-11（前端 TTL 门失败不打点，保留 2s 自愈）。m-9（模块级 exited）回退——防御性过度且污染测试；m-10（预筛词根宽、短路率低于宣称）记录不改（无正确性影响）。
+
+实用性审视：净价值约 60%——真正高价值 2 项（accounts allowedCache、upstream transient），中等 5 项，低价值 6 项（性能四项 µs 级/徽章/并发上限被盾 200 闸门稀释）。下一轮止损优先级：改线上 env MAX_BODY_BYTES → 面板用量 tab 三请求空转一行 gate → flush 整批丢弃重试 1 次。**引入的隐性回归已修**：legacy 前端 TTL 门曾挡死 2s 自愈（失败后 30s 不重试）。
+
+前端便捷功能（对比 cursorapi/windsurf/sub2api/kirostudio）候选，按价值：
+- **H1 tokens 批量创建「复制全部」**（数据已在 dataset.plain，纯前端 10 行）
+- **H2 账户上游 key 复制**（后端 1 端点 + keyRow 1 按钮——目前唯一无法从面板取回的密钥类型，用户点名）
+- H3 plain-overlay 明文完整展示 toggle；H4 legacy key 创建后展示明文 + 复制全部；H5 账户列表搜索 + kind/status 筛选；H6 URL 深链（hash）
+- M 级：请求明细 CSV 导出、总览趋势范围切换、详情区块折叠、错误重试按钮、accounts 手动刷新 + 上次同步时间
+- 中远期：批量账号操作条、批量文本导入账号、错误行动指引、账号状态标签增强（冷却倒计时/手动解除）、SSE 实时日志、半开恢复
+
+**版本收尾**：v0.2.0 已 tag + push + GitHub release（github.com/dwgx/fuckopencode/releases/tag/v0.2.0）。CI（.github/workflows/ci.yml，node 22/24 × typecheck+test+build）两轮全绿。commit：d359338（fix 审计轮）/ c856f3a（ci+版本 0.2.0）/ 088a31d（actions v5）。
+
 ### 观察项
 - OOM 修复完整周期验证（大 body >512KB 免克隆路径）。
 - 盾高并发内存；tokens WAL 持久性（曾丢一次，checkpoint 已加固）。
