@@ -4419,7 +4419,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     }).catch(function () { if (detailState.id !== id) return; detailErr('go', T('consoleUnavailable')); });
   }
 
-  /** Go 订阅区块：三窗口用量进度条 + 重置时间 + 开关。 */
+  /** Go 订阅区块：三窗口用量进度条 + 重置时间 + 开关。
+   *  窗口数据只有百分比 + 重置秒数（legacy.ts GoUsageWindow 无已用/限额数值），
+   *  按「每周 77% · 重置于 X」口径同行展示；超额（>100）钳到 100 画条。 */
   function renderGo(go, id, fromTick) {
     if (!clearSticky('go', fromTick)) return;
     // 窗口可能为 null（未订阅/解析失败）——渲染「—」，不崩（审查 H4）。
@@ -4427,13 +4429,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       if (!w || typeof w !== 'object') {
         return '<div class="go-row"><div class="go-l"><span class="go-label">' + label + '</span><span class="go-pct">—</span></div></div>';
       }
-      var pct = typeof w.usagePercent === 'number' ? w.usagePercent : 0;
+      var pct = typeof w.usagePercent === 'number' ? Math.max(0, Math.min(100, w.usagePercent)) : 0;
       var pctTxt = pct.toFixed(0) + '%';
-      var resetTxt = w.resetInSec > 0 ? T('goReset') + ' ' + hms(w.resetInSec * 1000) : '';
+      var resetTxt = w.resetInSec > 0 ? ' · ' + T('goReset') + ' ' + hms(w.resetInSec * 1000) : '';
       return '<div class="go-row">' +
-        '<div class="go-l"><span class="go-label">' + label + '</span><span class="go-pct">' + pctTxt + '</span></div>' +
+        '<div class="go-l"><span class="go-label">' + label + '</span>' +
+          '<span class="go-pct">' + pctTxt + '<span class="go-reset">' + resetTxt + '</span></span></div>' +
         '<div class="meter"><div class="meter-bg"><div class="meter-fill" style="width:' + pct + '%"></div></div></div>' +
-        '<div class="go-reset">' + resetTxt + '</div>' +
         '</div>';
     };
     var toggles =
