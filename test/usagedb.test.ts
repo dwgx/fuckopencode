@@ -94,6 +94,26 @@ describe('UsageDb 基础读写', () => {
     db.close();
   });
 
+  it('D-P2-1：count_tokens/探活 的未归属请求不计入 unattributed（与 totalRequests 同口径）', () => {
+    // count_tokens 请求落库时 keyFingerprint 为 '-'（server.ts 只设 endpoint），
+    // 修复前 unattributed 查询没有 endpoint 过滤，会把它们算进「未归属请求数」，
+    // 而 totalRequests 用的是 meta.unattrib（有过滤）→ 不变量 sum(byKey)+unattrib=total 被违反。
+    const db = new UsageDb(path.join(tmpDir, 'unattrib-noise.db'), 30, log);
+    db.recordRequest(row({ at: 1000, keyFingerprint: '', endpoint: 'count_tokens', status: 200 }));
+    db.recordRequest(row({ at: 2000, keyFingerprint: '', endpoint: 'probe', status: 429 }));
+    db.recordRequest(row({ at: 3000, keyFingerprint: '', endpoint: 'subscription', status: 503 }));
+
+    const h = db.history()!;
+    // 修复前：unattributedRequests=3（把 count_tokens/probe 也算进去了），
+    // totalRequests=1 → sum+unattrib=4 ≠ 1。
+    expect(h.unattributedRequests).toBe(1);
+    expect(h.unattributedFailed).toBe(1);
+    expect(h.totalRequests).toBe(1);
+    const sum = h.byKey.reduce((n, k) => n + k.requests, 0);
+    expect(sum + h.unattributedRequests).toBe(h.totalRequests);
+    db.close();
+  });
+
   it('ok / failed 按状态码分类', () => {
     const db = new UsageDb(path.join(tmpDir, 'usage.db'), 30, log);
     db.recordRequest(row({ at: 1, status: 200 }));
@@ -263,8 +283,33 @@ describe('UsageDb 基础读写', () => {
 });
 
 describe('UsageDb 保留期清理', () => {
-  it('删掉超过保留期的行，保留期内的不动', () => {
-    const db = new UsageDb(path.join(tmpDir, 'usage.db'), 1, log); // 保留 1 天
+  /** 只读连接直查 requests 表行数（绕过 UsageDb 读方法/缓存，断言真实删除）。 */
+  function requestCount(p: string): number {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string, opts?: { readOnly?: boolean }) => any;
+    };
+    const raw = new DatabaseSync(p, { readOnly: true });
+    const n = (raw.prepare('SELECT COUNT(*) AS n FROM requests').get() as { n: number }).n;
+    raw.close();
+    return n;
+  }
+
+  /** 只读连接直查 key_totals 的 fingerprint（P2-1：断言增量删后聚合表内容）。 */
+  function keyTotalsRows(p: string): Array<{ fingerprint: string; requests: number }> {
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string, opts?: { readOnly?: boolean }) => any;
+    };
+    const raw = new DatabaseSync(p, { readOnly: true });
+    const rows = raw
+      .prepare('SELECT fingerprint, requests FROM key_totals ORDER BY fingerprint')
+      .all() as Array<{ fingerprint: string; requests: number }>;
+    raw.close();
+    return rows;
+  }
+
+  it('删掉超过保留期的行，保留期内的不动（增量删聚合：key_totals 不清零，只删无窗口内请求的 key）', () => {
+    const p = path.join(tmpDir, 'usage.db');
+    const db = new UsageDb(p, 1, log); // 保留 1 天
     const now = 10 * 86_400_000;
     db.recordRequest(row({ at: now - 5 * 86_400_000 })); // 5 天前，该删
     db.recordRequest(row({ at: now - 2 * 86_400_000 })); // 2 天前，该删
@@ -276,9 +321,32 @@ describe('UsageDb 保留期清理', () => {
 
     expect(db.history()!.totalRequests).toBe(3);
     db.pruneNow(now);
-    const h = db.history()!;
-    expect(h.totalRequests).toBe(1);
-    expect(h.recentKeyEvents).toHaveLength(0);
+    // requests 明细：3 → 1（窗口内只剩 1 小时前那行）——prune 真的删了旧行。
+    expect(requestCount(p)).toBe(1);
+    // 聚合表是快照：窗口内仍有请求的 key（****0osU）保留，计数不清零
+    // （P2-1 增量删不整表重建的固有语义，重启后 migrate 重建回到精确窗口）。
+    expect(db.history()!.totalRequests).toBe(3);
+    expect(db.history()!.recentKeyEvents).toHaveLength(0);
+    db.close();
+  });
+
+  it('P2-1：prune 增量删 key_totals —— 窗口内仍有请求的 key 保留，仅窗口外请求的 key 删除', () => {
+    const p = path.join(tmpDir, 'prune-totals.db');
+    const db = new UsageDb(p, 1, log); // 保留 1 天
+    const now = 10 * 86_400_000;
+    // key A：窗口内（1 小时前）+ 窗口外（5 天前）都有请求 → prune 后保留。
+    db.recordRequest(row({ at: now - 5 * 86_400_000, keyFingerprint: '****keepA' }));
+    db.recordRequest(row({ at: now - 3_600_000, keyFingerprint: '****keepA' }));
+    // key B：只有窗口外请求（5 天前）→ prune 后删除。
+    db.recordRequest(row({ at: now - 5 * 86_400_000, keyFingerprint: '****dropB' }));
+    db.flush();
+    expect(keyTotalsRows(p).map((r) => r.fingerprint)).toEqual(['****dropB', '****keepA']);
+
+    db.pruneNow(now);
+    // 只删掉已无窗口内请求的 key（dropB）；keepA 因窗口内仍有请求而保留。
+    expect(keyTotalsRows(p).map((r) => r.fingerprint)).toEqual(['****keepA']);
+    // 保留的 key 计数是快照（2 条都 upsert 过，含已删的窗口外行，不清零）。
+    expect(keyTotalsRows(p)[0]!.requests).toBe(2);
     db.close();
   });
 
@@ -304,6 +372,40 @@ describe('UsageDb 保留期清理', () => {
     db.recordRequest(row({ at: 1 })); // 极旧
     db.pruneNow(100 * 86_400_000);
     expect(db.history()!.totalRequests).toBe(1);
+    db.close();
+  });
+
+  it('D-P2-2：rebuildTotals 非原子修复 —— 重建 INSERT 失败时 key_totals 不整表清空', () => {
+    const db = new UsageDb(path.join(tmpDir, 'rebuild-atomic.db'), 30, log);
+    db.recordRequest(row({ at: 1000, keyFingerprint: '****keep' }));
+    db.recordRequest(row({ at: 2000, keyFingerprint: '****keep' }));
+    db.flush();
+    expect(db.history()!.totalRequests).toBe(2);
+
+    // 让 rebuildTotals 的 INSERT 步骤抛错（模拟 SQLITE_BUSY/ENOSPC）。exec 是
+    // DatabaseSync 原型方法，直接替换实例引用即可拦到 this.db.exec。
+    // 关键：先执行 DELETE 部分再抛（模拟 SQLite 按语句 autocommit —— 旧实现里
+    // DELETE 已生效、INSERT 才失败），不能整串直接抛（那样 DELETE 也没跑过）。
+    const raw = db.sqlite()!;
+    const origExec = raw.exec.bind(raw);
+    let shouldFail = false;
+    raw.exec = ((sql: string) => {
+      if (shouldFail && /INSERT INTO key_totals/.test(sql)) {
+        origExec(sql.split('INSERT INTO key_totals')[0]!);
+        throw new Error('simulated ENOSPC');
+      }
+      return origExec(sql);
+    }) as typeof raw.exec;
+
+    shouldFail = true;
+    // prune 会走到 rebuildTotals（retention=30d 下 cutoff 为负，requests 不会被删）。
+    db.pruneNow(10 * 86_400_000);
+    shouldFail = false;
+    raw.exec = origExec;
+
+    // 修复前：DELETE 先提交、INSERT 失败 → key_totals 整表清空 → 聚合永久偏低。
+    // 修复后：BEGIN IMMEDIATE + ROLLBACK → 旧聚合保留。
+    expect(db.history()!.totalRequests).toBe(2);
     db.close();
   });
 });
@@ -362,6 +464,22 @@ describe('UsageDb 批量异步落库（热路径优化）', () => {
     expect(committedCount(p)).toBe(0);
     db.close();
     expect(committedCount(p)).toBe(1);
+  });
+
+  it('D-I3：close() 后 enabled=false，recordRequest/flush 不往已关闭句柄写、不刷错日志', () => {
+    const db = new UsageDb(path.join(tmpDir, 'close-enabled.db'), 30, log);
+    db.recordRequest(row({ at: 1 }));
+    db.close();
+    expect(db.enabled).toBe(false);
+    logs.length = 0;
+    // 修复前：enabled 仍为 true，recordRequest 入队后 flush() 会对已关闭的
+    // 句柄执行写库、每条刷一行「批量写入请求记录失败」。
+    db.recordRequest(row({ at: 2 }));
+    db.flush();
+    expect(logs).toHaveLength(0);
+    // 幂等：二次 close 直接早退，不抛、不刷日志。
+    expect(() => db.close()).not.toThrow();
+    expect(logs).toHaveLength(0);
   });
 
   it('读路径先 flush：recordRequest 后直接 listRequests 能看到（面板语义）', () => {
@@ -518,7 +636,15 @@ describe('UsageDb 账户 CRUD（多账号面板数据层）', () => {
     const inserted = db.insertAccount({ name: 'a', kind: 'unknown', keysEnc: '[]' });
     if (inserted === false) throw new Error('insert failed');
     const id = inserted;
-    db.close(); // 句柄关掉，后续执行必抛
+    // 模拟底层句柄故障（盘满/只读）但保持 enabled=true：prepare 抛错 →
+    // 写方法 catch 记日志返回 false、查询 catch 记日志返回 null，都不上抛。
+    // （D-I3 修复后 close() 会置 enabled=false，不能用「先 close 再操作」
+    //   来触发这条路径 —— 那是静默 no-op，不会走到 catch。）
+    const raw = db.sqlite()!;
+    const origPrepare = raw.prepare;
+    raw.prepare = () => {
+      throw new Error('simulated disk error');
+    };
     logs.length = 0;
 
     expect(() => db.insertAccount({ name: 'b', kind: 'unknown', keysEnc: '[]' })).not.toThrow();
@@ -530,6 +656,8 @@ describe('UsageDb 账户 CRUD（多账号面板数据层）', () => {
     expect(() => db.getAccount(id)).not.toThrow();
     expect(db.getAccount(id)).toBeNull();
     expect(logs.some((l) => l.includes('[usagedb]'))).toBe(true);
+    raw.prepare = origPrepare;
+    db.close();
   });
 
   it('降级实例（持久化关闭）：写 false、查 null', () => {
@@ -686,6 +814,68 @@ describe('UsageDb legacy_workspace_id 列（旧版控制台通道）', () => {
     // 幂等：再开一次（migrate 重复跑）不炸，列还在、数据还在。
     const db2 = new UsageDb(p, 30, log);
     expect(db2.getAccount(id)!.legacyWorkspaceId).toBe('wrk_01KZEQCBJ59Y3T34CSJNRVQJV7');
+    db2.close();
+  });
+});
+
+describe('UsageDb legacy_key_enc 列（旧版 Default API Key，zen usage 通道）', () => {
+  it('新库：建表即带 legacy_key_enc，roundtrip 读写（null 清除 + 互不干扰）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'lk.db'), 30, log);
+    const id = db.insertAccount({ name: 'a', kind: 'unknown', keysEnc: '[]' });
+    if (id === false) throw new Error('insert failed');
+    expect(db.getAccount(id)!.legacyKeyEnc).toBeNull();
+    expect(db.updateAccount(id, { legacyKeyEnc: '1:enc-legacy-key' })).toBe(true);
+    expect(db.getAccount(id)!.legacyKeyEnc).toBe('1:enc-legacy-key');
+    expect(db.updateAccount(id, { legacyKeyEnc: null })).toBe(true); // null = 置空
+    expect(db.getAccount(id)!.legacyKeyEnc).toBeNull();
+    // 与 legacy_cookie_enc 互不干扰
+    expect(db.updateAccount(id, { legacyCookieEnc: '1:enc-cookie' })).toBe(true);
+    expect(db.getAccount(id)!.legacyCookieEnc).toBe('1:enc-cookie');
+    expect(db.getAccount(id)!.legacyKeyEnc).toBeNull();
+    expect(db.updateAccount(9999, { legacyKeyEnc: '1:x' })).toBe(false);
+    db.close();
+  });
+
+  it('旧库迁移：无该列的 accounts 表打开即 ALTER，补列后读写正常（幂等）', () => {
+    const p = path.join(tmpDir, 'lk-old.db');
+    // 手工建一张早期版本的表（没有 legacy_key_enc），模拟线上已存在的旧库。
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string, opts?: { readOnly?: boolean }) => any;
+    };
+    const raw = new DatabaseSync(p);
+    raw.exec(`CREATE TABLE accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL DEFAULT 'account',
+      kind TEXT NOT NULL DEFAULT 'unknown',
+      workspace_id TEXT,
+      legacy_workspace_id TEXT,
+      legacy_cookie_enc TEXT,
+      keys_enc TEXT NOT NULL DEFAULT '[]',
+      cookie_enc TEXT,
+      oauth_refresh_enc TEXT,
+      status TEXT NOT NULL DEFAULT 'unknown',
+      status_detail TEXT,
+      retry_until INTEGER NOT NULL DEFAULT 0,
+      last_probe_at INTEGER NOT NULL DEFAULT 0,
+      last_billing_at INTEGER NOT NULL DEFAULT 0,
+      balance_units INTEGER,
+      monthly_limit_units INTEGER,
+      monthly_usage_units INTEGER,
+      created_at INTEGER NOT NULL
+    );`);
+    raw.close();
+
+    const db = new UsageDb(p, 30, log);
+    expect(db.enabled).toBe(true);
+    const id = db.insertAccount({ name: 'a', kind: 'unknown', keysEnc: '[]' });
+    if (id === false) throw new Error('insert failed');
+    expect(db.updateAccount(id, { legacyKeyEnc: '1:legacy-key-enc' })).toBe(true);
+    expect(db.getAccount(id)!.legacyKeyEnc).toBe('1:legacy-key-enc');
+    db.close();
+
+    // 幂等：再开一次（migrate 重复跑）不炸，列还在、数据还在。
+    const db2 = new UsageDb(p, 30, log);
+    expect(db2.getAccount(id)!.legacyKeyEnc).toBe('1:legacy-key-enc');
     db2.close();
   });
 });
@@ -1192,6 +1382,72 @@ describe('usageByKeyFingerprints 网关实际用量归属', () => {
   });
 });
 
+describe('UsageDb 聚合缓存引用安全（D-P2-4）', () => {
+  it('tokenUsageAll 缓存命中返回副本：调用方改 value 不污染缓存', () => {
+    const db = new UsageDb(path.join(tmpDir, 'token-cache.db'), 30, log);
+    db.recordRequest(row({ at: 1000, tokenFp: 'abc123' }));
+
+    const first = db.tokenUsageAll();
+    expect(first.get('abc123')?.requests).toBe(1);
+    // 缓存窗口内（10s）第二次调用命中缓存。修复前返回的就是内部缓存 Map 本体，
+    // 改动 value 会污染缓存，后续所有读取（含历史数据）都变 999。
+    first.get('abc123')!.requests = 999;
+
+    const second = db.tokenUsageAll();
+    expect(second).not.toBe(first);
+    expect(second.get('abc123')?.requests).toBe(1);
+    db.close();
+  });
+});
+
+describe('UsageDb 聚合缓存返回副本（I-15）', () => {
+  it('history 缓存命中返回副本：改 byKey/recentKeyEvents 不污染缓存', () => {
+    const db = new UsageDb(path.join(tmpDir, 'hist-cache.db'), 30, log);
+    db.recordRequest(row({ at: 1000, keyFingerprint: '****0osU' }));
+    const first = db.history()!;
+    expect(first.byKey[0]!.requests).toBe(1);
+    // 缓存窗口内（15s）第二次调用命中缓存。修复前返回内部缓存本体，
+    // 改 byKey 元素/往 recentKeyEvents push 会污染缓存，后续读取全变。
+    first.byKey[0]!.requests = 999;
+    first.recentKeyEvents.push({ at: 1, fingerprint: 'x', type: 'disabled', kind: null, cooldownMs: null });
+    const second = db.history()!;
+    expect(second).not.toBe(first);
+    expect(second.byKey[0]!.requests).toBe(1);
+    expect(second.recentKeyEvents).toHaveLength(0);
+    db.close();
+  });
+
+  it('usageTrend 缓存命中返回副本：改 items/顶层 totals 不污染缓存', () => {
+    const db = new UsageDb(path.join(tmpDir, 'trend-cache.db'), 30, log);
+    const now = 1_700_000_000_000;
+    db.recordRequest(row({ at: now, inputTokens: 10, status: 200 }));
+    const t1 = db.usageTrend(1, now)!;
+    expect(t1.requests).toBe(1);
+    t1.requests = 999;
+    t1.items[23]!.requests = 999;
+    const t2 = db.usageTrend(1, now + 1)!; // 同一缓存窗口
+    expect(t2).not.toBe(t1);
+    expect(t2.requests).toBe(1);
+    expect(t2.items[23]!.requests).toBe(1);
+    db.close();
+  });
+
+  it('statsByIp 返回的元素是副本：改 items 元素不污染缓存', () => {
+    const db = new UsageDb(path.join(tmpDir, 'ipstat-cache.db'), 30, log);
+    db.recordRequest(row({ at: 1000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
+    const p1 = db.statsByIp(1, 20)!;
+    expect(p1.items[0]!.requests).toBe(1);
+    // 缓存窗口内（10s）第二次调用命中缓存。修复前元素是缓存内同一对象，
+    // 改 requests/clients 会污染缓存内所有后续读取。
+    p1.items[0]!.requests = 999;
+    p1.items[0]!.clients.push('Fake');
+    const p2 = db.statsByIp(1, 20)!;
+    expect(p2.items[0]!.requests).toBe(1);
+    expect(p2.items[0]!.clients).toEqual(['Claude Code']);
+    db.close();
+  });
+});
+
 describe('requests 表 ip / cost_micro_cents 列', () => {
   it('落库与读取：listRequests 返回 ip；cost 累计进 usageByKeyFingerprints', () => {
     const db = new UsageDb(path.join(tmpDir, 'ipcol.db'), 30, log);
@@ -1232,6 +1488,89 @@ describe('requests 表 ip / cost_micro_cents 列', () => {
     const usage = db.tokenUsageAll();
     expect(usage.get('abc123')?.requests).toBe(1);
     db.close();
+  });
+});
+
+describe('requests 表 api_key_fp 列（D-I4）', () => {
+  it('新库建表即含 api_key_fp（CREATE TABLE 自带，不依赖补列 ALTER），roundtrip 落库', () => {
+    // 修复前：新库 DDL 没有 api_key_fp，靠 ensureRequestsColumns 的 ALTER 补。
+    // 若 ALTER 失败，insertRequest 的 prepare 引用不存在的列 → 整库降级 disabled，
+    // 与「补列失败只记日志」的承诺不符。修复后：DDL 自带该列，ALTER 只服务旧库。
+    const db = new UsageDb(path.join(tmpDir, 'api-key-fp-new.db'), 30, log);
+    expect(db.enabled).toBe(true);
+    const cols = db.sqlite()!.prepare('PRAGMA table_info(requests)').all() as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === 'api_key_fp')).toBe(true);
+    // roundtrip：api_key_fp 落库可读。
+    db.recordRequest(row({ at: 1000, apiKeyFp: 'aabbccddeeff' }));
+    db.flush();
+    const raw = db.sqlite()!.prepare('SELECT api_key_fp FROM requests LIMIT 1').get() as { api_key_fp: string | null };
+    expect(raw.api_key_fp).toBe('aabbccddeeff');
+    db.close();
+  });
+
+  it('新库补列 ALTER 失败不拖垮整库（DDL 自带列 → 根本不会发 ALTER）', () => {
+    // 模拟 node:sqlite 的 exec 在补 api_key_fp 列的 ALTER 上抛错。修复前该 ALTER
+    // 一定会发（新库缺列）且失败后 insertRequest prepare 级联失败 → enabled=false。
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string) => any;
+    };
+    const proto = DatabaseSync.prototype;
+    const origExec = proto.exec;
+    const spy = vi.spyOn(proto, 'exec').mockImplementation(function (this: any, sql: unknown) {
+      if (typeof sql === 'string' && /ALTER TABLE requests ADD COLUMN api_key_fp/.test(sql)) {
+        throw new Error('simulated ALTER failure');
+      }
+      return origExec.call(this, sql);
+    });
+    try {
+      const db = new UsageDb(path.join(tmpDir, 'api-key-fp-ddl.db'), 30, log);
+      expect(db.enabled).toBe(true); // 修复前这里会是 false（级联 prepare 失败）
+      db.recordRequest(row({ at: 1000, apiKeyFp: 'x' }));
+      expect(db.history()!.totalRequests).toBe(1);
+      db.close();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('旧库缺 api_key_fp 列 + ALTER 失败 → 降级 INSERT 不拖垮整库（对抗审查 M-1）', () => {
+    // 真实旧库升级路径：requests 表已存在且无 api_key_fp 列（老 schema），
+    // ensureRequestsColumns 必须发 ALTER；ALTER 失败（部署重叠 busy）时 insertRequest
+    // 的 prepare 引用缺失列本会级联整库 disabled。修复后：每列单独补 + api_key_fp
+    // 重试一次 + prepare 回退 18 列降级 INSERT，库照常可用（只丢 api_key_fp 数据）。
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string) => any;
+    };
+    const legacyPath = path.join(tmpDir, 'api-key-fp-legacy.db');
+    // 先建一个不含 api_key_fp 的旧 schema requests 表（其余表由 migrate 自动建）。
+    const raw = new DatabaseSync(legacyPath);
+    raw.exec(`CREATE TABLE IF NOT EXISTS requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      at INTEGER NOT NULL, key_fp TEXT NOT NULL, model TEXT, upstream_model TEXT,
+      endpoint TEXT, status INTEGER, duration_ms INTEGER, stream INTEGER,
+      input_tokens INTEGER, output_tokens INTEGER, thinking_tokens INTEGER,
+      error TEXT, path TEXT, ua TEXT, client TEXT, ip TEXT, cost_micro_cents INTEGER,
+      token_fp TEXT
+    )`);
+    raw.close();
+    const proto = DatabaseSync.prototype;
+    const origExec = proto.exec;
+    const spy = vi.spyOn(proto, 'exec').mockImplementation(function (this: any, sql: unknown) {
+      if (typeof sql === 'string' && /ALTER TABLE requests ADD COLUMN api_key_fp/.test(sql)) {
+        throw new Error('simulated ALTER failure');
+      }
+      return origExec.call(this, sql);
+    });
+    try {
+      const db = new UsageDb(legacyPath, 30, log);
+      expect(db.enabled).toBe(true); // 修复前：prepare 级联失败 → false
+      db.recordRequest(row({ at: 1000, apiKeyFp: 'x' }));
+      db.flush();
+      expect(db.history()!.totalRequests).toBe(1);
+      db.close();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
@@ -1315,7 +1654,9 @@ describe('UsageDb 真实趋势聚合（usageTrend）', () => {
     db.recordRequest(row({ at: hourStart, status: 200 }));
     const t1 = db.usageTrend(1, hourStart + H)!;
     const t2 = db.usageTrend(1, hourStart + H + 1)!; // 同一缓存窗口
-    expect(t2).toBe(t1);
+    // I-15 修复后返回副本：内容相等但引用不同（原来 `toBe(t1)` 断言内部缓存引用）。
+    expect(t2).toEqual(t1);
+    expect(t2).not.toBe(t1);
     // 缓存过期后（>10s）重新查询。
     const t3 = db.usageTrend(1, hourStart + H + 11_000)!;
     expect(t3).not.toBeNull();

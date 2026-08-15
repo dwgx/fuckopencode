@@ -4,15 +4,21 @@
  * 用途：网关可生成多个客户端用 key（走共享上游池，不绑定账号），管理端可
  * 增删改禁、按 token 看用量（请求数 / tokens / 上游记账费用）。
  *
- * # 安全设计：明文不落库，只存指纹
+ * # 安全设计：校验靠指纹，明文加密供面板取回
  *
- * - token 形如 `tk-` + 64 hex（32 字节随机，256-bit 熵）。
- * - 库里只存 `fingerprint = sha256(token)` 前 24 hex（96-bit，不可逆）。
- * - 校验 = 算客户端 token 的指纹 → 查表（active）→ 命中即放行，**全程无解密**。
- *   指纹 96-bit 下碰撞概率可忽略，且 fingerprint UNIQUE 约束兜底。
- * - token 明文**只在创建响应里出现一次**；此后管理端只能看到掩码
- *   （`tk-****` + 指纹末 8 位，可辨认不可逆推）。
- * - tokens 表的 token_enc 列按 DDL 保留但恒为 NULL（见 usagedb.ts 注释）。
+ * - token 形如 `tk-` + 64 hex（32 字节随机，256-bit 熵），或用户自定义
+ *   （如 `sk-...`，强度由创建方自担 —— 见 create 的长度校验）。
+ * - 库里存 `fingerprint = sha256(token)` 前 24 hex（96-bit，不可逆），
+ *   校验/用量聚合都以指纹为键。
+ * - 校验 = 算客户端 token 的指纹 → 查表（active）→ 命中即放行。指纹
+ *   96-bit 下碰撞概率可忽略，且 fingerprint UNIQUE 约束兜底。
+ * - `token_enc` 列：**加密存储 token 明文**（aes-256-gcm，`1:...` 格式，
+ *   同 accounts 的 cookie/keys），供面板「查看/复制」用 plainOf 解密取回、
+ *   以及老 token 补录明文。secret 不可用时创建时存 NULL —— 此时只存指纹，
+ *   明文仅创建响应出现一次，面板无法取回。
+ * - 随机 token 明文**只在创建响应里出现一次**；此后管理端只能看到掩码
+ *   （`tk-****` + 指纹末 8 位，可辨认不可逆推）。自定义 key 因显式提供、
+ *   又加密落了库，创建后仍可经 plainOf 取回。
  *
  * # 鉴权接线
  *
@@ -131,10 +137,31 @@ export class TokensStore {
   private readonly secret: SecretKey | null;
 
   /** verify 的 prepared statement（P1-7）：数据面每分发 token 请求都调 verify，
-   *  prepared 缓存避免每请求一次同步 prepare（38µs→2.3µs）。null = db 不可用。 */
+   *   prepared 缓存避免每请求一次同步 prepare（38µs→2.3µs）。null = db 不可用。 */
   private readonly verifyStmt: ReturnType<UsageDb['sqlite']> extends null
     ? null
     : ReturnType<NonNullable<ReturnType<UsageDb['sqlite']>>['prepare']> | null;
+
+  /**
+   * verify 结果缓存（P2-4 热路径优化）：数据面每分发 token 请求都调 verify，
+   * 即使走 prepared 点查仍是一次同步查库。**只缓存命中且 active 的结果**；
+   * miss/disabled 不入缓存 —— 新建 token 立即生效、禁用立即生效（不缓存
+   * 负面结果就不会有 10s 的「新 key 401 / 禁用还放行」幽灵）。
+   * 写操作（update 改 status/rpmLimit、delete）成功后即时失效。
+   * 降级：缓存读写异常一律回退直接查询（缓存绝不能拖垮校验）。
+   */
+  private verifyCache = new Map<string, { rpmLimit: number; expiresAt: number }>();
+
+  /** verify 缓存 TTL：10 秒（管理写操作即时失效，TTL 只是兜底窗口）。 */
+  static readonly VERIFY_CACHE_TTL_MS = 10_000;
+
+  private invalidateVerifyCache(fingerprint: string): void {
+    try {
+      this.verifyCache.delete(fingerprint);
+    } catch {
+      // 缓存异常不影响校验正确性。
+    }
+  }
 
   constructor(db: UsageDb | null, secret: SecretKey | null = null) {
     this.enabled = db != null && db.enabled;
@@ -220,6 +247,15 @@ export class TokensStore {
     if (customKey != null && customKey.trim() !== '') {
       // 自定义 key 值（用户提供，如 sk-dwgxnbnb）：指纹存储同随机，明文不落库。
       const key = customKey.trim();
+      // P2-2：自定义 key 低熵防护。短 key + 96-bit 指纹 = 可离线枚举爆破
+      // （攻击者枚举候选 key、算指纹对表）。去掉 sk-/tk- 前缀后不足 16 位
+      // 就拒绝。**自定义 key 需自行保证强度**——网关只校验长度下限，不做
+      // 熵检测（sk- 开头的 key 往往来自别处，命中即复用之）。
+      const bare = key.replace(/^(sk|tk)-/i, '');
+      if (bare.length < 16) {
+        console.warn('[tokens] 自定义 key 过短被拒绝（去前缀后至少 16 位）');
+        return { ok: false };
+      }
       const fingerprint = fingerprintOf(key);
       const prefix = key.slice(0, 2).toLowerCase();
       const enc = this.secret ? this.secret.encrypt(key) : null;
@@ -293,9 +329,17 @@ export class TokensStore {
     try {
       // 先验存在性再 UPDATE：SQLite 的 changes 只统计值实际被改的行，
       // 对不存在的 id 更新 0 行会被误判为成功（与 updateAccount 同一思路）。
-      if (!this.raw.prepare('SELECT 1 FROM tokens WHERE id = ?').get(id)) return 'missing';
+      // 顺手取指纹：status/rpmLimit 变化时失效 verify 缓存（改 name/note/
+      // tokenPlain 不影响校验结果，不失效）。
+      const fpRow = this.raw.prepare('SELECT fingerprint FROM tokens WHERE id = ?').get(id) as
+        | { fingerprint?: string }
+        | undefined;
+      if (!fpRow) return 'missing';
       vals.push(id);
       this.raw.prepare(`UPDATE tokens SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+      if (patch.status !== undefined || patch.rpmLimit !== undefined) {
+        this.invalidateVerifyCache(String(fpRow.fingerprint));
+      }
       return 'ok';
     } catch (err) {
       console.warn(`[tokens] 更新失败（id=${id}）: ${err instanceof Error ? err.message : err}`);
@@ -307,7 +351,13 @@ export class TokensStore {
   delete(id: number): boolean {
     if (!this.enabled) return false;
     try {
+      // 删除前取指纹：删掉后 verify 缓存里该 token 必须即时失效，否则
+      // 10s 内缓存仍放行已删除 token（管理面删 key 应立即生效）。
+      const fpRow = this.raw.prepare('SELECT fingerprint FROM tokens WHERE id = ?').get(id) as
+        | { fingerprint?: string }
+        | undefined;
       this.raw.prepare('DELETE FROM tokens WHERE id = ?').run(id);
+      if (fpRow?.fingerprint) this.invalidateVerifyCache(String(fpRow.fingerprint));
       return true;
     } catch (err) {
       console.warn(`[tokens] 删除失败（id=${id}）: ${err instanceof Error ? err.message : err}`);
@@ -320,6 +370,11 @@ export class TokensStore {
    * 数据面入口每次请求都查一次 —— fingerprint UNIQUE 索引，一次点查。
    * 校验路径在 endpoints 层做，这里只做存储语义：非正数统一归一 0
    * （脏数据不产生「负数限流」这类意外行为）。
+   *
+   * **生产数据面已不再调用**：`verify` 的 prepared 语句同一次点查就把
+   * rpm_limit 一起取回（见 `verifyStmt`，少一次同步查询）。本方法保留
+   * 给测试回归（断言热路径不再单独查）+ 库消费者按需读取，语义与 verify
+   * 归一化完全一致（同一套 `normalizeRpmLimit`）。
    */
   getRpmLimit(fingerprint: string): number {
     if (!this.enabled) return 0;
@@ -342,13 +397,35 @@ export class TokensStore {
    * 同步点查。rpmLimit 归一化与 getRpmLimit 完全一致（非正整数归 0，
    * rpm_limit=0 语义不变 = 不限流）。
    * **全程无解密**；db 不可用恒返回失败（fail-closed）。
+   * P2-4：10s TTL 内存缓存兜住高频重复校验（只缓存命中，见 verifyCache）。
    */
   verify(token: string): { ok: true; fingerprint: string; rpmLimit: number } | { ok: false } {
     if (!this.enabled || !this.verifyStmt) return { ok: false };
     const fingerprint = fingerprintOf(token);
+    // 缓存命中：跳过查库。只缓存命中结果，miss 不缓存（见 verifyCache 注释）。
+    try {
+      const cached = this.verifyCache.get(fingerprint);
+      if (cached) {
+        if (cached.expiresAt > Date.now()) {
+          return { ok: true, fingerprint, rpmLimit: cached.rpmLimit };
+        }
+        this.verifyCache.delete(fingerprint);
+      }
+    } catch {
+      // 缓存异常回退直接查询（降级）。
+    }
     try {
       const row = this.verifyStmt.get(fingerprint) as { status: string; rpm_limit?: unknown } | undefined;
-      return row ? { ok: true, fingerprint, rpmLimit: normalizeRpmLimit(row.rpm_limit) } : { ok: false };
+      if (row) {
+        const rpmLimit = normalizeRpmLimit(row.rpm_limit);
+        try {
+          this.verifyCache.set(fingerprint, { rpmLimit, expiresAt: Date.now() + TokensStore.VERIFY_CACHE_TTL_MS });
+        } catch {
+          // 缓存写失败忽略，下次直接查库。
+        }
+        return { ok: true, fingerprint, rpmLimit };
+      }
+      return { ok: false };
     } catch (err) {
       console.warn(`[tokens] 校验查询失败: ${err instanceof Error ? err.message : err}`);
       return { ok: false };

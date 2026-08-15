@@ -713,6 +713,71 @@ describe('Bearer fallback（OAuth 账号无 cookie 也能读控制台数据）',
     expect(client.cookieStatus(1)).toBe('invalid');
   });
 
+  it('OAuth 修复：缓存 access 被上游 401 作废 → 清 accessCache 后自动 refresh 自愈', async () => {
+    // 2026-08-15 实测：access_token 被上游作废（rt 轮换后旧 access 失效），
+    // 缓存命中用旧 access 打上游恒 401 → invalid 永久（直到重启清 accessCache），
+    // 而 rt 本身有效（keyprobe 直接 refresh 成功）。修复：401/403 清 accessCache，
+    // 下次 getCredentials 无缓存 → 用 rt refresh → 成功清 invalid 自愈。
+    let refreshCalls = 0;
+    let apiStatus = 401;
+    const { f, reqs } = fakeFetch(async (req) => {
+      if (String(req.url).includes('/auth/device/token')) {
+        refreshCalls++;
+        return jsonResponse(200, { access_token: 'at-' + refreshCalls, refresh_token: 'rt-' + refreshCalls });
+      }
+      if (apiStatus === 401) return jsonResponse(401, { error: { type: 'AuthError', message: 'Invalid API key.' } });
+      return jsonResponse(200, { balanceMicroCents: '100000000' });
+    });
+    const accounts: ConsoleAccounts = {
+      cookieOf: () => null,
+      workspaceIdOf: () => 'ws-1',
+      getOauthRefresh: () => 'rt-1',
+      setOauthRefresh: () => true,
+    };
+    const client = new ConsoleClient(cfg(), accounts, log, { fetchImpl: f });
+    // 第一次：refresh（rt-1 → at-1 缓存）→ 上游 401（at-1 已作废）→ invalid + accessCache 清
+    expect(await client.billingStatus(1)).toBeNull();
+    expect(refreshCalls).toBe(1);
+    expect(client.cookieStatus(1)).toBe('invalid');
+    // 第二次：accessCache 已清 → 重新 refresh（rt-1 → at-2）→ 上游 200 → 恢复 ok
+    apiStatus = 200;
+    const data = await client.billingStatus(1);
+    expect(data).toEqual({ balanceMicroCents: '100000000' });
+    expect(refreshCalls).toBe(2);
+    expect(client.cookieStatus(1)).toBe('ok');
+    // 修复前：401 不清 accessCache → 第二次仍用 at-1 → 再 401 → refreshCalls 仍是 1
+    const apiReqs = reqs.filter((r) => r.url.includes('/api/billing/status'));
+    expect(apiReqs.length).toBe(2); // 401 一次 + 200 一次（第二次确实重打了上游）
+  });
+
+  it('OAuth 修复：invalid 标记后成功 refresh 必须清除（防 oauth-invalid 死锁）', async () => {
+    // 2026-08-15 实测：账号 6 曾因一次历史 refresh 失败被标 oauth-invalid，
+    // 而 invalid 状态下 billing/usage 端点「不打上游直接给空」→ 不触发 refresh
+    // → invalid 永不更新（refresh 实际有效但面板永远报 OAuth expired）。修复：
+    // doRefresh 成功路径清除 invalid 标记，下一次 tick 恢复正常通道。
+    let failFirst = true;
+    const accounts: ConsoleAccounts = {
+      cookieOf: () => null,
+      workspaceIdOf: () => 'ws-1',
+      getOauthRefresh: () => 'rt-1',
+      setOauthRefresh: () => true,
+    };
+    const { f } = fakeFetch(async () => {
+      if (failFirst) {
+        failFirst = false;
+        return jsonResponse(401, {});
+      }
+      return jsonResponse(200, { access_token: 'at-2', refresh_token: 'rt-2' });
+    });
+    const client = new ConsoleClient(cfg(), accounts, log, { fetchImpl: f });
+    expect(await client.billingStatus(1)).toBeNull();
+    expect(client.cookieStatus(1)).toBe('invalid');
+    // 下一次调用：refresh 成功 → invalid 必须清除，数据返回
+    const data = await client.billingStatus(1);
+    expect(data).not.toBeNull();
+    expect(client.cookieStatus(1)).toBe('ok');
+  });
+
   it('refresh 响应缺 access_token → null（不透传空 token）', async () => {
     const accounts: ConsoleAccounts = {
       cookieOf: () => null,

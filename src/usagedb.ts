@@ -82,6 +82,12 @@ export interface UsageRow {
    * （null）——只有走分发 token 的请求才落这一列，供按 token 聚合用量。
    */
   tokenFp?: string | null;
+  /**
+   * API 客户端凭据的指纹（sha256 全 hex，见 security/auth.ts）。分发 token /
+   * 免鉴权请求不传（null）——只有走 API_KEYS 鉴权的请求才落这一列，
+   * 供按客户端凭据归因模型授权拒绝（MODEL-ACCESS）。
+   */
+  apiKeyFp?: string | null;
 }
 
 /**
@@ -222,6 +228,8 @@ export interface AccountRow {
   keysEnc: string;
   cookieEnc: string | null;
   legacyCookieEnc: string | null;
+  /** 旧版 Default API Key 的密文（AES-256-GCM，`1:...` 格式）；zen usage JSON API 用。 */
+  legacyKeyEnc: string | null;
   /** OAuth refresh_token 的密文（AES-256-GCM，`1:...` 格式）。access_token 从不落库。 */
   oauthRefreshEnc: string | null;
   /**
@@ -250,6 +258,7 @@ export interface InsertAccountParams {
   keysEnc: string;
   cookieEnc?: string | null;
   legacyCookieEnc?: string | null;
+  legacyKeyEnc?: string | null;
   allowedModels?: string[] | null;
   status?: string;
   statusDetail?: string | null;
@@ -273,6 +282,7 @@ export interface AccountUpdate {
   keysEnc?: string;
   cookieEnc?: string | null;
   legacyCookieEnc?: string | null;
+  legacyKeyEnc?: string | null;
   oauthRefreshEnc?: string | null;
   allowedModels?: string[] | null;
   status?: string;
@@ -377,13 +387,32 @@ function classifyDbFailure(detail: string): string {
 }
 
 /**
+ * history() 结果的对外副本（I-15）：`{...h}` 只复制顶层，byKey/recentKeyEvents
+ * 里的元素对象仍是缓存内共享引用，调用方改元素照样污染缓存 —— 每层都要复制。
+ */
+function cloneHistory(h: UsageHistory): UsageHistory {
+  return {
+    ...h,
+    byKey: h.byKey.map((k) => ({ ...k })),
+    recentKeyEvents: h.recentKeyEvents.map((e) => ({ ...e })),
+  };
+}
+
+/** usageTrend 结果的对外副本（I-15）：items 的桶对象要逐层复制。 */
+function cloneTrend(t: UsageTrend): UsageTrend {
+  return { ...t, items: t.items.map((it) => ({ ...it })) };
+}
+
+/**
  * 用量库。构造**永不抛**：任何失败都退化成 `enabled === false` 的 no-op 实例。
  */
 export class UsageDb {
-  /** 持久化是否真的可用。false = 所有方法都是空操作。 */
-  readonly enabled: boolean;
+  /** 持久化是否真的可用。false = 所有方法都是空操作。close() 后也会置 false。 */
+  enabled: boolean;
   private db: any = null;
   private insertRequest: any = null;
+  /** insertRequest 的参数个数（19 含 api_key_fp / 18 降级，见 D-I4）。 */
+  private insertRequestArity = 19;
   private insertKeyEvent: any = null;
   private insertAdminAuditStmt: any = null;
   /** key_totals 增量 upsert（flush 每 100ms 调用，prepared 缓存免重复 prepare）。 */
@@ -484,13 +513,29 @@ export class UsageDb {
       // 文件会涨到几百 MB 且不缩。设个上限，checkpoint 后把超出部分还给文件系统。
       this.db.exec('PRAGMA journal_size_limit = 16777216');
       this.migrate();
-      this.insertRequest = this.db.prepare(
-        `INSERT INTO requests
-           (at, key_fp, model, upstream_model, endpoint, status, duration_ms, stream,
-            input_tokens, output_tokens, thinking_tokens, error, path, ua, client, ip,
-            cost_micro_cents, token_fp)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
+      // D-I4：旧库升级路径——api_key_fp 的 ALTER 若失败（部署重叠 busy 等），
+      // prepare 引用缺失列会把整库拖成 disabled（与「补列失败只记日志」承诺不符）。
+      // 回退到不含 api_key_fp 的 18 列降级 INSERT，该列数据丢弃，库照常可用。
+      try {
+        this.insertRequest = this.db.prepare(
+          `INSERT INTO requests
+             (at, key_fp, model, upstream_model, endpoint, status, duration_ms, stream,
+              input_tokens, output_tokens, thinking_tokens, error, path, ua, client, ip,
+              cost_micro_cents, token_fp, api_key_fp)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        this.insertRequestArity = 19;
+      } catch (err) {
+        this.log(`[usagedb] api_key_fp 列不可用，回退降级 INSERT（丢该列数据）: ${err instanceof Error ? err.message : String(err)}`);
+        this.insertRequest = this.db.prepare(
+          `INSERT INTO requests
+             (at, key_fp, model, upstream_model, endpoint, status, duration_ms, stream,
+              input_tokens, output_tokens, thinking_tokens, error, path, ua, client, ip,
+              cost_micro_cents, token_fp)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        this.insertRequestArity = 18;
+      }
       this.insertKeyEvent = this.db.prepare(
         `INSERT INTO key_events
            (at, key_fp, type, kind, cooldown_ms, healthy_count, pool_size)
@@ -540,7 +585,8 @@ export class UsageDb {
         error TEXT,
         path TEXT, ua TEXT, client TEXT,
         ip TEXT, cost_micro_cents INTEGER,
-        token_fp TEXT
+        token_fp TEXT,
+        api_key_fp TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_requests_key_at ON requests(key_fp, at);
       CREATE INDEX IF NOT EXISTS idx_requests_at ON requests(at);
@@ -590,6 +636,7 @@ export class UsageDb {
         kind TEXT NOT NULL DEFAULT 'unknown',          -- subscription | payg | unknown（TS 侧收敛）
         workspace_id TEXT,                             -- opencode.ai workspace id，可空
         legacy_workspace_id TEXT,                      -- 旧版控制台（wrk_ 前缀）workspace id，可空
+        legacy_key_enc TEXT,                           -- 旧版 Default API Key 密文（zen usage JSON API 用），可空
         keys_enc TEXT NOT NULL DEFAULT '[]',           -- 整体一个密文串：encrypt(JSON.stringify([key...]))
         cookie_enc TEXT,                               -- 加密后的 auth cookie 原文，可空
         oauth_refresh_enc TEXT,                        -- 加密后的 OAuth refresh_token（access_token 从不落库）
@@ -630,6 +677,20 @@ export class UsageDb {
         created_at INTEGER NOT NULL
       );
 
+      -- 密钥-模型授权（MODEL-ACCESS.md）：管理「哪个密钥可以生成哪个模型」。
+      -- 行存在 = 该密钥配了自定义授权；删行 = 清除自定义、回退全局/账号层。
+      -- 三类 subject：token（复用 tokens.fingerprint）/ api-key / upstream-key
+      -- （后两者用 sha256(key) 全 hex，绝不落明文）。小表、UNIQUE 即查询键，
+      -- 不建多余索引（与 model_aliases 同哲学）。
+      CREATE TABLE IF NOT EXISTS model_access (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject_type TEXT NOT NULL,   -- 'token' | 'api-key' | 'upstream-key'
+        subject_id   TEXT NOT NULL,   -- token=指纹；api-key/upstream-key=sha256 全 hex
+        models       TEXT NOT NULL,   -- JSON 数组（非空；行存在 = 已配置自定义）
+        updated_at   INTEGER NOT NULL,
+        UNIQUE(subject_type, subject_id)
+      );
+
       -- 按 key 累计用量聚合表（P1-F）：history() 的 byKey 段原来每次都是
       -- 全表 GROUP BY（150K 行 p50=646ms、60 万行最坏 10s，期间所有在飞 SSE
       -- 冻住）；15s 缓存只降频不降耗。现在 flush 在**同一事务**里 upsert 本
@@ -652,6 +713,7 @@ export class UsageDb {
     this.ensureOauthColumn();
     this.ensureLegacyWorkspaceColumn();
     this.ensureLegacyCookieColumn();
+    this.ensureLegacyKeyColumn();
     this.ensureAllowedModelsColumn();
     // requests 表补详细请求列（path/ua/client）。补列失败只记日志：历史聚合
     // 不依赖这三列；失败时 listRequests 会因缺列走 catch 返回 null（503），
@@ -717,15 +779,37 @@ export class UsageDb {
     try {
       const cols = this.db.prepare('PRAGMA table_info(requests)').all() as Array<{ name: string }>;
       const names = new Set(cols.map((c) => c.name));
-      for (const col of ['path', 'ua', 'client', 'ip', 'token_fp']) {
+      // api_key_fp（MODEL-ACCESS）：API 客户端凭据的 sha256 指纹，审计归因用
+      // （token 已有 token_fp；免鉴权/分发 token 调用为 null）。
+      // 每列单独补（D-I4 对抗审查）：一列 ALTER 失败（部署重叠 SQLITE_BUSY 等）不
+      // 连坐其余列；api_key_fp 失败重试一次（busy 通常 200ms 窗口内可过），仍失败
+      // 由 insertRequest 的降级 prepare 兜住（见构造），不再级联整库 disabled。
+      for (const col of ['path', 'ua', 'client', 'ip', 'token_fp', 'api_key_fp']) {
         if (!names.has(col)) {
-          this.db.exec(`ALTER TABLE requests ADD COLUMN ${col} TEXT`);
+          try {
+            this.db.exec(`ALTER TABLE requests ADD COLUMN ${col} TEXT`);
+          } catch (err) {
+            if (col === 'api_key_fp') {
+              try {
+                this.db.exec('ALTER TABLE requests ADD COLUMN api_key_fp TEXT');
+                this.log(`[usagedb] api_key_fp 补列重试成功`);
+              } catch (err2) {
+                this.log(`[usagedb] api_key_fp 补列失败（重试后仍失败，该列降级为空）: ${err2 instanceof Error ? err2.message : String(err2)}`);
+              }
+            } else {
+              this.log(`[usagedb] requests 表 ${col} 列补列失败: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
         }
       }
       // cost_micro_cents 是数字列：新库 DDL 里是 INTEGER，旧库补列必须同类型
       // （统一走 TEXT 会让新老库形态漂移，SUM 能算但语义不干净）。
       if (!names.has('cost_micro_cents')) {
-        this.db.exec('ALTER TABLE requests ADD COLUMN cost_micro_cents INTEGER');
+        try {
+          this.db.exec('ALTER TABLE requests ADD COLUMN cost_micro_cents INTEGER');
+        } catch (err) {
+          this.log(`[usagedb] cost_micro_cents 补列失败: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     } catch (err) {
       this.log(`[usagedb] requests 表补详细请求列失败（详细请求端点不可用）: ${err instanceof Error ? err.message : err}`);
@@ -771,6 +855,22 @@ export class UsageDb {
       }
     } catch (err) {
       this.log(`[usagedb] legacy_cookie 补列失败（降级：legacy 用主 cookie 槽）: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * 给旧库的 accounts 表补 legacy_key_enc 列（旧版 Default API Key，zen usage
+   * JSON API 用）。幂等：已存在则不动。失败只记日志 —— 该列缺失只影响
+   * 「免 cookie 的 Go 用量」，其余通道与 cookie 路径不受影响。
+   */
+  private ensureLegacyKeyColumn(): void {
+    try {
+      const cols = this.db.prepare("SELECT name FROM pragma_table_info('accounts')").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'legacy_key_enc')) {
+        this.db.exec('ALTER TABLE accounts ADD COLUMN legacy_key_enc TEXT');
+      }
+    } catch (err) {
+      this.log(`[usagedb] legacy_key 补列失败（降级：该账号无免 cookie Go 用量）: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -837,6 +937,7 @@ export class UsageDb {
         row.ip ?? null,
         row.costMicroCents ?? 0,
         row.tokenFp ?? null,
+        row.apiKeyFp ?? null,
       ],
     });
     if (row.at > this.pendingLastAt) this.pendingLastAt = row.at;
@@ -873,7 +974,7 @@ export class UsageDb {
     try {
       this.db.exec('BEGIN');
       try {
-        for (const { args } of rows) this.insertRequest.run(...args);
+        for (const { args } of rows) this.insertRequest.run(...args.slice(0, this.insertRequestArity));
         this.upsertTotals(rows);
         this.db.exec('COMMIT');
       } catch (err) {
@@ -936,23 +1037,38 @@ export class UsageDb {
 
   /** 按 requests 现存量重建 key_totals（与 queryHistory 的 byKey 同口径）。幂等，
    *  整表替换（避免与增量 upsert 叠加出双倍计数）。调用点：migrate 建表后
-   *  （旧库升级立即可见历史累计）+ prune 删旧行后（保持与 requests 同窗口的
-   *  30d 语义 —— 聚合表是快照不是不清零的永久账本）。 */
+   *  （旧库升级立即可见历史累计；进程重启后窗口恢复精确）。prune **不再调用**
+   *  本方法 —— 它走增量删（见 prune，避免全表 GROUP BY 同步阻塞事件循环）；
+   *  本方法保留供 migrate/降级兜底用。 */
   private rebuildTotals(): void {
-    this.db.exec(`
-      DELETE FROM key_totals;
-      INSERT INTO key_totals (fingerprint, requests, ok, failed, input_tokens, output_tokens, last_at, min_at)
-      SELECT key_fp,
-             COUNT(*),
-             SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),
-             SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
-             COALESCE(SUM(input_tokens), 0),
-             COALESCE(SUM(output_tokens), 0),
-             MAX(at), MIN(at)
-        FROM requests
-       WHERE key_fp != '-' AND endpoint NOT IN ('probe', 'count_tokens')
-       GROUP BY key_fp
-    `);
+    // 整表替换是两条语句（DELETE + INSERT），必须同一事务：INSERT 失败
+    // （SQLITE_BUSY/ENOSPC）时整体 ROLLBACK，否则 key_totals 被清空后
+    // 历史聚合永久偏低，直到下次 prune 才有机会恢复。
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.exec(`
+        DELETE FROM key_totals;
+        INSERT INTO key_totals (fingerprint, requests, ok, failed, input_tokens, output_tokens, last_at, min_at)
+        SELECT key_fp,
+               COUNT(*),
+               SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END),
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               MAX(at), MIN(at)
+          FROM requests
+         WHERE key_fp != '-' AND endpoint NOT IN ('probe', 'count_tokens')
+         GROUP BY key_fp
+      `);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // 事务可能已自动回滚，忽略。
+      }
+      throw err;
+    }
   }
 
   /**
@@ -1057,7 +1173,9 @@ export class UsageDb {
     const offset = Math.max(0, (page - 1) * pageSize);
     return {
       total: all.length,
-      items: all.slice(offset, offset + pageSize),
+      // slice 只产生新数组，元素仍是缓存内同一对象（I-15）：逐个复制
+      // （clients 数组也要复制），调用方改元素不污染缓存。
+      items: all.slice(offset, offset + pageSize).map((r) => ({ ...r, clients: [...r.clients] })),
     };
   }
 
@@ -1149,7 +1267,9 @@ export class UsageDb {
     this.flush();
     const now = Date.now();
     if (this.tokenUsageCache != null && now - this.tokenUsageCacheAt < TOKEN_USAGE_CACHE_MS) {
-      return this.tokenUsageCache;
+      // 缓存命中返回副本：`new Map(cache)` 只复制 Map 容器，value 对象仍是共享
+      // 引用，调用方改 value 照样污染缓存 —— 每个值也要复制一份。
+      return new Map([...this.tokenUsageCache].map(([fp, u]) => [fp, { ...u }]));
     }
     try {
       const rows = this.db
@@ -1176,7 +1296,8 @@ export class UsageDb {
       }
       this.tokenUsageCache = map;
       this.tokenUsageCacheAt = now;
-      return map;
+      // 与命中路径同款：返回副本，调用方改动 value 不污染缓存。
+      return new Map([...map].map(([fp, u]) => [fp, { ...u }]));
     } catch (err) {
       this.log(`[usagedb] 分发 token 用量聚合失败（返回空）: ${err instanceof Error ? err.message : err}`);
       return empty;
@@ -1205,10 +1326,15 @@ export class UsageDb {
     const days = Number.isFinite(rangeDays) ? Math.max(1, Math.floor(rangeDays)) : 7;
     const nowMs = now ?? Date.now();
     const cached = this.trendCache.get(days);
-    if (cached && nowMs - cached.at < TREND_CACHE_MS) return cached.data;
+    if (cached && nowMs - cached.at < TREND_CACHE_MS) {
+      // 缓存命中返回副本（I-15）：直接 return cached.data 会让调用方改 items
+      // 污染 10s 内的所有后续读取。
+      const data = cached.data;
+      return data ? cloneTrend(data) : null;
+    }
     const fresh = this.queryTrend(days, nowMs);
     this.trendCache.set(days, { at: nowMs, data: fresh });
-    return fresh;
+    return fresh ? cloneTrend(fresh) : null;
   }
 
   /** usageTrend 的真查询。失败返回 null（不写缓存，下次重试）。 */
@@ -1380,7 +1506,9 @@ export class UsageDb {
     this.flush();
     const now = Date.now();
     if (this.historyCache && now - this.historyCacheAt < HISTORY_CACHE_MS) {
-      return this.historyCache;
+      // 缓存命中返回副本（I-15）：直接 return 内部缓存会让调用方改返回值
+      // 污染 15s 内的所有后续读取。
+      return cloneHistory(this.historyCache);
     }
     const fresh = this.queryHistory();
     // 查询失败（返回 null）时不写缓存，下次调用会重试。
@@ -1388,7 +1516,7 @@ export class UsageDb {
       this.historyCache = fresh;
       this.historyCacheAt = now;
     }
-    return fresh;
+    return fresh ? cloneHistory(fresh) : null;
   }
 
   private queryHistory(): UsageHistory | null {
@@ -1413,12 +1541,14 @@ export class UsageDb {
         .all() as Array<Record<string, number | string>>;
 
       // 未归属请求（key_fp = '-'）单独给一个数：真实发生的请求，丢了总数对不上。
-      // 走 (key_fp, at) 索引，只扫 '-' 行。
+      // 走 (key_fp, at) 索引，只扫 '-' 行。与 meta.unattrib 同口径：排除探活与
+      // 记账（count_tokens 请求落库时 key_fp 为 '-'，不排除会把「未归属请求数」
+      // 刷高、违反 totalRequests 不变量）。
       const unattributed = this.db
         .prepare(
           `SELECT COUNT(*) AS requests,
                   SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END) AS failed
-             FROM requests WHERE key_fp = '-'`,
+             FROM requests WHERE key_fp = '-' AND (endpoint IS NULL OR endpoint NOT IN ('probe', 'count_tokens'))`,
         )
         .get() as { requests: number; failed: number };
 
@@ -1429,9 +1559,9 @@ export class UsageDb {
           `SELECT COALESCE((SELECT SUM(requests) FROM key_totals), 0)            AS totals,
                   COALESCE((SELECT MIN(min_at) FROM key_totals), 0)             AS totalsMinAt,
                   COALESCE((SELECT COUNT(*) FROM requests
-                             WHERE key_fp = '-' AND endpoint NOT IN ('probe', 'count_tokens')), 0) AS unattrib,
+                             WHERE key_fp = '-' AND (endpoint IS NULL OR endpoint NOT IN ('probe', 'count_tokens'))), 0) AS unattrib,
                   COALESCE((SELECT MIN(at) FROM requests
-                             WHERE key_fp = '-' AND endpoint NOT IN ('probe', 'count_tokens')), 0) AS unattribMinAt`,
+                             WHERE key_fp = '-' AND (endpoint IS NULL OR endpoint NOT IN ('probe', 'count_tokens'))), 0) AS unattribMinAt`,
         )
         .get() as { totals: number; totalsMinAt: number; unattrib: number; unattribMinAt: number };
 
@@ -1531,14 +1661,43 @@ export class UsageDb {
     this.tokenUsageCache = null;
     this.trendCache.clear();
     try {
-      this.db.prepare('DELETE FROM requests WHERE at < ?').run(cutoff);
-      this.db.prepare('DELETE FROM key_events WHERE at < ?').run(cutoff);
-      // 管理审计与请求日志同一保留期（按 at）。
-      this.db.prepare('DELETE FROM admin_audit WHERE at < ?').run(cutoff);
-      // 明细删了窗口，聚合表整表重建（快照语义，保持 30d 窗口；整表替换防
-      // 与增量 upsert 叠加双倍计数）。失败只记日志：聚合表停留在旧窗口，
-      // history 数字偏高直到下次 prune —— 观测数据，可接受。
-      this.rebuildTotals();
+      // DELETE 同一事务：中途失败整体 ROLLBACK，避免删了一半、请求明细
+      // 与聚合窗口漂移。
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.prepare('DELETE FROM requests WHERE at < ?').run(cutoff);
+        this.db.prepare('DELETE FROM key_events WHERE at < ?').run(cutoff);
+        // 管理审计与请求日志同一保留期（按 at）。
+        this.db.prepare('DELETE FROM admin_audit WHERE at < ?').run(cutoff);
+        // P2-1：key_totals 增量删，不再整表重建（原 rebuildTotals 是全表
+        // GROUP BY，150K 行 646ms / 60 万行最坏 10s，同步阻塞在飞请求）。
+        // 删除窗口与 requests 对齐：只删「窗口内已无记账口径请求」的 key。
+        // 不能用 `min_at < cutoff` 判断 —— min_at 由增量 upsert 用 MIN 合并
+        // （只增不减），存活超过保留期的 key 其 min_at 恒早于 cutoff，会被
+        // 误删掉仍有窗口内请求的聚合。NOT EXISTS 子查询走 (key_fp, at)
+        // 索引，key_totals 行数 = key 数（几个~几十），每次都是点查级开销。
+        // 代价：保留的 key 计数是「进程启动以来累计」而非窗口内精确值
+        // （快照不重算），进程重启时 migrate 初始重建会回到精确窗口。
+        this.db
+          .prepare(
+            `DELETE FROM key_totals WHERE NOT EXISTS (
+               SELECT 1 FROM requests r
+                WHERE r.key_fp = key_totals.fingerprint
+                  AND r.at >= ?
+                  AND r.endpoint IS NOT NULL
+                  AND r.endpoint NOT IN ('probe', 'count_tokens')
+             )`,
+          )
+          .run(cutoff);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch {
+          // 事务可能已自动回滚，忽略。
+        }
+        throw err;
+      }
     } catch (err) {
       this.log(`[usagedb] 保留期清理失败（已忽略）: ${err instanceof Error ? err.message : err}`);
     }
@@ -1693,6 +1852,10 @@ export class UsageDb {
       // 关闭失败无所谓，进程退出时 OS 会回收。
     }
     this.db = null;
+    // 关闭后置 enabled=false：句柄已失效，若仍是 true，close 后 recordRequest/
+    // flush 会把积压行往已关闭的句柄写、每条刷一行「批量写入失败」错误日志。
+    // 幂等：二次 close 里 flush() 因 enabled=false 早退、db 为 null 直接 return。
+    this.enabled = false;
   }
 }
 
@@ -1708,6 +1871,7 @@ const ACCOUNT_COLUMNS: Array<[keyof AccountUpdate, string]> = [
   ['keysEnc', 'keys_enc'],
   ['cookieEnc', 'cookie_enc'],
   ['legacyCookieEnc', 'legacy_cookie_enc'],
+  ['legacyKeyEnc', 'legacy_key_enc'],
   ['oauthRefreshEnc', 'oauth_refresh_enc'],
   ['status', 'status'],
   ['statusDetail', 'status_detail'],
@@ -1731,6 +1895,7 @@ function mapAccountRow(r: Record<string, unknown>): AccountRow {
     keysEnc: String(r.keys_enc),
     cookieEnc: r.cookie_enc == null ? null : String(r.cookie_enc),
     legacyCookieEnc: r.legacy_cookie_enc == null ? null : String(r.legacy_cookie_enc),
+    legacyKeyEnc: r.legacy_key_enc == null ? null : String(r.legacy_key_enc),
     oauthRefreshEnc: r.oauth_refresh_enc == null ? null : String(r.oauth_refresh_enc),
     status: String(r.status),
     statusDetail: r.status_detail == null ? null : String(r.status_detail),

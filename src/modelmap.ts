@@ -106,16 +106,14 @@ export function updateModelAlias(
 }
 
 /**
- * 默认模型映射（seed 用）。历史上这两个别名内置在 deepseek.ts 的 MODEL_ALIASES
- * 里，改造为 db 配置清单后由首次启动种子进来 —— 表空时 seed，行为与旧版一致：
- * 两个 Anthropic 风格名字都映射到订阅端点的 deepseek-v4-flash（fable-5 曾映射
- * free，但 free 是 IP 日窗限流，VPS IP 被限时全池 503，已改走订阅端点）。
- * 一旦用户手动增删改过（表非空），不再 seed —— 配置归属用户。
+ * 默认模型映射（seed 用）。**刻意为空**（2026-08-14 清空）：
+ * 历史上 seed 过 `claude-mythos-5` / `claude-fable-5` 两个测试别名——对部署者
+ * 是「离谱映射」（fable 是本项目内部代号，别人部署看到只会困惑，且掩盖了
+ * 「别名需用户自己配」的事实）。初始配置必须干净：别名映射属于用户决策，
+ * 默认不预设任何映射，靠 MODEL_MAP env 或后台「模型映射」页自行配置。
+ * seed 逻辑保留（空列表 = 每次启动 no-op），用户一旦手动加过别名即不再 seed。
  */
-export const DEFAULT_MODEL_ALIASES: ReadonlyArray<{ alias: string; target: string; note: string | null }> = [
-  { alias: 'claude-mythos-5', target: 'deepseek-v4-flash', note: '默认映射（seed）' },
-  { alias: 'claude-fable-5', target: 'deepseek-v4-flash', note: '默认映射（seed）' },
-];
+export const DEFAULT_MODEL_ALIASES: ReadonlyArray<{ alias: string; target: string; note: string | null }> = [];
 
 /**
  * 首次启动 seed：model_aliases 表空时写入默认映射，返回是否真的执行了 seed。

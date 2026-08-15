@@ -10,13 +10,15 @@ import {
   fetchLegacyBilling,
   fetchLegacyGoStatus,
   fetchLegacyKeys,
+  fetchZenGoUsage,
   legacyCookieStatus,
+  mergeLegacyGoStatus,
   parseLegacyBillingHtml,
   parseLegacyGoHtml,
   parseLegacyKeysHtml,
   setLegacyGoToggle,
 } from '../src/legacy.js';
-import type { LegacyPlainKey } from '../src/legacy.js';
+import type { LegacyGoStatus, LegacyPlainKey } from '../src/legacy.js';
 import type { FetchLike } from '../src/billing.js';
 
 /**
@@ -89,6 +91,13 @@ describe('parseLegacyKeysHtml', () => {
     const parsed = parseLegacyKeysHtml(html);
     expect(parsed.keys[0]!.masked).toBe('sk-AOpQ...0os0');
     expect(JSON.stringify(parsed)).not.toContain('OUTje3uIJRVctKiLocPCaPPF1y');
+  });
+
+  it('C-I3：异常短 key（≤11 位）掩码整段打码为 ***，明文不进响应', () => {
+    const html = `<script>${keyObj(0, { display: 'null', plain: 'sk-abc' })}</script>`;
+    const parsed = parseLegacyKeysHtml(html);
+    expect(parsed.keys[0]!.masked).toBe('***');
+    expect(JSON.stringify(parsed)).not.toContain('sk-abc');
   });
 
   it('email 缺失 → creatorEmail 为 null', () => {
@@ -180,6 +189,27 @@ describe('LegacyPlainCache', () => {
     expect(c.get(1)).toBeNull(); // 最旧被逐出
     expect(c.get(2)).not.toBeNull();
     expect(c.get(3)).not.toBeNull();
+  });
+
+  it('C-P2-2：同一账号不同 workspace 互不命中（TTL 内绝不跨 workspace 泄露明文）', () => {
+    const c = new LegacyPlainCache();
+    c.set(1, [{ id: 'key_1', name: 'n', key: 'sk-ws-a' }], 'ws-a');
+    expect(c.get(1, 'ws-a')).toEqual([{ id: 'key_1', name: 'n', key: 'sk-ws-a' }]);
+    // workspace 不匹配 → miss（调用方用当前 ws 重抓并覆盖旧条目）
+    expect(c.get(1, 'ws-b')).toBeNull();
+    // 重抓后以新 ws 填充，旧 ws 反过来 miss
+    c.set(1, [{ id: 'key_2', name: 'n', key: 'sk-ws-b' }], 'ws-b');
+    expect(c.get(1, 'ws-b')).toEqual([{ id: 'key_2', name: 'n', key: 'sk-ws-b' }]);
+    expect(c.get(1, 'ws-a')).toBeNull();
+    expect(c.size()).toBe(1);
+  });
+
+  it('C-P2-2：ws 未传（旧调用方形态）→ 兼容放行，TTL 行为不变', () => {
+    const c = new LegacyPlainCache();
+    c.set(1, [{ id: 'key_1', name: 'n', key: 'sk-x' }]);
+    expect(c.get(1)).toEqual([{ id: 'key_1', name: 'n', key: 'sk-x' }]);
+    // 条目无 ws，请求带 ws 也无法校验 → 放行（升级过渡期语义）
+    expect(c.get(1, 'ws-y')).toEqual([{ id: 'key_1', name: 'n', key: 'sk-x' }]);
   });
 });
 
@@ -811,5 +841,171 @@ describe('fetchLegacyBilling', () => {
       reason: 'wrong-console',
     });
     expect(reqs).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zen usage（/zen/go/v1/usage，API key 通道，零 cookie）
+// ---------------------------------------------------------------------------
+//
+// fixture 按 2026-08-15 服务器实测形状构造（见 src/legacy.ts fetchZenGoUsage 注释）：
+// GET /zen/go/v1/usage + Bearer 旧版 Default API Key → 200
+// `{"usage":{"rolling":{"status":"ok","percent":5,"resetsAt":"..."},...}}`；
+// 无效 key → 401 AuthError。
+
+describe('fetchZenGoUsage', () => {
+  const ZEN_OK = {
+    usage: {
+      rolling: { status: 'ok', percent: 5, resetsAt: '2026-08-15T05:09:37.327Z' },
+      weekly: { status: 'ok', percent: 41, resetsAt: '2026-08-17T00:00:00.327Z' },
+      monthly: { status: 'ok', percent: 20, resetsAt: '2026-09-11T15:25:51.327Z' },
+    },
+  };
+
+  it('实测形状 200 → LegacyGoStatus（percent→usagePercent、resetsAt→resetInSec、status 透传）', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-15T00:00:00.000Z'));
+    try {
+      const { f, reqs } = fakeFetch(() =>
+        new Response(JSON.stringify(ZEN_OK), { status: 200, headers: { 'content-type': 'application/json' } }),
+      );
+      const r = await fetchZenGoUsage(BASE, 'sk-AOpQOUTje3uIJRVctKiLocPCaPPF1yWBQwOlwP7JfiOX47iCoL8BeTFTviyd0osU', f);
+      expect(r).not.toBeNull();
+      if (!r) return;
+      expect(r.subscribed).toBe(true);
+      expect(r.useBalance).toBe(false);
+      expect(r.chinaModels).toBe(false);
+      const reset = (iso: string): number =>
+        Math.max(0, Math.floor((Date.parse(iso) - Date.now()) / 1000));
+      expect(r.rolling).toEqual({ status: 'ok', resetInSec: reset('2026-08-15T05:09:37.327Z'), usagePercent: 5 });
+      expect(r.weekly).toEqual({ status: 'ok', resetInSec: reset('2026-08-17T00:00:00.327Z'), usagePercent: 41 });
+      expect(r.monthly).toEqual({ status: 'ok', resetInSec: reset('2026-09-11T15:25:51.327Z'), usagePercent: 20 });
+      const req = reqs[0]!;
+      expect(req.method).toBe('GET');
+      expect(req.url).toBe('https://opencode.ai/zen/go/v1/usage');
+      expect(req.headers.get('authorization')).toBe('Bearer sk-AOpQOUTje3uIJRVctKiLocPCaPPF1yWBQwOlwP7JfiOX47iCoL8BeTFTviyd0osU');
+      expect(req.headers.get('accept')).toBe('application/json');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('401（无效 key，实测 AuthError 形状）→ null，不抛', async () => {
+    const { f } = fakeFetch(() =>
+      new Response(JSON.stringify({ type: 'error', error: { type: 'AuthError', message: 'Unauthorized' } }), { status: 401 }),
+    );
+    expect(await fetchZenGoUsage(BASE, 'sk-bad', f)).toBeNull();
+  });
+
+  it('非 2xx（5xx）→ null', async () => {
+    const { f } = fakeFetch(() => new Response('', { status: 500 }));
+    expect(await fetchZenGoUsage(BASE, 'sk-x', f)).toBeNull();
+  });
+
+  it('网络错误/超时 → null', async () => {
+    const { f } = fakeFetch(() => {
+      throw new Error('net');
+    });
+    expect(await fetchZenGoUsage(BASE, 'sk-x', f)).toBeNull();
+  });
+
+  it('响应不是合法 JSON → null', async () => {
+    const { f } = fakeFetch(() => new Response('<html>oops</html>', { status: 200 }));
+    expect(await fetchZenGoUsage(BASE, 'sk-x', f)).toBeNull();
+  });
+
+  it('JSON 缺顶层 usage → null', async () => {
+    const { f } = fakeFetch(() => new Response(JSON.stringify({ foo: 1 }), { status: 200 }));
+    expect(await fetchZenGoUsage(BASE, 'sk-x', f)).toBeNull();
+  });
+
+  it('窗口缺字段/畸形 → 该窗口 null（其余照常）；resetsAt 解析失败 → resetInSec 0 而非 NaN', async () => {
+    const bad = {
+      usage: {
+        rolling: { status: 'ok', percent: 5, resetsAt: 'not-a-date' },
+        weekly: { status: 'ok', percent: 'x' },
+        monthly: { status: 'ok' },
+      },
+    };
+    const { f } = fakeFetch(() => new Response(JSON.stringify(bad), { status: 200 }));
+    const r = await fetchZenGoUsage(BASE, 'sk-x', f);
+    expect(r).not.toBeNull();
+    if (!r) return;
+    expect(r.rolling).toEqual({ status: 'ok', resetInSec: 0, usagePercent: 5 });
+    expect(r.weekly).toBeNull();
+    expect(r.monthly).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go 状态合并（zen 窗口 + cookie HTML 开关，go 端点 zen 优先路径用）
+// ---------------------------------------------------------------------------
+
+describe('mergeLegacyGoStatus', () => {
+  it('mock fetch：zen 窗口 + cookie go 页开关 → 合并结果窗口来自 zen、开关来自 cookie', async () => {
+    const { f, reqs } = fakeFetch((req) =>
+      req.url.includes('/zen/go/v1/usage')
+        ? new Response(
+            JSON.stringify({
+              usage: {
+                rolling: { status: 'ok', percent: 5, resetsAt: '2026-08-15T05:09:37.327Z' },
+                weekly: { status: 'ok', percent: 41, resetsAt: '2026-08-17T00:00:00.327Z' },
+                monthly: { status: 'ok', percent: 20, resetsAt: '2026-09-11T15:25:51.327Z' },
+              },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        : new Response(goPageHtml(goSubscribedHydration({ useBalance: '!0' }), true), { status: 200 }),
+    );
+    const zen = await fetchZenGoUsage(BASE, 'sk-x', f);
+    const cookieR = await fetchLegacyGoStatus(BASE, 'auth=c', GO_WS, f);
+    expect(zen).not.toBeNull();
+    expect(cookieR.ok).toBe(true);
+    if (!zen || !cookieR.ok) return;
+    const merged = mergeLegacyGoStatus(zen, cookieR.status);
+    expect(merged.useBalance).toBe(true); // 来自 cookie go 页
+    expect(merged.chinaModels).toBe(true); // 来自 cookie go 页
+    expect(merged.monthly?.usagePercent).toBe(20); // 窗口来自 zen
+    expect(merged.rolling).toEqual(zen.rolling);
+    expect(reqs).toHaveLength(2);
+  });
+
+  it('cookie 状态为 null（cookie 缺失/失效/解析失败）→ 返回 zen 原样，开关保持 false', () => {
+    const zen: LegacyGoStatus = {
+      subscribed: true,
+      useBalance: false,
+      chinaModels: false,
+      rolling: { status: 'ok', resetInSec: 3600, usagePercent: 5 },
+      weekly: null,
+      monthly: null,
+    };
+    const merged = mergeLegacyGoStatus(zen, null);
+    expect(merged).toBe(zen);
+    expect(merged.useBalance).toBe(false);
+    expect(merged.chinaModels).toBe(false);
+    expect(merged.rolling).toEqual(zen.rolling);
+  });
+
+  it('zen 窗口为 null 时合并仍保留 null（不因 cookie 引入窗口数据）', () => {
+    const zen: LegacyGoStatus = {
+      subscribed: true,
+      useBalance: false,
+      chinaModels: false,
+      rolling: null,
+      weekly: null,
+      monthly: null,
+    };
+    const cookieStatus: LegacyGoStatus = {
+      subscribed: true,
+      useBalance: true,
+      chinaModels: true,
+      rolling: { status: 'ok', resetInSec: 1, usagePercent: 99 },
+      weekly: null,
+      monthly: null,
+    };
+    const merged = mergeLegacyGoStatus(zen, cookieStatus);
+    expect(merged.useBalance).toBe(true);
+    expect(merged.chinaModels).toBe(true);
+    expect(merged.rolling).toBeNull(); // 窗口仍取 zen
   });
 });

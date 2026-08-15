@@ -27,7 +27,8 @@ import { buildSystemGuard, detectInjection, extractAllText, scanMessagesForInjec
 import { isJsonContentType, validateAnthropicRequest, validateChatRequest } from './security/validate.js';
 import { extractDevice, recordEvent, snapshot, type RequestEvent } from './metrics.js';
 import { UsageDb } from './usagedb.js';
-import { applySettingsToConfig, SETTINGS_META, SettingsStore, validateSetting } from './settings.js';
+import { applySettingsToConfig, effectiveGlobalModels, SETTINGS_META, SettingsStore, validateSetting } from './settings.js';
+import { MODEL_ACCESS_TYPES, ModelAccessStore, type ModelAccessSubjectType } from './modelaccess.js';
 import { TokensStore, fingerprintOf } from './tokens.js';
 import { RpmLimiter } from './ratelimit.js';
 import { buildAccountsSection, type AccountsStore } from './accounts.js';
@@ -35,6 +36,23 @@ import { handleAdminRoutes, LOGIN_HTML, parseAccountId } from './admin.js';
 import { loadModelAliases, updateModelAlias } from './modelmap.js';
 import { OauthManager, type OauthIdentity } from './oauth.js';
 import type { FetchLike } from './billing.js';
+// 唯一例外：go 端点 zen 优先路径要合并 zen 窗口 + cookie HTML 开关，共享这个
+// 纯函数（legacy.ts 不反向依赖 server.ts，单向，不构成互相依赖）。
+import { mergeLegacyGoStatus } from './legacy.js';
+import { shutdown } from './shutdown.js';
+import {
+  checkUpdate,
+  currentVersion,
+  DEFAULT_OTA_REPO,
+  fetchCompareCommits,
+  otaProjectRoot,
+  performUpdate,
+  sanitizeRepo,
+  startOtaCheck,
+  type ChangelogCommit,
+  type CheckStatus,
+} from './ota.js';
+import { readStatus as readOtaGuardStatus } from './ota-guard.js';
 import { DASHBOARD_HTML } from './dashboard.js';
 import { anthropicToOpenAIRequest } from './toOpenAI.js';
 import { anthropicEventToSSE, openAIStreamToAnthropic, openAIToAnthropicResponse } from './toAnthropic.js';
@@ -92,16 +110,51 @@ function collectForwardHeaders(
  * 带背压的响应写入：`res.write()` 返回 false 表示内核缓冲已满，
  * 等待 'drain' 再继续，避免慢客户端把内存推到无界。
  * 客户端断开（'close'/'error'）时也解除等待，让调用循环检查 res.destroyed 退出。
+ *
+ * S-P1-1：半死连接（TCP 存活但不读）永不触发 drain，drain 等待会挂死流式循环，
+ * 连带 upstream.touch 停、并发在飞计数与 keypool inFlight 不释放。这里给等待加
+ * 超时（默认 60s，`res.write` 一次成功即为一次续命，下一笔重新起算），超时即
+ * `res.destroy()` —— 'close' 触发并发门释放，调用循环在下次迭代检查 res.destroyed
+ * 退出、finally 里 release 上游计数。监听器用具名函数 + 收尾移除（顺带修 I-7 累积）。
+ * timeoutMs 仅测试注入用，生产恒走 WRITE_CHUNK_TIMEOUT_MS。
  */
-function writeChunk(res: ServerResponse, data: string): Promise<void> {
+const WRITE_CHUNK_TIMEOUT_MS = 60_000;
+export function writeChunk(res: ServerResponse, data: string, timeoutMs = WRITE_CHUNK_TIMEOUT_MS): Promise<void> {
   return new Promise((resolve, reject) => {
     if (res.write(data)) {
       resolve();
       return;
     }
-    res.once('drain', resolve);
-    res.once('close', resolve);
-    res.once('error', reject);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      res.off('error', onError);
+    };
+    const onDrain = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onClose = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err: Error): void => {
+      cleanup();
+      reject(err);
+    };
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onError);
+    timer = setTimeout(() => {
+      cleanup();
+      res.destroy();
+      resolve();
+    }, timeoutMs);
   });
 }
 
@@ -846,6 +899,10 @@ function currentSettingValue(cfg: AppConfig, key: string): unknown {
       return cfg.compactTriggerBytes;
     case 'compactMaxMessageChars':
       return cfg.compactMaxMessageChars;
+    case 'allowedModels':
+      // MODEL-ACCESS 全局白名单（审查 MINOR-4）：settings GET 的 value 字段
+      // 缺了会让 API 表面出现半截字段（default/source 有、value 无）。
+      return [...effectiveGlobalModels(cfg)];
     default:
       return undefined;
   }
@@ -1005,6 +1062,437 @@ async function handlePatchSettings(
       adminPassIsDefault: deps.cfg.adminPass === DEFAULT_ADMIN_PASS,
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// GitHub OTA 自更新端点（OTA.md §6-§7）：
+// - GET  /__admin/api/update/status   只读状态（isAdminRequest 即可，不加 Origin）
+// - POST /__admin/api/update/check    强制检查（绕过 60s 缓存；过 Origin）
+// - POST /__admin/api/update/perform  执行更新（过 Origin；落 admin_audit；
+//                                      OTA_ENABLED=0 → 403 fail-closed）
+// 错误分类（OTA.md §7）：400 入参 / 409 冲突（更新中/降级/无 supervisor）/
+// 422 校验失败 / 502 上游不可达 / 500 内部；403 为开关关闭。
+// ---------------------------------------------------------------------------
+
+/** OTA check/perform 的请求体上限（无业务字段，只防滥用）。 */
+const OTA_BODY_MAX_BYTES = 64 * 1024;
+
+/** createApp 内的 OTA 状态缓存（后台定时检查 + check 端点刷新，喂给 status）。 */
+interface OtaState {
+  status: CheckStatus | null;
+}
+
+/** OTA 自重启的测试注入点：createApp 内建的 scheduleRestart 会真的 shutdown()
+ * 服务器（会关掉测试实例）。单测注入空操作桩，断言「安排过重启」即可。 */
+let otaRestartStub: (() => void) | null = null;
+export function setOtaRestartStub(fn: (() => void) | null): void {
+  otaRestartStub = fn;
+}
+
+interface OtaDeps {
+  cfg: AppConfig;
+  db: UsageDb | null;
+  fetchImpl: FetchLike | undefined;
+  root: string;
+  state: OtaState;
+  scheduleRestart?: () => void;
+}
+
+function otaEnabledOf(cfg: AppConfig): boolean {
+  return cfg.otaEnabled === true;
+}
+
+function otaRepoOf(cfg: AppConfig): string {
+  return sanitizeRepo(cfg.otaRepo, DEFAULT_OTA_REPO);
+}
+
+function otaErrorType(httpStatus: number): string {
+  if (httpStatus === 403) return 'authentication_error';
+  return httpStatus >= 500 ? 'server_error' : 'invalid_request_error';
+}
+
+async function handleOtaStatus(req: IncomingMessage, res: ServerResponse, deps: OtaDeps): Promise<void> {
+  const cached = deps.state.status;
+  sendJson(res, 200, {
+    ok: true,
+    data: {
+      current: currentVersion(deps.root),
+      enabled: otaEnabledOf(deps.cfg),
+      repo: otaRepoOf(deps.cfg),
+      latest: cached?.latest ?? null,
+      hasUpdate: cached?.hasUpdate ?? false,
+      lastCheckedAt: cached?.checkedAt ?? 0,
+      error: cached?.error ?? null,
+      rollback: readOtaGuardStatus(deps.root),
+    },
+  });
+}
+
+async function handleOtaCheck(req: IncomingMessage, res: ServerResponse, deps: OtaDeps): Promise<void> {
+  const read = await readBody(req, OTA_BODY_MAX_BYTES);
+  if (!read.ok) {
+    sendJson(res, read.status, {
+      error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
+    });
+    return;
+  }
+  // OTA_ENABLED=0：check 不外联 GitHub（否则面板「检查更新」按钮在关闭态也打远程，
+  // M-P2-1 附带）。直接返回 disabled 状态：latest 恒 null、hasUpdate false。
+  if (!otaEnabledOf(deps.cfg)) {
+    const s: CheckStatus = {
+      current: currentVersion(deps.root),
+      latest: null,
+      hasUpdate: false,
+      enabled: false,
+      error: null,
+      checkedAt: Date.now(),
+    };
+    deps.state.status = s;
+    sendJson(res, 200, { ok: true, data: { ...s, commits: [] } });
+    return;
+  }
+  // force=true：绕过 60s 缓存（面板「检查更新」按钮要最新结果）。
+  const s = await checkUpdate({
+    fetchImpl: deps.fetchImpl,
+    repo: otaRepoOf(deps.cfg),
+    token: deps.cfg.otaToken,
+    enabled: otaEnabledOf(deps.cfg),
+    root: deps.root,
+    force: true,
+  });
+  deps.state.status = s;
+  let commits: ChangelogCommit[] = [];
+  if (s.hasUpdate && s.latest) {
+    try {
+      commits = await fetchCompareCommits({
+        fetchImpl: deps.fetchImpl,
+        repo: otaRepoOf(deps.cfg),
+        token: deps.cfg.otaToken,
+        from: s.current,
+        to: s.latest,
+      });
+    } catch {
+      // 更新日志拉取失败不阻断检查（面板显示无日志即可）。
+    }
+  }
+  sendJson(res, 200, { ok: true, data: { ...s, commits } });
+}
+
+async function handleOtaPerform(req: IncomingMessage, res: ServerResponse, deps: OtaDeps): Promise<void> {
+  const read = await readBody(req, OTA_BODY_MAX_BYTES);
+  if (!read.ok) {
+    sendJson(res, read.status, {
+      error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
+    });
+    return;
+  }
+  const ip = clientIpOf(req);
+  if (!otaEnabledOf(deps.cfg)) {
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'ota.perform', accountId: null, ok: false, note: 'OTA disabled (OTA_ENABLED=0)', ip });
+    sendJson(res, 403, { error: { message: 'OTA updates are disabled (set OTA_ENABLED=1)', type: 'authentication_error' } });
+    return;
+  }
+  try {
+    const result = await performUpdate({
+      fetchImpl: deps.fetchImpl,
+      repo: otaRepoOf(deps.cfg),
+      token: deps.cfg.otaToken,
+      enabled: true,
+      root: deps.root,
+      scheduleRestart: deps.scheduleRestart,
+    });
+    deps.db?.insertAdminAudit({
+      at: Date.now(),
+      op: 'ota.perform',
+      accountId: null,
+      ok: true,
+      note: `updated ${result.before} -> ${result.after}`,
+      ip,
+    });
+    sendJson(res, 200, { ok: true, data: result });
+  } catch (err) {
+    const httpStatus = (err as { httpStatus?: number })?.httpStatus ?? 500;
+    const message = err instanceof Error ? err.message : String(err);
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'ota.perform', accountId: null, ok: false, note: message, ip });
+    sendJson(res, httpStatus, { error: { message, type: otaErrorType(httpStatus) } });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 密钥-模型授权管理端点（MODEL-ACCESS §5）：
+// - GET  /__admin/api/model-access                       面板全量数据
+// - PUT  /__admin/api/model-access/global                全局白名单（settings 热配置）
+// - PUT  /__admin/api/model-access/keys/:type/:subject   单 key 自定义授权
+// 鉴权：路由处先过 isAdminRequest；读写都过 adminOriginAllowed（读也防跨站，
+// 与 tokens/requests 同口径）。审计 op：model-access.global / model-access.key。
+// ---------------------------------------------------------------------------
+
+type ModelAccessDeps = {
+  cfg: AppConfig;
+  db: UsageDb | null;
+  settingsStore: SettingsStore;
+  modelAccess: ModelAccessStore;
+  tokens: TokensStore | null;
+  pool: KeyPool;
+  store: AccountsStore | null;
+};
+
+/** 授权端点请求体上限（模型名很短，64KB 纯防御，与 settings 端点同量级）。 */
+const MODEL_ACCESS_BODY_MAX_BYTES = 64 * 1024;
+
+/** subject 统一身份：sha256(key) 全 hex（MODEL-ACCESS §2.2）。 */
+function modelAccessSha256(key: string): string {
+  return crypto.createHash('sha256').update(key, 'utf8').digest('hex');
+}
+
+/**
+ * 上游 key 行装配（GET 面板用）：与 main.ts 的池同源 —— env keys + 账户明文
+ * keys（按 sha256 去重）。逐把算 sha256 匹配自定义授权（model_access 的 subject），
+ * 指纹/账号名只做展示。绝不输出 key 明文。
+ */
+function modelAccessUpstreamKeys(deps: ModelAccessDeps): Array<{
+  fingerprint: string;
+  accountId: number;
+  accountName: string | null;
+  subject: string;
+  custom: string[] | null;
+}> {
+  const raws: Array<{ key: string; accountId: number }> = [];
+  const seen = new Set<string>();
+  const push = (key: string, accountId: number): void => {
+    const sha = modelAccessSha256(key);
+    if (seen.has(sha)) return;
+    seen.add(sha);
+    raws.push({ key, accountId });
+  };
+  for (const k of deps.cfg.upstreamKeys ?? []) push(k.trim(), 0); // trim（审查 MINOR-5）：池构造 trim 过，这里不 trim 会让带空白的 env key 哈希对不上
+  if (deps.store != null && deps.store.enabled) {
+    for (const [k, accountId] of deps.store.keysForPool()) push(k, accountId);
+  }
+  const customBySubject = new Map<string, string[]>();
+  for (const row of deps.modelAccess.listByType('upstream-key')) customBySubject.set(row.subjectId, row.models);
+  const names = new Map<number, string>();
+  if (deps.store != null && deps.store.enabled) {
+    for (const acc of deps.store.list()) names.set(acc.id, acc.name);
+  }
+  return raws.map((r) => {
+    const subject = modelAccessSha256(r.key);
+    return {
+      fingerprint: keyFingerprint(r.key),
+      accountId: r.accountId,
+      accountName: names.get(r.accountId) ?? null,
+      subject,
+      custom: customBySubject.get(subject) ?? null,
+    };
+  });
+}
+
+/** GET /__admin/api/model-access：面板全量（全局 + 可选模型 + 三类 key 授权）。 */
+async function handleGetModelAccess(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ModelAccessDeps,
+): Promise<void> {
+  if (!adminOriginAllowed(req)) {
+    sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+    return;
+  }
+  const stored = deps.settingsStore.get('allowedModels');
+  const tokenCustom = new Map<string, string[]>();
+  for (const row of deps.modelAccess.listByType('token')) tokenCustom.set(row.subjectId, row.models);
+  const apiKeyCustom = new Map<string, string[]>();
+  for (const row of deps.modelAccess.listByType('api-key')) apiKeyCustom.set(row.subjectId, row.models);
+  sendJson(res, 200, {
+    ok: true,
+    data: {
+      global: {
+        models: [...effectiveGlobalModels(deps.cfg)],
+        source: stored != null ? 'settings' : 'code',
+        core: [...ALLOWED_MODELS],
+      },
+      models: [...new Set([...Object.keys(deps.cfg.modelMap), ...ALLOWED_MODELS])],
+      keys: {
+        tokens: (deps.tokens != null ? deps.tokens.list() : []).map((t) => ({
+          id: t.id,
+          name: t.name,
+          fingerprint: t.fingerprint,
+          mask: t.mask,
+          status: t.status,
+          custom: tokenCustom.get(t.fingerprint) ?? null,
+        })),
+        apiKeys: (deps.cfg.apiKeys ?? []).map((k) => ({
+          mask: keyFingerprint(k),
+          subject: modelAccessSha256(k),
+          custom: apiKeyCustom.get(modelAccessSha256(k)) ?? null,
+        })),
+        upstreamKeys: modelAccessUpstreamKeys(deps),
+      },
+    },
+  });
+}
+
+/**
+ * PUT /__admin/api/model-access/global：写全局白名单（settings 热配置）。
+ * models null/空 = 删 settings 键回代码默认（硬底线）；否则校验（≤50、trim
+ * 去重、必须在 ALLOWED_MODELS 内 —— 硬底线不可放宽）后写 settings + apply 内存。
+ */
+async function handlePutModelAccessGlobal(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ModelAccessDeps,
+): Promise<void> {
+  if (!adminOriginAllowed(req)) {
+    sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+    return;
+  }
+  if (deps.db == null || !deps.db.enabled) {
+    sendJson(res, 503, { error: { message: `usage db unavailable: ${deps.db?.disabledReason ?? 'unknown'}`, type: 'server_error' } });
+    return;
+  }
+  const read = await readBody(req, MODEL_ACCESS_BODY_MAX_BYTES);
+  if (!read.ok) {
+    sendJson(res, read.status, {
+      error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
+    });
+    return;
+  }
+  const parsed = parseJson(read.text);
+  if (!parsed.ok) {
+    sendJson(res, 400, badBodyError(parsed.empty));
+    return;
+  }
+  const body = parsed.body;
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    sendJson(res, 400, { error: { message: 'request body must be a JSON object', type: 'invalid_request_error' } });
+    return;
+  }
+  const modelsRaw = (body as Record<string, unknown>).models;
+  if (modelsRaw === undefined) {
+    sendJson(res, 400, { error: { message: 'models is required', type: 'invalid_request_error' } });
+    return;
+  }
+  const v = validateSetting('allowedModels', modelsRaw);
+  if (!v.ok) {
+    sendJson(res, 400, { error: { message: v.error, type: 'invalid_request_error' } });
+    return;
+  }
+  const normalized = v.value as string[] | null;
+  // 空数组等价 null：清键回代码默认（settings 表不留空壳键）。
+  const models = normalized == null || normalized.length === 0 ? null : normalized;
+  if (models == null) {
+    if (!deps.settingsStore.delete('allowedModels')) {
+      sendJson(res, 503, { error: { message: 'failed to persist setting', type: 'server_error' } });
+      return;
+    }
+  } else if (!deps.settingsStore.set('allowedModels', JSON.stringify(models))) {
+    sendJson(res, 503, { error: { message: 'failed to persist setting', type: 'server_error' } });
+    return;
+  }
+  applySettingsToConfig(deps.cfg, { allowedModels: models });
+  deps.db.insertAdminAudit({
+    at: Date.now(),
+    op: 'model-access.global',
+    accountId: null,
+    ok: true,
+    note: models == null ? 'reset' : `models:${models.length}`,
+    ip: clientIpOf(req),
+  });
+  sendJson(res, 200, {
+    ok: true,
+    data: {
+      global: {
+        models: [...effectiveGlobalModels(deps.cfg)],
+        source: deps.settingsStore.get('allowedModels') != null ? 'settings' : 'code',
+      },
+    },
+  });
+}
+
+/**
+ * PUT /__admin/api/model-access/keys/:type/:subject：单 key 自定义授权。
+ * 校验 subject 真实存在（token 查 tokens 表指纹 / api-key 对 cfg.apiKeys 逐
+ * sha256 比对 / upstream-key 经 pool.hasKeyWithHash），不存在 404。models 校验
+ * 与全局同规则（硬底线内）；null = 删行清除自定义、回退全局/账号。
+ */
+async function handlePutModelAccessKey(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ModelAccessDeps,
+  typeRaw: string,
+  subject: string,
+): Promise<void> {
+  if (!adminOriginAllowed(req)) {
+    sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+    return;
+  }
+  if (deps.db == null || !deps.db.enabled) {
+    sendJson(res, 503, { error: { message: `usage db unavailable: ${deps.db?.disabledReason ?? 'unknown'}`, type: 'server_error' } });
+    return;
+  }
+  if (!MODEL_ACCESS_TYPES.includes(typeRaw as ModelAccessSubjectType)) {
+    sendJson(res, 400, { error: { message: `invalid subject type: ${typeRaw}`, type: 'invalid_request_error' } });
+    return;
+  }
+  const type = typeRaw as ModelAccessSubjectType;
+  if (subject.length === 0) {
+    sendJson(res, 400, { error: { message: 'subject is required', type: 'invalid_request_error' } });
+    return;
+  }
+  // subject 必须对应一个真实存在的密钥（防往授权表塞幽灵行）。
+  let exists = false;
+  if (type === 'token') {
+    exists = deps.tokens != null && deps.tokens.list().some((t) => t.fingerprint === subject);
+  } else if (type === 'api-key') {
+    exists = (deps.cfg.apiKeys ?? []).some((k) => modelAccessSha256(k) === subject);
+  } else {
+    exists = deps.pool.hasKeyWithHash(subject);
+  }
+  if (!exists) {
+    sendJson(res, 404, { error: { message: 'subject not found', type: 'not_found_error' } });
+    return;
+  }
+  const read = await readBody(req, MODEL_ACCESS_BODY_MAX_BYTES);
+  if (!read.ok) {
+    sendJson(res, read.status, {
+      error: { message: BODY_READ_STATUS_MESSAGE[read.status] ?? 'request body read failed', type: 'invalid_request_error' },
+    });
+    return;
+  }
+  const parsed = parseJson(read.text);
+  if (!parsed.ok) {
+    sendJson(res, 400, badBodyError(parsed.empty));
+    return;
+  }
+  const body = parsed.body;
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    sendJson(res, 400, { error: { message: 'request body must be a JSON object', type: 'invalid_request_error' } });
+    return;
+  }
+  const modelsRaw = (body as Record<string, unknown>).models;
+  if (modelsRaw === undefined) {
+    sendJson(res, 400, { error: { message: 'models is required', type: 'invalid_request_error' } });
+    return;
+  }
+  const v = validateSetting('allowedModels', modelsRaw);
+  if (!v.ok) {
+    sendJson(res, 400, { error: { message: v.error, type: 'invalid_request_error' } });
+    return;
+  }
+  const normalized = v.value as string[] | null;
+  const models = normalized == null || normalized.length === 0 ? null : normalized;
+  if (!deps.modelAccess.setCustom(type, subject, models)) {
+    sendJson(res, 503, { error: { message: 'failed to persist model access', type: 'server_error' } });
+    return;
+  }
+  deps.db.insertAdminAudit({
+    at: Date.now(),
+    op: 'model-access.key',
+    accountId: null,
+    ok: true,
+    note: `${type}:${subject.slice(-8)}`,
+    ip: clientIpOf(req),
+  });
+  sendJson(res, 200, { ok: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,6 +2049,12 @@ type MetricsCtx = Pick<
    * 聚合用量，不进内存指标（与 keyFingerprint 同级别，面板另有展示）。
    */
   tokenFp: string | null;
+  /**
+   * API key 命中时客户端凭据的 sha256 全 hex（security/auth.ts 口径）。
+   * token / 免鉴权请求为 null —— 只落库（requests.api_key_fp）供按 API 凭据
+   * 归因模型授权拒绝（MODEL-ACCESS §4.3），不进内存指标。
+   */
+  apiKeyFp: string | null;
 };
 
 /**
@@ -1664,10 +2158,22 @@ function sendPoolEmpty(res: ServerResponse, pool: KeyPool): void {
 }
 
 /**
- * 模型拒绝（全局门 not-allowed/not-in-catalog，或账号级 ModelNotAllowedError）
- * 的统一 400 出口。message 列出当前全局白名单（ALLOWED_MODELS），提示可用模型。
+ * 模型拒绝（全局门 not-allowed/not-in-catalog，账号级 ModelNotAllowedError，
+ * 或密钥级 not-allowed-for-key）的统一 400 出口。keyAllowed 非 null 时是密钥级
+ * 拒绝（MODEL-ACCESS 入口 A）：message 列出该密钥的生效白名单，并带
+ * "for this key" 区分审计；否则是全局门/账号级拒绝，message 列全局白名单。
  */
-function sendModelNotAllowed(res: ServerResponse, model: string): void {
+function sendModelNotAllowed(res: ServerResponse, model: string, keyAllowed?: ReadonlySet<string>): void {
+  if (keyAllowed != null) {
+    const allowed = [...keyAllowed].sort().join(', ');
+    sendJson(res, 400, {
+      error: {
+        message: `model "${model}" is not allowed for this key (allowed models: ${allowed})`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
   const supported = [...ALLOWED_MODELS].sort().join(', ');
   sendJson(res, 400, {
     error: {
@@ -1683,6 +2189,11 @@ function sendModelNotAllowed(res: ServerResponse, model: string): void {
  * 顺序语义：**池空优先于模型拒绝** —— 池空是运维态（503 让客户端重试）；
  * 模型拒绝是配置问题（400，重试无意义），等池恢复后再暴露。返回 true 表示
  * 已发出 400 响应（调用方 return）；false 表示放行（模型可用）。
+ *
+ * 可选参 keyAllowed/keyGateLabel（MODEL-ACCESS 入口 A）：白名单/目录门通过后，
+ * 再按客户端密钥的生效白名单（自定义 ?? 全局默认）判一次 —— 该密钥不能生成
+ * 此模型时同样 400（message 带 "for this key"），ctx.error 记
+ * `model X not-allowed-for-key <type>:<subject末8>` 区分审计。
  */
 function checkModelGate(
   res: ServerResponse,
@@ -1690,13 +2201,27 @@ function checkModelGate(
   cfg: AppConfig,
   pool: KeyPool,
   ctx: MetricsCtx,
+  keyAllowed?: ReadonlySet<string> | null,
+  keyGateLabel?: string | null,
 ): boolean {
   // 池空优先于模型拒绝：池空（无 key 或全部禁用）是运维态，让 postUpstreamChat
   // 抛 PoolEmptyError（503 / 额度耗尽透传 429），客户端按 5xx 重试；模型拒绝是
   // 配置问题（400），等池恢复后再暴露。
   if (pool.size === 0 || pool.healthyCount === 0) return false;
   const d = resolveModel(model, cfg.modelMap, cfg.fallbackModel, upstreamModels);
-  if (d.ok) return false;
+  if (d.ok) {
+    // 缺省模型（body 无 model，resolveModel 已回落 fallback）不做密钥级门：
+    // 与入口 B 的 eligible `if (!model) return true` 一致（审查 MINOR-2），
+    // 且 message 不会显示空模型名（"model \"\" is not allowed for this key"）。
+    if (!model) return false;
+    // 密钥级门：该密钥的生效白名单（自定义 ?? 全局默认）不含已解析出的模型。
+    if (keyAllowed != null && !keyAllowed.has(d.model)) {
+      ctx.error = `model ${JSON.stringify(d.model)} not-allowed-for-key${keyGateLabel ? ` ${keyGateLabel}` : ''}`;
+      sendModelNotAllowed(res, model ?? '', keyAllowed);
+      return true;
+    }
+    return false;
+  }
   // 观测：拒绝原因记进 ctx.error（落库/面板可见）。
   ctx.error = `model ${JSON.stringify(model ?? '')} ${d.reason}`;
   sendModelNotAllowed(res, model ?? '');
@@ -1762,6 +2287,9 @@ export function createApp(
   tokensStore?: TokensStore | null,
   legacyPlainCache?: LegacyPlainCacheLike,
   legacyTtlCache?: LegacyTtlCacheLike,
+  modelAccessStore?: ModelAccessStore | null,
+  /** OTA 项目根注入（测试指向临时目录；生产用 otaProjectRoot() = dist/ 上一级）。 */
+  otaRootOverride?: string,
 ) {
   // 用量库：未显式传时按配置建。构造永不抛，不可用就退化成 no-op（面板无累计列）。
   const db = usageDb ?? new UsageDb(cfg.usageDbPath, cfg.usageDbRetentionDays);
@@ -1769,6 +2297,11 @@ export function createApp(
   // 启动合并（settings 覆盖 env 默认）由调用方（main.ts）在 createApp 之前做；
   // 这里只持有 store 供 GET/PATCH 端点读 db（source 判定 + 写入）。
   const settingsStore = new SettingsStore(db);
+  // 密钥-模型授权层（MODEL-ACCESS 数据面）：未注入时按 db 自建（db 不可用则
+  // 内部降级 enabled=false，getCustom 恒返回 null —— 无自定义授权 = 回退全局，
+  // 行为与无此功能时一致）。管理面写操作（admin 端点）走同一实例，改动即对
+  // 数据面生效。
+  const modelAccess = modelAccessStore ?? new ModelAccessStore(db);
   // 分发 token 校验器：未接线（null）时 verifyAuth 跳过分发 token（fail-closed）。
   // 管理面鉴权（isAdminRequest）刻意不传它 —— 分发 token 只用于客户端数据面。
   const tokens = tokensStore ?? null;
@@ -1790,6 +2323,27 @@ export function createApp(
     store != null && store.enabled
       ? (accountId: number): string[] | null => store.allowedModelsOf(accountId)
       : (): string[] | null => null;
+  // 上游 key 级模型授权（MODEL-ACCESS 入口 B）：按 sha256(rawKey) 查 model_access。
+  // rawKey 明文只在进程内流转（进 sha256 后就丢），不落库、不进日志、不进响应。
+  const upstreamKeyModelAccess = (rawKey: string): string[] | null =>
+    modelAccess.getCustom('upstream-key', crypto.createHash('sha256').update(rawKey, 'utf8').digest('hex'));
+  /**
+   * 客户端密钥级模型门（MODEL-ACCESS 入口 A）：算当前请求该用的密钥授权集。
+   * token 命中用 tokenFp（subject 'token'），API key 命中用 apiKeyFp（'api-key'），
+   * 免鉴权（两者皆 null）→ null（不加门）。授权语义：自定义 ?? 全局默认。
+   * 返回 { allowed, label }：label = `<type>:<subject末8>` 供 ctx.error 区分审计。
+   */
+  const clientKeyGate = (
+    ctx: MetricsCtx,
+  ): { allowed: ReadonlySet<string>; label: string } | null => {
+    const type: ModelAccessSubjectType | null =
+      ctx.tokenFp != null ? 'token' : ctx.apiKeyFp != null ? 'api-key' : null;
+    const subjectId = type == null ? null : type === 'token' ? ctx.tokenFp : ctx.apiKeyFp;
+    if (type == null || subjectId == null) return null;
+    const custom = modelAccess.getCustom(type, subjectId);
+    const allowed = custom != null ? new Set(custom) : effectiveGlobalModels(cfg);
+    return { allowed, label: `${type}:${subjectId.slice(-8)}` };
+  };
   // billing 抓取的 fetch 注入点（测试用 fake；生产走默认全局 fetch）。
   // OAuth device flow 复用同一个注入点（任务契约：沿用 adminFetch 参数）。
   const adminFetchImpl = adminFetch;
@@ -1851,15 +2405,42 @@ export function createApp(
     if (typeof catalogTimer.unref === 'function') catalogTimer.unref();
   }
 
-  return createServer(async (req, res) => {
+  // GitHub OTA 自更新（OTA.md）：后台版本检查定时器。只检查不自动应用，
+  // 结果喂给 /__admin/api/update/status 的缓存段（check/perform 端点也刷新）。
+  // intervalMs 0 = 关闭；timer unref 不拖进程退出。
+  const otaRoot = otaRootOverride ?? otaProjectRoot();
+  const otaState: OtaState = { status: null };
+  const otaCheckMs = cfg.otaCheckIntervalMs ?? 6 * 3_600_000;
+  // 门控 OTA_ENABLED（审查 M-1）：默认关闭（fail-closed）时**零外联**——
+  // 不启定时器、不打 GitHub，符合「OTA 对现有部署零影响」的验收。
+  if (otaCheckMs > 0 && cfg.otaEnabled === true) {
+    startOtaCheck({
+      intervalMs: otaCheckMs,
+      fetchImpl: adminFetchImpl,
+      repo: cfg.otaRepo ?? DEFAULT_OTA_REPO,
+      token: cfg.otaToken ?? '',
+      enabled: cfg.otaEnabled === true,
+      root: otaRoot,
+      onResult: (s) => {
+        otaState.status = s;
+      },
+    });
+  }
+
+  const server = createServer(async (req, res) => {
     const startTime = Date.now();
     const url = req.url ?? '/';
     const path = url.split('?')[0] ?? '/';
-    // 浏览器自动请求的静态资源：直接 404，不鉴权不记录 —— 否则 favicon 等
-    // 401 把面板的「最近请求」刷屏（实测 /__metrics events 被 favicon 占满）。
+    // 浏览器自动请求的静态资源：204 静默（无内容），不鉴权不记录 —— 否则
+    // favicon 等 401/404 把面板的「最近请求」刷屏、浏览器 console 报错
+    // （实测 /__metrics events 被 favicon 占满 + 页面 console 有 favicon 404 error）。
     if (STATIC_ASSET_PATHS.has(path)) {
-      res.writeHead(404, { 'content-type': 'text/plain' });
-      res.end('not found');
+      // 任意方法（含带 body 的 POST）命中静态路径都可能有残余 body：resume 消费
+      // 防 keep-alive 污染下一条请求（与限流路径同款问题）。connection: close
+      // 双保险——favicon 响应不值得保连接，排空后再关连接彻底杜绝假 400。
+      req.resume();
+      res.writeHead(204, { connection: 'close' });
+      res.end();
       return;
     }
     // handler 边跑边往这里填，finally 统一记一条指标事件。
@@ -1878,6 +2459,7 @@ export function createApp(
       error: null,
       costMicroCents: 0,
       tokenFp: null,
+      apiKeyFp: null,
       rewritten: 0,
       stripped: 0,
       compressed: 0,
@@ -1926,9 +2508,10 @@ export function createApp(
 
       // 监控面板：公开访问，无需鉴权（用户明确要求 HTML 公开）。
       //
-      // 注意这意味着**任何人都能看到全部调用方的 IP、完整 UA、转发链**。
-      // 这是刻意的选择，不是漏配。想收回去就把 DASHBOARD_PUBLIC 设成 0，
-      // 那时会退回「本机直连免 key、其余要 key」的行为。
+      // 公网匿名（非管理鉴权）响应按 m12/M-P2-1 裁剪：events 的 device 只留
+      // client/os/mobile 之类非身份字段，IP、完整 UA、转发链（xff）都剥掉 ——
+      // 只剥 IP 不剥 UA/xff 是半遮半掩，UA 指纹一样能追到人。管理鉴权（本机
+      // 直连 / 带 key）才拿到完整 device。想收回去就把 DASHBOARD_PUBLIC 设成 0。
       if (req.method === 'GET' && (path === '/__dash' || path === '/__metrics')) {
         if (!cfg.dashboardPublic && !(cfg.dashboardOpen && isDirectLocalRequest(req))) {
           // 面板登录会话 cookie 也放行（浏览器登录后可免 API key 访问监控面板）。
@@ -1952,13 +2535,15 @@ export function createApp(
           // 是管理面内部信息）。公网匿名模式两者都不给 —— 公网响应不含任何
           // 管理面字段（MULTI-ACCOUNT.md §6.1）。
           const adminOk = isAdminRequest(req, cfg);
-          // 隐私（m12）：公网匿名响应剥掉 device.ip（调用方 IP 不该公网可见）。
+          // 隐私（m12 + M-P2-1）：公网匿名响应把 device 裁剪到非身份字段 ——
+          // 剥 ip（调用方 IP 不该公网可见）、完整 ua（UA 指纹可追人）与
+          // forwardedFor 全链；只留 client/os/mobile/language/viaProxy 之类。
           // events 元素是环形缓冲的共享引用，剥字段必须复制对象，不能原地改。
-          // 管理鉴权请求保留完整 device（管理面板按 IP 统计要它）。
+          // 管理鉴权请求保留完整 device（管理面板按 IP/UA 统计要它）。
           const events = adminOk
             ? snap.events
             : snap.events.map((e) => {
-                const { ip: _ip, ...device } = e.device;
+                const { ua: _ua, ip: _ip, forwardedFor: _xff, ...device } = e.device;
                 return { ...e, device };
               });
           // 改写/剥除计数是管理面观测字段，与 accounts 段同门槛：公网匿名
@@ -2075,7 +2660,7 @@ export function createApp(
           if (path === '/__admin/api/oauth/start') {
             await handleOauthStart(req, res, cfg, oauthManager, adminFetchImpl);
           } else {
-            await handleOauthPoll(req, res, cfg, oauthManager, store, adminFetchImpl);
+            await handleOauthPoll(req, res, cfg, oauthManager, store, db, adminFetchImpl);
           }
           return;
         }
@@ -2189,6 +2774,73 @@ export function createApp(
               return;
             }
             sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+            return;
+          }
+        }
+        // 旧版 API key（legacyKey）明文 —— 详情页配置区「复制」用。独立 if
+        // （不与 /tokens/ 前缀混）—— admin 会话 + Origin 双校验，同 tokens plain。
+        if (path.startsWith('/__admin/api/legacy-key/') && path.endsWith('/plain')) {
+          const lid = parseAccountId(path.slice('/__admin/api/legacy-key/'.length, -'/plain'.length));
+          if (lid == null) { sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } }); return; }
+          if (req.method !== 'GET' || !adminOriginAllowed(req)) {
+            sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+            return;
+          }
+          if (store == null || !store.enabled) {
+            sendJson(res, 503, { error: { message: store == null ? 'accounts module not wired' : `accounts unavailable: ${store.disabledReason ?? 'unknown'}`, type: 'server_error' } });
+            return;
+          }
+          const lk = store.legacyKeyOf(lid);
+          if (lk == null) {
+            sendJson(res, 404, { error: { message: 'legacy key not configured for this account', type: 'not_found_error' } });
+            return;
+          }
+          sendJson(res, 200, { ok: true, data: { id: lid, key: lk } });
+          return;
+        }
+        // 密钥-模型授权（MODEL-ACCESS §5）：GET 面板全量 + PUT 全局/密钥级。
+        // 读写都过 adminOriginAllowed（读也防跨站，与 tokens/requests 同口径）。
+        if (path === '/__admin/api/model-access') {
+          if (req.method !== 'GET') {
+            sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+            return;
+          }
+          if (!adminOriginAllowed(req)) {
+            sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+            return;
+          }
+          await handleGetModelAccess(req, res, { cfg, db, settingsStore, modelAccess, tokens, pool: keyPool, store });
+          return;
+        }
+        if (path === '/__admin/api/model-access/global') {
+          if (req.method !== 'PUT') {
+            sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+            return;
+          }
+          if (!adminOriginAllowed(req)) {
+            sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+            return;
+          }
+          await handlePutModelAccessGlobal(req, res, { cfg, db, settingsStore, modelAccess, tokens, pool: keyPool, store });
+          return;
+        }
+        {
+          const maRest = path.startsWith('/__admin/api/model-access/keys/')
+            ? path.slice('/__admin/api/model-access/keys/'.length)
+            : null;
+          if (maRest != null) {
+            const slash = maRest.indexOf('/');
+            const typeRaw = slash >= 0 ? maRest.slice(0, slash) : maRest;
+            const subject = slash >= 0 ? maRest.slice(slash + 1) : '';
+            if (req.method !== 'PUT') {
+              sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+              return;
+            }
+            if (!adminOriginAllowed(req)) {
+              sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+              return;
+            }
+            await handlePutModelAccessKey(req, res, { cfg, db, settingsStore, modelAccess, tokens, pool: keyPool, store }, typeRaw, subject);
             return;
           }
         }
@@ -2311,7 +2963,42 @@ export function createApp(
           });
           return;
         }
-        await handleAdminRoutes(req, res, { cfg, store, pool: keyPool, fetchImpl: adminFetchImpl, db, consoleClient: consoleClientImpl });
+        // GitHub OTA 自更新端点（OTA.md）：status 只读（isAdminRequest 已过，
+        // 不加 Origin —— 读也防跨站的口径用于财务/设备信息，版本状态不在此列）；
+        // check/perform 是写操作，再过 adminOriginAllowed；perform 落 admin_audit。
+        if (path.startsWith('/__admin/api/update/')) {
+          const action = path.slice('/__admin/api/update/'.length);
+          const otaDeps: OtaDeps = {
+            cfg,
+            db,
+            fetchImpl: adminFetchImpl,
+            root: otaRoot,
+            state: otaState,
+          };
+          if (action === 'status' && req.method === 'GET') {
+            await handleOtaStatus(req, res, otaDeps);
+            return;
+          }
+          if (action === 'check' && req.method === 'POST') {
+            if (!adminOriginAllowed(req)) {
+              sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+              return;
+            }
+            await handleOtaCheck(req, res, otaDeps);
+            return;
+          }
+          if (action === 'perform' && req.method === 'POST') {
+            if (!adminOriginAllowed(req)) {
+              sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+              return;
+            }
+            await handleOtaPerform(req, res, { ...otaDeps, scheduleRestart: otaRestartStub ?? scheduleRestart });
+            return;
+          }
+          sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+          return;
+        }
+        await handleAdminRoutes(req, res, { cfg, store, pool: keyPool, fetchImpl: adminFetchImpl, db, consoleClient: consoleClientImpl, modelAccess });
         return;
       }
 
@@ -2322,6 +3009,9 @@ export function createApp(
           'access-control-allow-methods': 'POST, OPTIONS',
           'access-control-allow-headers': 'content-type, authorization, x-api-key, anthropic-version',
         });
+        // 恶意客户端可能给 preflight 带 body：不消费会残留在 socket 上，被当成
+        // 下一个请求解析（keep-alive 假 400，与限流路径同款问题）。
+        req.resume();
         res.end();
         return;
       }
@@ -2331,6 +3021,10 @@ export function createApp(
       if (cfg.allowUnauthenticated) {
         const origin = req.headers.origin;
         if (typeof origin === 'string' && origin.length > 0) {
+          // 与限流路径对齐：403 在 readBody 之前返回，请求体可能还在路上。
+          // resume 排空残余 body 防 keep-alive 假 400；connection: close 双保险。
+          res.setHeader('connection', 'close');
+          req.resume();
           sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
           return;
         }
@@ -2344,6 +3038,7 @@ export function createApp(
         return;
       }
       ctx.tokenFp = auth.tokenFp;
+      ctx.apiKeyFp = auth.apiKeyFp;
 
       if (req.method === 'POST' && path === '/v1/chat/completions') {
         if (!isJsonContentType(req.headers['content-type'])) {
@@ -2352,7 +3047,7 @@ export function createApp(
         }
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
         if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
-        await handleChatCompletion(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf);
+        await handleChatCompletion(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf, clientKeyGate, upstreamKeyModelAccess);
         return;
       }
 
@@ -2363,7 +3058,7 @@ export function createApp(
         }
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
         if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
-        await handleMessagesPassThrough(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf);
+        await handleMessagesPassThrough(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf, clientKeyGate, upstreamKeyModelAccess);
         return;
       }
 
@@ -2397,6 +3092,9 @@ export function createApp(
       // 「为什么失败」得回去翻 journalctl，而那恰是这个库要消灭的动作。
       ctx.error = stripControl(message).slice(0, 300);
       console.error(`[proxy] ${stripControl(message)}`);
+      // S-P2-4：catch 可能在任意阶段抛出（含 readBody 未消费完），先 resume 排空
+      // 残余 body，防 keep-alive 污染下一条请求（与限流路径同款；已消费也无害）。
+      req.resume();
       if (!res.headersSent) {
         sendJson(res, 500, { error: INTERNAL_SERVER_ERROR });
       } else {
@@ -2463,10 +3161,33 @@ export function createApp(
           ip: clientIpOf(req),
           costMicroCents: ctx.costMicroCents,
           tokenFp: ctx.tokenFp,
+          apiKeyFp: ctx.apiKeyFp,
         });
       }
     }
   });
+
+  // OTA 自重启（OTA.md §4）：替换成功后 1s 走现成 shutdown()（flush 用量库 →
+  // close → exit(0)），systemd Restart=always 拉起新版本。1s 让 HTTP 200 先 flush。
+  // **必须传 exit**：不传的话 shutdown 的 exitOnce 只 closeDb 不退出进程，活跃
+  // SSE 连接下 server.close 回调永不触发、5s 兜底后进程继续跑旧代码（审查 B-1）。
+  const scheduleRestart = (): void => {
+    setTimeout(() => {
+      shutdown('OTA', {
+        server,
+        closeDb: () => {
+          try {
+            db?.close();
+          } catch {
+            // 关库失败不阻断重启
+          }
+        },
+        exit: (code: number) => process.exit(code),
+      });
+    }, 1000);
+  };
+
+  return server;
 }
 
 /**
@@ -2504,6 +3225,8 @@ async function handleChatCompletion(
   keyId: string,
   ctx: MetricsCtx,
   allowedModelsOf: (accountId: number) => string[] | null,
+  keyGate: (ctx: MetricsCtx) => { allowed: ReadonlySet<string>; label: string } | null,
+  keyModelAccess: (rawKey: string) => string[] | null,
 ): Promise<void> {
   const read = await readBody(req, cfg.maxBodyBytes);
   if (!read.ok) {
@@ -2548,7 +3271,17 @@ async function handleChatCompletion(
 
   // 全局模型门：白名单外明确拒绝（不再静默回落 flash）。池空时跳过 ——
   // 池空是运维态（503），模型拒绝是配置问题（400），等池恢复后再暴露。
-  if (checkModelGate(res, typeof body.model === 'string' ? body.model : undefined, cfg, pool, ctx)) {
+  // 带密钥级授权（MODEL-ACCESS 入口 A）：token/api-key 自定义 ?? 全局默认。
+  const gate = keyGate(ctx);
+  if (checkModelGate(
+    res,
+    typeof body.model === 'string' ? body.model : undefined,
+    cfg,
+    pool,
+    ctx,
+    gate?.allowed ?? null,
+    gate?.label ?? null,
+  )) {
     return;
   }
 
@@ -2571,7 +3304,10 @@ async function handleChatCompletion(
   // 用 key 池转发。非流式在「未写出任何响应字节」时可换 key 重试一次。
   let upstream: UpstreamCall;
   try {
-    upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal, {}, undefined, { allowedModelsOf });
+    upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal, {}, undefined, {
+      allowedModelsOf,
+      keyModelAccess,
+    });
     ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
     if (err instanceof PoolEmptyError) {
@@ -2605,12 +3341,8 @@ async function handleChatCompletion(
   let modelUnsupported = false;
   if (!upstream.response.ok && !res.headersSent) {
     // 读取错误体用于分级（余额不足 → rate-limit，而非 auth 长期禁用）。
-    let errBody: unknown = null;
-    try {
-      errBody = await upstream.response.json();
-    } catch {
-      // body 不是 JSON（如空/HTML）：忽略，按状态码分级。
-    }
+    // 限长读取（M-P2-5 同类：不整读大非 JSON 错误体进堆），非 JSON 按状态码分级。
+    let errBody: unknown = await readUpstreamErrorJson(upstream.response);
     firstErrBody = errBody;
     modelUnsupported = isModelUnsupported(upstream.response.status, errBody);
     if (modelUnsupported) {
@@ -2633,6 +3365,7 @@ async function handleChatCompletion(
           upstream = await postUpstreamChat(cfg, pool, upstreamReq, controller.signal, {}, undefined, {
             excludeKey: upstream.key,
             allowedModelsOf,
+            keyModelAccess,
           });
           ctx.keyFingerprint = keyFingerprint(upstream.key);
           // 换了 key 就是一个全新的响应：上一个 key 的错误体不能再用来描述它。
@@ -2665,11 +3398,8 @@ async function handleChatCompletion(
     // 这是新响应，firstErrBody 属于上一个 key，得重新读。
     let errBody: unknown = firstErrBody;
     if (errBody == null) {
-      try {
-        errBody = await upstream.response.json();
-      } catch {
-        // ignore
-      }
+      // 限长读取（M-P2-5 同类），非 JSON 按状态码分级。
+      errBody = await readUpstreamErrorJson(upstream.response);
     }
     noteUpstreamError(ctx, upstream.response.status, errBody);
     // 统一错误出口：首 key 的失败已在换 key 判断块上报过（failureReported=true），
@@ -2858,6 +3588,68 @@ function prepareOpenAIUpstreamRequest(
   return out;
 }
 
+/** 上游错误响应体读取上限：只为分级/透传用，不整读大错误页进堆（S-P2-5）。 */
+const UPSTREAM_ERR_BODY_MAX = 64 * 1024;
+
+/**
+ * 限长读取上游错误响应体。旧实现 `text().slice(0, 64K)` 会把大错误体（HTML 错误
+ * 页/熔断页）**整读进堆再截断** —— 2GB VPS 上的内存放大点（OOM 史）。改流式限长：
+ * 先看 content-length 头，已超上限直接取消 body 不读；否则流式读满 64KB 即 cancel
+ * 剩余，cancel 只负责断开连接（未读完的 body 会占住 undici 连接），失败不吞结果。
+ */
+async function readUpstreamErrorBody(response: Response): Promise<string> {
+  const len = response.headers.get('content-length');
+  if (len != null) {
+    const n = Number(len);
+    if (Number.isFinite(n) && n > UPSTREAM_ERR_BODY_MAX) {
+      response.body?.cancel().catch(() => {});
+      return '';
+    }
+  }
+  const body = response.body;
+  if (!body) return '';
+  try {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let out = '';
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = UPSTREAM_ERR_BODY_MAX - total;
+      if (value.byteLength > remaining) {
+        out += decoder.decode(value.subarray(0, remaining), { stream: true });
+        reader.cancel().catch(() => {});
+        return out;
+      }
+      out += decoder.decode(value, { stream: true });
+      total += value.byteLength;
+      if (total >= UPSTREAM_ERR_BODY_MAX) {
+        reader.cancel().catch(() => {});
+        return out;
+      }
+    }
+    return out + decoder.decode();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 限长读取上游错误体并尝试解析为 JSON（chat 路径用）。与 readUpstreamErrorBody
+ * 同一内存约束（M-P2-5 同类：错误体可能被整读进堆），解析失败返回 null（调用方
+ * 按状态码分级）。
+ */
+async function readUpstreamErrorJson(response: Response): Promise<unknown> {
+  const raw = await readUpstreamErrorBody(response);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function handleMessagesPassThrough(
   req: IncomingMessage,
   res: ServerResponse,
@@ -2866,6 +3658,8 @@ async function handleMessagesPassThrough(
   keyId: string,
   ctx: MetricsCtx,
   allowedModelsOf: (accountId: number) => string[] | null,
+  keyGate: (ctx: MetricsCtx) => { allowed: ReadonlySet<string>; label: string } | null,
+  keyModelAccess: (rawKey: string) => string[] | null,
 ): Promise<void> {
   const read = await readBody(req, cfg.maxBodyBytes);
   if (!read.ok) {
@@ -2889,12 +3683,9 @@ async function handleMessagesPassThrough(
   // 大请求与小请求的响应 model 回显会分叉。快照对 <512KB 也一致（原样回显客户端模型名）。
   const requestedModel = typeof body.model === 'string' ? body.model : undefined;
 
-  // 全局模型门：白名单外明确拒绝（不再静默回落 flash）。池空时跳过 ——
-  // 池空是运维态（503），模型拒绝是配置问题（400），等池恢复后再暴露。
-  if (checkModelGate(res, requestedModel, cfg, pool, ctx)) {
-    return;
-  }
-
+  // L2：schema 校验（对齐 chat 路径：结构校验先于模型门 —— 同请求在两条路径
+  // 报错优先级一致，避免「非法模型 + 非法结构」在直通路径报模型错、chat 路径
+  // 报结构错；模型门读 body.model 需要已解析 body，validate 在前更稳）。
   const v = validateAnthropicRequest(body, cfg);
   if (!v.ok) {
     // 观测：校验拒绝的原因写进 ctx.error 落库/面板（此前校验 400 的 error 恒空，
@@ -2902,6 +3693,15 @@ async function handleMessagesPassThrough(
     ctx.error = `reject: ${v.error}`;
     console.log(`[proxy] validate reject ${req.url ?? ''}: ${v.error}`);
     sendJson(res, 400, { error: { message: v.error, type: 'invalid_request_error' } });
+    return;
+  }
+
+  // 全局模型门：白名单外明确拒绝（不再静默回落 flash）。池空时跳过 ——
+  // 池空是运维态（503），模型拒绝是配置问题（400），等池恢复后再暴露。
+  // 带密钥级授权（MODEL-ACCESS 入口 A）：token/api-key 自定义 ?? 全局默认。
+  // 在 validate 之后：非法结构先报结构错，不先撞模型门。
+  const gate = keyGate(ctx);
+  if (checkModelGate(res, requestedModel, cfg, pool, ctx, gate?.allowed ?? null, gate?.label ?? null)) {
     return;
   }
 
@@ -2981,7 +3781,7 @@ async function handleMessagesPassThrough(
       controller.signal,
       extraHeaders,
       undefined,
-      { allowedModelsOf },
+      { allowedModelsOf, keyModelAccess },
     );
     ctx.keyFingerprint = keyFingerprint(upstream.key);
   } catch (err) {
@@ -3001,8 +3801,8 @@ async function handleMessagesPassThrough(
 
   if (!upstream.response.ok) {
     // Claude Code 期望 Anthropic 原生错误格式，直通透传（限长 + 剥控制符防泄漏/日志注入），
-    // 保留 request-id 与 retry-after。
-    const raw = (await upstream.response.text().catch(() => '')).slice(0, 64 * 1024);
+    // 保留 request-id 与 retry-after。限长读取（S-P2-5）：不整读大错误体进堆。
+    const raw = await readUpstreamErrorBody(upstream.response);
     let errBody: unknown = null;
     try {
       errBody = JSON.parse(raw);
@@ -3037,7 +3837,9 @@ async function handleMessagesPassThrough(
     // summary.rewritten —— 改写率 = 上游上下文撞限的暴露面。
     const rewrittenBody = rewriteContextOverflowImpl(raw);
     if (rewrittenBody.rewrote) ctx.rewritten += 1;
-    res.end(stripSecrets(stripControl(rewrittenBody.text)));
+    // F2：上游错误体是 OpenAI 形状（{"error":{...}}）→ 补顶层 type:"error" 转成
+    // Anthropic 错误形状再透传，否则 Anthropic 客户端解析不到顶层 error.type。
+    res.end(stripSecrets(stripControl(wrapOpenAIErrorForAnthropic(rewrittenBody.text))));
     return;
   }
   const requestId = upstream.response.headers.get('request-id');
@@ -3099,6 +3901,13 @@ async function handleMessagesPassThrough(
           // server 侧取用记账 —— 否则主流量（messages + stream）的 input 侧
           // 用量账本失真，SCALE_CLIENT_TOKENS 缩放也永远作用不到 input 侧。
           if (ev.usage.input_tokens != null) ctx.inputTokens = ev.usage.input_tokens;
+          // 流式 thinking 记账（F1）：reasoning_tokens 由 toAnthropic 折进
+          // message_delta.usage.output_tokens_details.thinking_tokens（chat 路径
+          // 从 completion_tokens_details.reasoning_tokens 取同值，:3421）。不放
+          // 这里直通流式的 thinking 用量账本恒 0。
+          if (ev.usage.output_tokens_details?.thinking_tokens != null) {
+            ctx.thinkingTokens = ev.usage.output_tokens_details.thinking_tokens;
+          }
         }
         await writeChunk(res, anthropicEventToSSE(ev));
       }
@@ -3254,10 +4063,15 @@ function estimateInputTokens(body: unknown): number {
 const OAUTH_BODY_MAX_BYTES = 64 * 1024;
 
 /** 管理面写操作的 Origin 校验（与 admin.ts 的 originAllowed 同语义：
- *  hostname+端口归一比较，不比较 scheme，兼容 HTTPS 反代 TLS 终止）。 */
-function adminOriginAllowed(req: IncomingMessage): boolean {
+ *  hostname+端口归一比较，不比较 scheme，兼容 HTTPS 反代 TLS 终止）。
+ *  fail-closed：多值 Origin 头（Node 在部分版本/代理后解析成数组）按拒绝处理 ——
+ *  语义「多 Origin 任一匹配即放行」不可信，浏览器发不出多值 Origin（fetch 只
+ *  允许单值），出现数组头只可能是代理/恶意客户端。空/缺失 Origin 放行（curl
+ *  等非浏览器场景）。 */
+export function adminOriginAllowed(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
-  if (typeof origin !== 'string' || origin.length === 0) return true;
+  if (origin == null || origin === '') return true;
+  if (typeof origin !== 'string') return false;
   const host = req.headers.host;
   if (typeof host !== 'string' || host.length === 0) return false;
   try {
@@ -3310,6 +4124,7 @@ async function handleOauthPoll(
   cfg: AppConfig,
   oauth: OauthManager,
   store: AccountsStore | null,
+  db: UsageDb | null,
   fetchImpl: FetchLike | undefined,
 ): Promise<void> {
   if (!adminOriginAllowed(req)) {
@@ -3338,6 +4153,13 @@ async function handleOauthPoll(
   }
   const r = await oauth.poll(deviceCode, cfg.oauthConsoleUrl, cfg.oauthClientId, fetchImpl ?? fetch);
   if (!r.ok) {
+    // 重试路径 refresh 已轮换但 orgs 仍失败：新 rt 随结果带回。轮换后旧值立即
+    // 失效——按「轮换前旧值」匹配现有账号落库，不更新则进程重启后 console
+    // 通道用旧值必然 invalid_grant。匹配不上（首登 orgs 一直失败、账号还没建）
+    // → 跳过，下次 done 会落新值。
+    if (r.refreshToken && r.prevRefreshToken) {
+      persistOauthRefreshRotation(store, db, r.refreshToken, r.prevRefreshToken);
+    }
     sendJson(res, 200, { ok: false, reason: r.reason });
     return;
   }
@@ -3346,7 +4168,7 @@ async function handleOauthPoll(
     return;
   }
   // done：服务端自动创建账号（幂等）。失败时设备码已消费，前端重新走 start。
-  if (!persistOauthAccount(store, r.identity)) {
+  if (!persistOauthAccount(store, db, r.identity)) {
     sendJson(res, 200, { ok: false, reason: 'error' });
     return;
   }
@@ -3365,18 +4187,25 @@ async function handleOauthPoll(
  * 不同 workspace 才新建账号。所以「现有 cookie 账号能否补绑 OAuth」= 能，
  * 前提是同一个 workspace；面板无需单独入口，复用弹层再授权一次即可。
  */
-function persistOauthAccount(store: AccountsStore | null, identity: OauthIdentity): boolean {
+function persistOauthAccount(store: AccountsStore | null, db: UsageDb | null, identity: OauthIdentity): boolean {
+  // 审计（A-P2-2）：成功/失败都记，只带 accountId/ws，不记 token 材料。
+  const audit = (op: string, accountId: number | null, ok: boolean, note: string | null): void => {
+    db?.insertAdminAudit({ at: Date.now(), op, accountId, ok, note: note ?? `ws=${identity.workspaceId}` });
+  };
   if (store == null || !store.enabled) {
     console.error(`[oauth] 数据面不可用，登录成功但账号未落库: ws=${identity.workspaceId}`);
+    audit('oauth.account-create', null, false, 'store unavailable');
     return false;
   }
   const existing = store.list().find((a) => a.workspaceId === identity.workspaceId);
   if (existing) {
     if (!store.setOauthRefresh(existing.id, identity.refreshToken)) {
       console.error(`[oauth] 账号 ${existing.id} refresh_token 落库失败`);
+      audit('oauth.refresh-update', existing.id, false, 'refresh persist failed');
       return false;
     }
     console.log(`[oauth] account=${identity.name} ws=${identity.workspaceId} refresh updated`);
+    audit('oauth.refresh-update', existing.id, true, null);
     return true;
   }
   const created = store.create({
@@ -3388,14 +4217,42 @@ function persistOauthAccount(store: AccountsStore | null, identity: OauthIdentit
   });
   if (!created.ok) {
     console.error(`[oauth] 账号创建失败: ${created.reason}`);
+    audit('oauth.account-create', null, false, `create failed: ${created.reason}`);
     return false;
   }
   if (!store.setOauthRefresh(created.value.id, identity.refreshToken)) {
     console.error(`[oauth] 账号 ${created.value.id} refresh_token 落库失败`);
+    audit('oauth.account-create', created.value.id, false, 'refresh persist failed');
     return false;
   }
   console.log(`[oauth] account=${identity.name} ws=${identity.workspaceId} created (id=${created.value.id})`);
+  audit('oauth.account-create', created.value.id, true, null);
   return true;
+}
+
+/**
+ * orgs 失败路径的 refresh 轮换落库：按「旧值 == 账号现存 rt」匹配现有账号。
+ * refresh 轮换语义下旧值在轮换瞬间失效，不更新则进程重启后 console 通道用旧值
+ * 必然 invalid_grant。匹配不上（首登 orgs 一直失败、账号还没建）→ 跳过，下次
+ * done 会落新值。仅 OAuth 登录过的账号才存过 rt，逐个解密匹配，账号量小代价可忽略。
+ */
+function persistOauthRefreshRotation(
+  store: AccountsStore | null,
+  db: UsageDb | null,
+  newRt: string,
+  prevRt: string,
+): void {
+  if (store == null || !store.enabled) return;
+  for (const a of store.list()) {
+    if (store.getOauthRefresh(a.id) !== prevRt) continue;
+    if (store.setOauthRefresh(a.id, newRt)) {
+      db?.insertAdminAudit({ at: Date.now(), op: 'oauth.refresh-rotate', accountId: a.id, ok: true, note: 'orgs failed after rotation' });
+      console.log(`[oauth] 轮换落库（orgs 失败路径）account=${a.id}`);
+    } else {
+      console.error(`[oauth] 轮换落库失败 account=${a.id}`);
+    }
+    return;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4371,7 +5228,7 @@ export interface LegacyPlainKey {
  * LegacyPlainCache，端点只依赖 get/clear；填充由 client 适配器完成）。
  */
 export interface LegacyPlainCacheLike {
-  get(accountId: number): LegacyPlainKey[] | null;
+  get(accountId: number, ws?: string): LegacyPlainKey[] | null;
   clear(accountId: number): void;
 }
 
@@ -4434,6 +5291,12 @@ export interface LegacyClientLike {
   createKey(accountId: number, cookie: string | null, workspaceId: string, name: string): Promise<LegacyWriteResult>;
   deleteKey(accountId: number, cookie: string | null, workspaceId: string, keyId: string): Promise<LegacyWriteResult>;
   getGoStatus(accountId: number, cookie: string | null, workspaceId: string): Promise<LegacyGoReadResult>;
+  /**
+   * 用旧版 Default API Key 读 Go 订阅用量（/zen/go/v1/usage JSON API，零 cookie）。
+   * 成功返回 LegacyGoStatus；失败（401/非 2xx/网络/畸形）返回 null —— 调用方
+   * 回落 cookie HTML 抓取。main.ts 用 legacy.ts 的 fetchZenGoUsage 实现。
+   */
+  getZenGoUsage(accountId: number, apiKey: string): Promise<LegacyGoStatus | null>;
   setGoToggle(accountId: number, cookie: string | null, workspaceId: string, toggle: 'useBalance' | 'chinaModels', value: boolean): Promise<LegacyWriteResult>;
   getBilling(accountId: number, cookie: string | null, workspaceId: string): Promise<LegacyBillingReadResult>;
 }
@@ -4616,7 +5479,7 @@ async function runLegacyWrite(
     sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
-  const cookie = deps.store!.cookieOf(accountId);
+  const cookie = deps.store!.legacyCookieOf?.(accountId) ?? deps.store!.cookieOf(accountId);
   const r = await call(cookie, ws, body);
   if (r === null) return;
   const ok = r.ok;
@@ -4655,7 +5518,7 @@ async function runLegacyWriteNoBody(
     sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
-  const cookie = deps.store!.cookieOf(accountId);
+  const cookie = deps.store!.legacyCookieOf?.(accountId) ?? deps.store!.cookieOf(accountId);
   const r = await call(cookie, ws);
   const ok = r.ok;
   console.log(`[admin] op=${op} account=${accountId} by=local`);
@@ -4685,7 +5548,7 @@ async function handleLegacyKeysList(res: ServerResponse, deps: LegacyDeps, accou
     sendJson(res, 200, { ok: true, data: { keys: cached } });
     return;
   }
-  const cookie = deps.store!.cookieOf(accountId);
+  const cookie = deps.store!.legacyCookieOf?.(accountId) ?? deps.store!.cookieOf(accountId);
   const r = await deps.client!.listKeys(accountId, cookie, ws);
   if (!r.ok) {
     sendLegacyChannelError(res, r.reason);
@@ -4718,8 +5581,8 @@ async function handleLegacyPlainKeys(res: ServerResponse, deps: LegacyDeps, acco
     sendJson(res, 404, { error: { message: 'legacy workspace not configured for this account', type: 'not_found_error' } });
     return;
   }
-  const cookie = deps.store!.cookieOf(accountId);
-  const cached = deps.plainCache.get(accountId);
+  const cookie = deps.store!.legacyCookieOf?.(accountId) ?? deps.store!.cookieOf(accountId);
+  const cached = deps.plainCache.get(accountId, ws);
   if (cached) {
     sendJson(res, 200, cached);
     return;
@@ -4732,7 +5595,7 @@ async function handleLegacyPlainKeys(res: ServerResponse, deps: LegacyDeps, acco
     return;
   }
   // listKeys 的抓取已刷新缓存；解析到明文就返回，空列表/无明文返回 []。
-  sendJson(res, 200, deps.plainCache.get(accountId) ?? []);
+  sendJson(res, 200, deps.plainCache.get(accountId, ws) ?? []);
 }
 
 /** 读端点：GET /__admin/api/legacy/account/:id/go（订阅状态 + 三窗口用量 + 开关）。 */
@@ -4749,7 +5612,35 @@ async function handleLegacyGoStatus(res: ServerResponse, deps: LegacyDeps, accou
     sendJson(res, 200, { ok: true, data: { go: cached } });
     return;
   }
-  const cookie = deps.store!.cookieOf(accountId);
+  // 旧版 Default API Key 优先走 zen usage JSON API（零 cookie，懒人配置的核心）。
+  // zen JSON 无 useBalance/chinaModels 两个开关（恒 false）——并行从 cookie
+  // HTML go 页取开关，mergeLegacyGoStatus 合并：zen 的窗口 + cookie 的开关值。
+  // cookie 失败（无 cookie/401/解析失败）→ 开关保持 false（merge 返回 zen
+  // 原样，不阻塞窗口返回，与 zen 单独使用时一致，不新增错误面）；cookie 失败
+  // 不影响 zen 窗口。zen 失败 → 用已并行取得的 cookie 结果（既有回落路径，
+  // 行为不变）。zen 失败不缓存 —— 2s tick 会重试，key 无效/网络波动自愈。
+  const lk = deps.store!.legacyKeyOf?.(accountId);
+  if (lk) {
+    const cookie = deps.store!.legacyCookieOf?.(accountId) ?? deps.store!.cookieOf(accountId);
+    const [zen, cookieR] = await Promise.all([
+      deps.client!.getZenGoUsage(accountId, lk),
+      deps.client!.getGoStatus(accountId, cookie, ws),
+    ]);
+    if (zen) {
+      const merged = mergeLegacyGoStatus(zen, cookieR.ok ? cookieR.status : null);
+      deps.ttlCache.set(accountId, 'go', ws, merged);
+      sendJson(res, 200, { ok: true, data: { go: merged } });
+      return;
+    }
+    if (!cookieR.ok) {
+      sendLegacyChannelError(res, cookieR.reason);
+      return;
+    }
+    deps.ttlCache.set(accountId, 'go', ws, cookieR.status);
+    sendJson(res, 200, { ok: true, data: { go: cookieR.status } });
+    return;
+  }
+  const cookie = deps.store!.legacyCookieOf?.(accountId) ?? deps.store!.cookieOf(accountId);
   const r = await deps.client!.getGoStatus(accountId, cookie, ws);
   if (!r.ok) {
     sendLegacyChannelError(res, r.reason);
@@ -4773,7 +5664,7 @@ async function handleLegacyBilling(res: ServerResponse, deps: LegacyDeps, accoun
     sendJson(res, 200, { ok: true, data: { billing: cached } });
     return;
   }
-  const cookie = deps.store!.cookieOf(accountId);
+  const cookie = deps.store!.legacyCookieOf?.(accountId) ?? deps.store!.cookieOf(accountId);
   const r = await deps.client!.getBilling(accountId, cookie, ws);
   if (!r.ok) {
     sendLegacyChannelError(res, r.reason);
@@ -4877,4 +5768,36 @@ function rewriteContextOverflowImpl(raw: string): { text: string; rewrote: boole
     ),
     rewrote: true,
   };
+}
+
+/**
+ * 把 OpenAI 错误响应体包装成 Anthropic 错误形状（F2）。
+ *
+ * 直通路径上游是 OpenAI 协议，错误体是 `{"error":{...}}`；Anthropic 客户端
+ * 期望顶层 `type:"error"`（否则 message/type 都在 error 里、顶层对不上而报
+ * 「unexpected error format」）。body 是 OpenAI 错误形状（JSON 对象 + error 字段）
+ * 时补顶层 type，内层 error 的 message/type/code 全部原样保留；已带
+ * type:"error"（上游本身 Anthropic 形状）、解析失败 / 非 JSON（SSR 错误页、
+ * HTML 熔断页）、没有 error 字段的 body 一律原样透传，不猜形状。
+ */
+function wrapOpenAIErrorForAnthropic(text: string): string {
+  if (!text) return text;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return text;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type === 'error') return text;
+  const err = obj.error;
+  if (typeof err !== 'object' || err === null || Array.isArray(err)) return text;
+  // 保留内层 error（message/type/status 等字段一个不丢），其余顶层字段（如
+  // status）也带上，只补 type:"error"。
+  const wrapped: Record<string, unknown> = { type: 'error', error: err };
+  for (const [k, v] of Object.entries(obj)) {
+    if (k !== 'error' && k !== 'type') wrapped[k] = v;
+  }
+  return JSON.stringify(wrapped);
 }

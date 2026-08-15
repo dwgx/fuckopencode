@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /**
  * 上游 key 池：多 key 自动分流 + 失败自动禁用 + 冷却恢复。
  *
@@ -102,8 +104,19 @@ export interface KeyStateEvent {
 
 export type UpstreamFailureKind = 'auth' | 'rate-limit' | 'quota-exhausted' | 'transient';
 
-/** 额度耗尽但解析不出重置时间时的默认冷却：1 小时。 */
-const QUOTA_FALLBACK_COOLDOWN_MS = 3_600_000;
+/**
+ * 额度耗尽但解析不出重置时间时的默认冷却：24 小时（2026-08-14 从 1h 提升）。
+ *
+ * 为什么是 24h 而不是 1h：实测上游（opencode zen）的额度错误绝大多数没有
+ * `Resets in` 时间（FreeUsageLimitError 的 message 是 "Rate limit exceeded.
+ * Please try again later."），1 小时兜底让 key 每小时回池再撞一次 429 ——
+ * 用户实测面板显示「quota-exhausted · 5m26s」这种假冷却，每几分钟一轮失败。
+ * 额度窗口的真实恢复时长：free 日窗 24h、周额度 2 天。24h 覆盖两者下界，
+ * 回池后若仍未恢复会再解析（有 Resets 的走精确时长）。代价：真并发限流
+ * （几秒恢复）被冻 24h —— 但 429 并发限流在 classify 里是 rate-limit 分支
+ * （3 秒），只有明确额度类型/额度文案才走到这里，不会误伤。
+ */
+const QUOTA_FALLBACK_COOLDOWN_MS = 24 * 3_600_000;
 
 /**
  * 冷却策略的对外描述（面板用）。
@@ -184,6 +197,18 @@ export class KeyPool {
    */
   private modelBlocks = new Map<string, number>();
 
+  /**
+   * sha256 指纹预计算索引（P2-4）：sha256(key) 全 hex → key。构造/addKey 时
+   * 维护，removeKey 时删除。原 hasKeyWithHash 每调用遍历全部 key 逐把重算
+   * sha256（O(n) 次哈希）；预计算后 O(1) 点查。key 原文只作 Map value 内部
+   * 持有，对外仍只暴露指纹 —— 与 snapshot/disabledFingerprints 同一约束。
+   */
+  private readonly sha256ByKey = new Map<string, string>();
+
+  private indexSha256(key: string): void {
+    this.sha256ByKey.set(createHash('sha256').update(key, 'utf8').digest('hex'), key);
+  }
+
   constructor(
     rawKeys: string[],
     options: KeyPoolOptions,
@@ -207,6 +232,7 @@ export class KeyPool {
         lastFailAt: -1,
         totalAcquired: 0,
       });
+      this.indexSha256(key);
     }
     this.opts = {
       cooldownMs: options.cooldownMs,
@@ -405,13 +431,13 @@ export class KeyPool {
    *
    * @param excludeKey 本次不参与选路的 key（换 key 重试用：刚失败的 key 刚 release，
    *   inFlight 归 0 会被 least-loaded 立即重选，白撞一次错误再换号）。
-   * @param isEligible 账号级过滤（账号模型白名单 + 被动学习 block）。健康过滤后再
-   *   逐 key 按 accountId 判断；未提供 = 不过滤。全部健康 key 都被滤掉 → 抛
-   *   ModelNotAllowedError（配置问题，区别于池空的健康问题）。
+   * @param isEligible 账号级/密钥级过滤（账号模型白名单 + 密钥级自定义授权 +
+   *   被动学习 block）。健康过滤后再逐 key 按 (accountId, key) 判断；未提供 = 不过滤。
+   *   全部健康 key 都被滤掉 → 抛 ModelNotAllowedError（配置问题，区别于池空的健康问题）。
    * @param model 携带进 ModelNotAllowedError 的模型名（选号过滤是账号归属知道后
    *   才做的，error 要能告诉调用方「哪个模型被拒」）。
    */
-  acquire(excludeKey?: string, isEligible?: (accountId: number) => boolean, model = ''): string {
+  acquire(excludeKey?: string, isEligible?: (accountId: number, key: string) => boolean, model = ''): string {
     const now = this.now();
     this.reapRecovered(now);
     const healthy = this.keys.filter((k) => this.isAvailable(k) && k.key !== excludeKey);
@@ -419,7 +445,7 @@ export class KeyPool {
       // 池空：抛 typed error，server 层转 503。
       throw new PoolEmptyError();
     }
-    const eligible = isEligible == null ? healthy : healthy.filter((k) => isEligible(k.accountId));
+    const eligible = isEligible == null ? healthy : healthy.filter((k) => isEligible(k.accountId, k.key));
     if (eligible.length === 0) {
       // 有健康 key 但全被账号级过滤排除：模型拒绝（配置问题），不是池空（健康问题）。
       throw new ModelNotAllowedError(model);
@@ -502,9 +528,10 @@ export class KeyPool {
       // 429 / 余额不足：只打**很短**的冷却，不累计禁用计数。
       //
       // 冷却必须短：429 与余额不足通常是**账号级**状态，换 key 也解决不了，
-      // 而 key 数量往往很少（线上 2 个）。用 cooldownMs/6（默认 50s）会让
-      // 连续两次 429 就把整池打光、之后 50 秒全部 503 —— Claude Code 遇 503
-      // 直接报错中断，表现为「用一会儿就挂」。所以这里固定 3 秒上限，
+      // 而 key 数量往往很少（线上 2 个）。实际公式 `cooldownMs/100` 并钳到
+      // [500ms, 3s]（默认 cooldownMs=300s → 3s）。若冷却过长（如 50s），
+      // 连续两次 429 就会把整池打光、之后几十秒全部 503 —— Claude Code 遇 503
+      // 直接报错中断，表现为「用一会儿就挂」。所以固定 3 秒上限，
       // 让请求快速重回池子，把重试节奏交给客户端而不是拖死整池。
       // 短冷却也上报：整池同时 rate-limit 一样会造成 503 空窗，
       // 而这恰好是排查 2026-08-09 那 295 个 503 时最大的盲区。
@@ -584,6 +611,7 @@ export class KeyPool {
       lastFailAt: -1,
       totalAcquired: 0,
     });
+    this.indexSha256(trimmed);
     return true;
   }
 
@@ -594,6 +622,7 @@ export class KeyPool {
   removeKey(key: string): boolean {
     const idx = this.keys.findIndex((p) => p.key === key.trim());
     if (idx === -1) return false;
+    this.sha256ByKey.delete(createHash('sha256').update(key.trim(), 'utf8').digest('hex'));
     this.keys.splice(idx, 1);
     return true;
   }
@@ -601,6 +630,17 @@ export class KeyPool {
   /** key 所属账户 id；未知 key 返回 0（未归属）。 */
   accountIdOf(key: string): number {
     return this.keys.find((p) => p.key === key.trim())?.accountId ?? 0;
+  }
+
+  /**
+   * 池内是否存在 sha256(key) 全 hex = 给定值的 key（MODEL-ACCESS 管理面校验
+   * upstream-key subject 用）。纯内部比对，不返回任何 key 材料 —— 与
+   * snapshot/disabledFingerprints 同一不泄明文约束。
+   * P2-4：sha256 在构造/addKey 时预计算进 Map，O(1) 点查（不再每调用遍历
+   * 全部 key 逐把重算哈希）。
+   */
+  hasKeyWithHash(sha256Hex: string): boolean {
+    return this.sha256ByKey.has(sha256Hex);
   }
 
   /**

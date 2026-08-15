@@ -477,9 +477,15 @@ export async function* openAIStreamToAnthropic(
     // 里恒 0，不放这里流式 input 用量就是 0。Anthropic 允许 message_delta.usage
     // 带 input_tokens。output_tokens 走 scale（SCALE_CLIENT_TOKENS 是给客户端看
     // 的失真值），input 侧保持真实 —— 否则实验开关污染网关自身记账。
+    // thinking（F1）：reasoning_tokens 由 anthropicUsage 折进 output_tokens_details
+    // （与 output_tokens 同源同 scale，非流式已记账、流式此前漏掉恒 0）。不放
+    // 这里 server 直通流式路径取不到 thinking 用量。
     usage: {
       output_tokens: anthropicUsage.output_tokens,
       input_tokens: openAIUsageToAnthropic(usage, undefined).input_tokens,
+      ...(anthropicUsage.output_tokens_details != null
+        ? { output_tokens_details: anthropicUsage.output_tokens_details }
+        : {}),
     },
   };
   yield { type: 'message_stop' };

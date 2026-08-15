@@ -307,6 +307,105 @@ describe('OauthManager.poll', () => {
     expect((await m2.poll('dc-1', 'https://console.test', 'opencode-cli', fetchImpl2)).ok).toBe(false);
   });
 
+  it('C-P2-1：orgs 瞬时失败走重试路径，refresh token 轮换写回会话（identity 用新值，绝不用死值落库）', async () => {
+    const m = new OauthManager();
+    let orgsFailures = 0;
+    let tokenCalls = 0;
+    const refreshRequests: string[] = [];
+    // 顺序状态机：初始 device_code 换 at-1/rt-1 → orgs 401 → 重试#1 用 rt-1
+    // 换 at-2/rt-2 → orgs 又 401 → 重试#2 用 rt-2 换 at-3/rt-3 → orgs 成功。
+    const fetchImpl: FetchLike = async (input, init) => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.endsWith('/auth/device/code')) {
+        return jsonResponse(200, DEFAULT_CODE);
+      }
+      if (url.endsWith('/auth/device/token')) {
+        tokenCalls += 1;
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        if (body.grant_type === 'urn:ietf:params:oauth:grant-type:device_code') {
+          return jsonResponse(200, { access_token: 'at-1', refresh_token: 'rt-1' });
+        }
+        refreshRequests.push(String(body.refresh_token));
+        return jsonResponse(200, { access_token: `at-${tokenCalls}`, refresh_token: `rt-${tokenCalls}` });
+      }
+      if (url.endsWith('/api/orgs')) {
+        if (orgsFailures < 2) {
+          orgsFailures += 1;
+          return jsonResponse(401, { error: 'unauthorized' });
+        }
+        return jsonResponse(200, [{ id: 'org-ws-1', name: 'main' }]);
+      }
+      if (url.endsWith('/api/user')) return jsonResponse(200, { id: 'u1', email: 'user@example.com' });
+      return new Response('not found', { status: 404 });
+    };
+    await m.start('https://console.test', 'opencode-cli', fetchImpl);
+
+    expect(await m.poll('dc-1', 'https://console.test', 'opencode-cli', fetchImpl)).toEqual({ ok: false, reason: 'error' });
+    // 第二次失败发生在重试路径（refresh 已轮换 rt-1→rt-2）：失败结果带回新 rt，
+    // 调用方按 prevRefreshToken 匹配现有账号落库，轮换不丢（M3-oauth）。
+    expect(await m.poll('dc-1', 'https://console.test', 'opencode-cli', fetchImpl)).toEqual({
+      ok: false,
+      reason: 'error',
+      refreshToken: 'rt-2',
+      prevRefreshToken: 'rt-1',
+    });
+    const done = await m.poll('dc-1', 'https://console.test', 'opencode-cli', fetchImpl);
+    expect(done).toEqual({
+      ok: true,
+      status: 'done',
+      identity: { name: 'user@example.com', workspaceId: 'org-ws-1', workspaceName: 'main', refreshToken: 'rt-3' },
+    });
+    // 每次重试都用会话里**最新轮换值**（rt-1 → rt-2），证明轮换写回了会话；
+    // 若没写回，第二次重试会用旧值 rt-1，refreshRequests 就是 ['rt-1','rt-1']。
+    expect(refreshRequests).toEqual(['rt-1', 'rt-2']);
+    expect(m.sessionCount()).toBe(0);
+  });
+
+  it('M3-oauth：重试路径 refresh 轮换后 orgs 再失败 → 失败结果带回新 rt（轮换不丢）', async () => {
+    const m = new OauthManager();
+    let orgsFailures = 0;
+    let tokenCalls = 0;
+    const fetchImpl: FetchLike = async (input, init) => {
+      const url = typeof input === 'string' ? input : String(input);
+      if (url.endsWith('/auth/device/code')) return jsonResponse(200, DEFAULT_CODE);
+      if (url.endsWith('/auth/device/token')) {
+        tokenCalls += 1;
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        if (body.grant_type === 'urn:ietf:params:oauth:grant-type:device_code') {
+          return jsonResponse(200, { access_token: 'at-1', refresh_token: 'rt-1' });
+        }
+        return jsonResponse(200, { access_token: `at-${tokenCalls}`, refresh_token: `rt-${tokenCalls}` });
+      }
+      if (url.endsWith('/api/orgs')) {
+        if (orgsFailures < 2) {
+          orgsFailures += 1;
+          return jsonResponse(401, { error: 'unauthorized' });
+        }
+        return jsonResponse(200, [{ id: 'org-ws-1', name: 'main' }]);
+      }
+      if (url.endsWith('/api/user')) return jsonResponse(200, { id: 'u1', email: 'user@example.com' });
+      return new Response('not found', { status: 404 });
+    };
+    await m.start('https://console.test', 'opencode-cli', fetchImpl);
+
+    // 首次失败：本轮没有轮换发生，不带 refreshToken。
+    expect(await m.poll('dc-1', 'https://console.test', 'opencode-cli', fetchImpl)).toEqual({ ok: false, reason: 'error' });
+    // 重试路径 refresh 轮换（rt-1→rt-2）后 orgs 再失败：新值必须随结果带回，
+    // 否则调用方无法落库，旧值 rt-1 已失效 → 下次刷新 invalid_grant。
+    expect(await m.poll('dc-1', 'https://console.test', 'opencode-cli', fetchImpl)).toEqual({
+      ok: false,
+      reason: 'error',
+      refreshToken: 'rt-2',
+      prevRefreshToken: 'rt-1',
+    });
+    // 第三次成功：identity 用最新轮换值落库。
+    expect(await m.poll('dc-1', 'https://console.test', 'opencode-cli', fetchImpl)).toEqual({
+      ok: true,
+      status: 'done',
+      identity: { name: 'user@example.com', workspaceId: 'org-ws-1', workspaceName: 'main', refreshToken: 'rt-3' },
+    });
+  });
+
   it('fetch 超时（AbortSignal.timeout 触发）→ error，不挂死', async () => {
     // fake 只监听 signal：abort 才 reject —— 真实 fetch 超时就是这个行为。
     const hangFetch: FetchLike = (_input, init) =>

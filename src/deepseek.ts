@@ -359,9 +359,6 @@ export function injectMissingThinkingBlocks(body: Record<string, unknown>): void
     if (msg.role !== 'assistant') continue;
     const content = msg.content;
     if (!Array.isArray(content)) continue;
-    const hasToolUse = content.some(
-      (b) => b != null && typeof b === 'object' && (b as { type?: unknown }).type === 'tool_use',
-    );
     const hasThinking = content.some(
       (b) => b != null && typeof b === 'object' && (b as { type?: unknown }).type === 'thinking',
     );
@@ -372,7 +369,6 @@ export function injectMissingThinkingBlocks(body: Record<string, unknown>): void
     if (!hasThinking && content.length > 0) {
       content.unshift({ type: 'thinking', thinking: '', signature: '' });
     }
-    void hasToolUse;
   }
 }
 
@@ -449,6 +445,10 @@ export async function* completeStreamEvents(
           id: `msg_${Date.now().toString(36)}`,
           type: 'message',
           role: 'assistant',
+          // `model: ''` 是刻意为之：本函数拿不到模型上下文（事件流里唯一的
+          // 模型来源是上游自带的 message_start，但那种情况下不会走到这里——
+          // 上游已发过就不补发，case 'message_start' 原样透传）。客户端对该
+          // 字段的兼容性待验证，但没有可靠来源时填假值比空串更危险，故保留空串。
           model: '',
           content: [],
           stop_reason: null,

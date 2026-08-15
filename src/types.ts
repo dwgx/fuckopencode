@@ -228,7 +228,13 @@ export type AnthropicStreamEvent =
       // input_tokens 由网关补传真实 prompt_tokens（Anthropic 允许 message_delta
       // 带 input_tokens）：流式下 message_start 里恒 0，不放这里 server 侧
       // 拿不到 input 用量（见 toAnthropic.openAIStreamToAnthropic 收尾段）。
-      usage?: { output_tokens: number; input_tokens?: number };
+      // output_tokens_details.thinking_tokens（F1）：reasoning_tokens 由网关折进
+      // message_delta，server 直通流式记账从这里取 thinking。
+      usage?: {
+        output_tokens: number;
+        input_tokens?: number;
+        output_tokens_details?: { thinking_tokens?: number };
+      };
     }
   | { type: 'message_stop' }
   | { type: 'ping' }

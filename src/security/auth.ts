@@ -2,7 +2,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { AppConfig } from '../config.js';
 
 export type AuthResult =
-  | { ok: true; keyId: string; tokenFp: string | null; rpmLimit: number }
+  | { ok: true; keyId: string; tokenFp: string | null; rpmLimit: number; apiKeyFp: string | null }
   | { ok: false };
 
 /**
@@ -93,23 +93,25 @@ export function verifyAuth(
     const tokenHash = sha256Hex(token);
     for (const [allowed, allowedHash] of apiKeyHashes(cfg.apiKeys)) {
       if (timingSafeEqual(tokenHash, allowedHash)) {
-        return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null, rpmLimit: 0 };
+        // apiKeyFp = sha256(apiKey) 全 hex：API 客户端的稳定身份（MODEL-ACCESS
+        // 授权 + 请求归因用）。keyId 保持短随机值（面板日志展示用，不暴露指纹）。
+        return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null, rpmLimit: 0, apiKeyFp: sha256Hex(allowed).toString('hex') };
       }
     }
     if (tokensStore != null) {
       const r = tokensStore.verify(token);
-      if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint, rpmLimit: r.rpmLimit };
+      if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint, rpmLimit: r.rpmLimit, apiKeyFp: null };
     }
     return { ok: false };
   }
 
   if (token != null && tokensStore != null) {
     const r = tokensStore.verify(token);
-    if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint, rpmLimit: r.rpmLimit };
+    if (r.ok) return { ok: true, keyId: r.fingerprint.slice(-8), tokenFp: r.fingerprint, rpmLimit: r.rpmLimit, apiKeyFp: null };
   }
 
   if (cfg.allowUnauthenticated) {
-    return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null, rpmLimit: 0 };
+    return { ok: true, keyId: randomUUID().slice(0, 8), tokenFp: null, rpmLimit: 0, apiKeyFp: null };
   }
   return { ok: false };
 }

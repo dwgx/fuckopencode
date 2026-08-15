@@ -12,6 +12,7 @@
  */
 
 import { stripControl } from './errors.js';
+import { maskKey } from './legacy.js';
 import { keyFingerprint } from './keypool.js';
 import type { KeyPool, PoolKeySnapshot, UpstreamFailureKind } from './keypool.js';
 import type { SecretKey } from './secrets.js';
@@ -40,6 +41,10 @@ export interface AccountView {
   workspaceId: string | null;
   /** 旧版控制台（opencode.ai，wrk_ 前缀）workspace id；未配置 null。 */
   legacyWorkspaceId: string | null;
+  /** 是否配置了旧版 Default API Key（zen usage JSON API 用，免 cookie）。 */
+  hasLegacyKey: boolean;
+  /** 掩码（如 sk-AOpQ...0osU）；未配置 null。绝不含明文。 */
+  legacyKeyMasked: string | null;
   status: AccountStatus;
   statusDetail: string | null;
   retryUntil: number;
@@ -63,6 +68,8 @@ export interface AccountPatch {
   legacyWorkspaceId?: string | null;
   cookie?: string | null;
   legacyCookie?: string | null;
+  /** 旧版 Default API Key（zen usage JSON API 用）；null/空串 = 清除。 */
+  legacyKey?: string | null;
   /** 账号级模型白名单；null/空数组 = 清除（退回全局白名单）。 */
   allowedModels?: string[] | null;
 }
@@ -87,6 +94,10 @@ export interface AccountSectionItem {
   workspaceId: string | null;
   /** 旧版控制台（opencode.ai，wrk_ 前缀）workspace id；未配置 null。 */
   legacyWorkspaceId: string | null;
+  /** 是否配置了旧版 Default API Key（zen usage JSON API 用，免 cookie）。 */
+  hasLegacyKey: boolean;
+  /** 掩码（如 sk-AOpQ...0osU）；未配置 null。绝不含明文。 */
+  legacyKeyMasked: string | null;
   /** 控制台凭据（cookie 或 OAuth）是否存在。 */
   hasConsole: boolean;
   balance: number | null;
@@ -265,6 +276,10 @@ export class AccountsStore {
     if (patch.cookie !== undefined) {
       // cookie 只能整体替换：空串/null 都是清除，非空才加密。
       dbPatch.cookieEnc = patch.cookie === null || patch.cookie === '' ? null : secret.encrypt(patch.cookie);
+    }
+    if (patch.legacyKey !== undefined) {
+      // 旧版 Default API Key 只能整体替换：空串/null 都是清除，非空才加密。
+      dbPatch.legacyKeyEnc = patch.legacyKey === null || patch.legacyKey === '' ? null : secret.encrypt(patch.legacyKey);
     }
     if (patch.allowedModels !== undefined) {
       // 空数组 = 清除（与 null 同语义，退回全局白名单）；非空去空去重后落库。
@@ -471,6 +486,26 @@ export class AccountsStore {
     return this.db.getAccount(id)?.legacyWorkspaceId ?? null;
   }
 
+  /**
+   * 解密旧版 Default API Key 明文（zen usage JSON API 用）。无/解密失败返回
+   * null。**进程内使用**（明文只在进程内流转，进 Authorization 头即弃）。
+   */
+  legacyKeyOf(id: number): string | null {
+    const secret = this.secret;
+    if (!this.enabled || !secret) return null;
+    const row = this.db.getAccount(id);
+    if (!row || !row.legacyKeyEnc) return null;
+    return secret.decrypt(row.legacyKeyEnc);
+  }
+
+  /** 写旧版 Default API Key（明文进、加密落库）；null/空串清除。账户不存在返回 false。 */
+  setLegacyKey(id: number, key: string | null): boolean {
+    const secret = this.secret;
+    if (!this.enabled || !secret || this.db.getAccount(id) == null) return false;
+    const enc = key == null || key === '' ? null : secret.encrypt(key);
+    return this.db.updateAccount(id, { legacyKeyEnc: enc });
+  }
+
   /** 设置旧版控制台 workspace id。传 null/空串 = 清除。账户不存在返回 false。 */
   setLegacyWorkspaceId(id: number, workspaceId: string | null): boolean {
     if (!this.enabled) return false;
@@ -543,6 +578,8 @@ export class AccountsStore {
       kind: row.kind,
       workspaceId: row.workspaceId,
       legacyWorkspaceId: row.legacyWorkspaceId,
+      hasLegacyKey: row.legacyKeyEnc != null,
+      legacyKeyMasked: this.maskedLegacyKey(row),
       status: row.status as AccountStatus,
       statusDetail: row.statusDetail,
       retryUntil: row.retryUntil,
@@ -579,6 +616,13 @@ export class AccountsStore {
    */
   private decryptKeys(row: AccountRow): string[] | null {
     return this.decryptStoredKeys(row)?.map((k) => k.key) ?? null;
+  }
+
+  /** 解密 legacy_key_enc 并算掩码（视图展示用）。未配置/解密失败返回 null。 */
+  private maskedLegacyKey(row: AccountRow): string | null {
+    if (!row.legacyKeyEnc || !this.secret) return null;
+    const plain = this.secret.decrypt(row.legacyKeyEnc);
+    return plain ? maskKey(plain) : null;
   }
 
   /**
@@ -647,6 +691,8 @@ export function buildAccountsSection(store: AccountsStore, pool: KeyPool, now: n
       lastProbeAt: acc.lastProbeAt,
       workspaceId: acc.workspaceId,
       legacyWorkspaceId: acc.legacyWorkspaceId,
+      hasLegacyKey: acc.hasLegacyKey,
+      legacyKeyMasked: acc.legacyKeyMasked,
       // 控制台凭据是否存在（cookie 或 OAuth refresh）——前端用它区分
       // 「未接入（无凭据）」vs「已连接待同步（有凭据但余额还没抓到）」。
       hasConsole: store.cookieOf(acc.id) != null || store.getOauthRefresh(acc.id) != null,

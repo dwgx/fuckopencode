@@ -399,6 +399,12 @@ export class ConsoleClient {
       // 静默：cookie 是敏感凭证，失效时不打任何日志细节，只标记健康态。
       // 通道一并记下（cookie 失效 vs OAuth Bearer 失效 → 面板给不同指引）。
       this.recordFail(id, true, cred.type === 'cookie' ? 'cookie' : 'oauth');
+      // OAuth 修复（2026-08-15 实测）：access_token 会被上游作废（rt 轮换后旧
+      // access 失效），缓存命中时用旧 access 打上游恒 401 → invalid 永久（直到
+      // 重启清 accessCache）——而 rt 本身有效（keyprobe 直接 refresh 成功）。
+      // 401/403 时清 accessCache，下次 getCredentials 无缓存 → 用 rt refresh →
+      // 成功清 invalid 自愈（doRefresh 成功路径）。
+      if (cred.type === 'bearer') this.accessCache.delete(id);
       return null;
     }
     if (!res.ok) {
@@ -555,6 +561,18 @@ export class ConsoleClient {
       if (newRefresh) {
         // refresh token 轮换：新值写回，否则下次用旧值必然 invalid_grant。
         this.accounts.setOauthRefresh(id, newRefresh);
+      }
+      // 成功刷新 = OAuth 凭据有效：**必须清除 invalid 健康标记**（OAuth 修复，
+      // 2026-08-15 实测：账号 6 曾因一次历史 refresh 失败被标记 oauth-invalid，
+      // 而 invalid 状态下 billing/usage 端点「不打上游直接给空」——不触发 refresh
+      // → invalid 永不更新，形成死锁：refresh 实际有效（服务器实测 200）但面板
+      // 永远显示「OAuth credential expired or revoked」）。成功路径清除标记，
+      // 下一次 tick 即恢复正常通道。
+      const h = this.health.get(id);
+      if (h != null) {
+        h.invalid = false;
+        h.channel = null;
+        h.consecutiveFails = 0;
       }
       // 缓存 access（留 60s 余量防过期边界）。
       this.accessCache.set(id, { token, expiresAt: this.now() + (expiresIn - 60) * 1000 });

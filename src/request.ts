@@ -61,6 +61,14 @@ function jsonModeTool(responseFormat: OpenAIChatRequest['response_format']): Ant
  * - Anthropic 不支持的字段（frequency_penalty / presence_penalty / n /
  *   logit_bias / seed / user / logprobs）静默丢弃。
  */
+/**
+ * OpenAI → Anthropic 请求转换（库消费者/历史参考）。
+ *
+ * **网关内未接线**：数据面 chat 路径（/v1/chat/completions）直发 OpenAI 协议，
+ * 不走本模块；唯一引用是 index.ts 对外导出，供外部库消费者按需调用。
+ * 修改本文件不影响网关行为，但改动前仍要与 deepseek 适配（见 DEEPSEEK-QUIRKS.md）
+ * 保持语义一致，避免「库路径 vs 网关路径」双口径漂移。
+ */
 export function openAIToAnthropicRequest(
   req: OpenAIChatRequest,
   options: RequestConvertOptions = {},

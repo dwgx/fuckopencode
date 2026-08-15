@@ -14,6 +14,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createHash } from 'node:crypto';
 import type { AppConfig } from './config.js';
 import { keyFingerprint } from './keypool.js';
 import type { KeyPool } from './keypool.js';
@@ -23,6 +24,7 @@ import type { BillingAccounts } from './billing.js';
 import { refreshBilling, type FetchLike } from './billing.js';
 import type { UsageDb } from './usagedb.js';
 import { deleteModelAlias, loadModelAliases, saveModelAlias } from './modelmap.js';
+import { ModelAccessStore } from './modelaccess.js';
 import { stripControl } from './errors.js';
 import { extractDevice } from './metrics.js';
 
@@ -220,6 +222,20 @@ export function validatePatchAccount(body: unknown): ValidateResult<PatchWithAll
     }
   }
 
+  if (b.legacyKey !== undefined) {
+    // 旧版 Default API Key（zen usage JSON API 用，免 cookie）；null/空串清除。
+    if (b.legacyKey === null || b.legacyKey === '') {
+      patch.legacyKey = null;
+    } else if (typeof b.legacyKey !== 'string') {
+      return fail('legacyKey must be a string or null');
+    } else if (b.legacyKey.length > 2048) {
+      return fail('legacyKey must be at most 2048 characters');
+    } else {
+      const cleaned = stripControl(b.legacyKey).slice(0, 2048);
+      patch.legacyKey = cleaned;
+    }
+  }
+
   // 可用模型覆盖：null / 空数组 / 全空串 = 清除（回全局默认），非空数组原样。
   if (b.allowedModels !== undefined) {
     const allowedModels = parseAllowedModels(b.allowedModels);
@@ -365,6 +381,9 @@ export interface AdminDeps {
     cookieStatus?(id: number): 'ok' | 'invalid';
     lastError?(id: number): 'auth' | 'upstream' | 'no-cred' | null;
   } | null;
+  /** 密钥-模型授权层（MODEL-ACCESS）：删账户/删 key 时清理 upstream-key 授权行。
+   *  未注入时按 deps.db 自建（无 db 则跳过清理——降级路径，清理是卫生操作非安全边界）。 */
+  modelAccess?: ModelAccessStore | null;
 }
 
 /**
@@ -372,12 +391,17 @@ export interface AdminDeps {
  * （同源，回环场景浏览器自动带）→ 403。无 Origin 放行（curl 等非浏览器场景）。
  */
 /** 管理面写操作的 Origin 校验：只认「origin 的 hostname+端口 == Host 头」。
+ *  fail-closed：多值 Origin 头（Node 在部分版本/代理后解析成数组）按拒绝处理——
+ *  语义「多 Origin 任一匹配即放行」不可信，浏览器发不出多值 Origin（fetch 只
+ *  允许单值），出现数组头只可能是代理/恶意客户端。空/缺失 Origin 放行（curl
+ *  等非浏览器场景）。
  *  不比较 scheme —— HTTPS 反代（nginx/cloudflared TLS 终止）后面 Origin 是
  *  https:// 而 Host 头不变，写死 http 会让所有写操作 403。跨站攻击者的
  *  origin hostname 必然不同（同 hostname 不同端口也算跨站，端口也归一比较）。 */
-function originAllowed(req: IncomingMessage): boolean {
+export function originAllowed(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
-  if (typeof origin !== 'string' || origin.length === 0) return true;
+  if (origin == null || origin === '') return true;
+  if (typeof origin !== 'string') return false;
   const host = req.headers.host;
   if (typeof host !== 'string' || host.length === 0) return false;
   try {
@@ -535,6 +559,16 @@ export async function handleAdminRoutes(
       sendJson(res, 400, { error: { message: 'invalid key fingerprint', type: 'invalid_request_error' } });
       return;
     }
+    if (req.method === 'GET' && fingerprint === 'plain') {
+      // /accounts/:id/keys/plain：列出完整 key 明文（面板复制用）。凭证级
+      // 读端点，读也强制 Origin 校验（与 billing / legacy keys-plain 同口径）。
+      if (!originAllowed(req)) {
+        sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+        return;
+      }
+      await handleAccountKeysPlain(req, res, deps, id);
+      return;
+    }
     if (req.method === 'DELETE') {
       handleRemoveKey(req, res, deps, id, fingerprint);
       return;
@@ -600,7 +634,7 @@ async function handleCreate(req: IncomingMessage, res: ServerResponse, deps: Adm
     sendJson(res, 500, { error: { message: 'failed to create account', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.create', accountId: created.value.id, ok: true, note: null, ip: auditIp(req) });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.create', accountId: created.value.id, ok: true, note: created.value.name, ip: auditIp(req) });
   // §3.4 热加载：落盘 → 进内存。新 key 的 lastUsedAt=0 → 下一轮探针自动探它。
   for (const key of v.value.keys) deps.pool.addKey(key, created.value.id);
   sendAccount(res, 201, deps, created.value.id);
@@ -619,19 +653,30 @@ async function handlePatch(req: IncomingMessage, res: ServerResponse, deps: Admi
     sendJson(res, 400, { error: { message: v.message, type: 'invalid_request_error' } });
     return;
   }
+  const fields = Object.keys(v.value);
   if (!deps.store!.update(id, v.value)) {
     deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: false, note: 'update failed', ip: auditIp(req) });
     sendJson(res, 500, { error: { message: 'failed to update account', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: true, note: null, ip: auditIp(req) });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: true, note: fields.join(','), ip: auditIp(req) });
   // 凭据更新（cookie/oauth）后重置 console 健康态——防旧 invalid 标记死锁（审查 H2）。
   if (v.value.cookie !== undefined || v.value.workspaceId !== undefined) {
     deps.consoleClient?.noteCredentialChanged?.(id);
   }
-  // legacyCookie 走独立槽（加密存储）。
-  if (v.value.legacyCookie !== undefined) {
-    deps.store!.setLegacyCookie(id, v.value.legacyCookie);
+  // legacyCookie 走独立槽（加密存储）。落库失败不能静默吞：面板会显示已更新，
+  // 实际没落库，下次重启/换会话就丢。此时主 PATCH 已应用（部分成功），
+  // 明确 500 + 审计 note 说明是哪一步失败。
+  if (v.value.legacyCookie !== undefined && !deps.store!.setLegacyCookie(id, v.value.legacyCookie)) {
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: false, note: 'legacy cookie save failed', ip: auditIp(req) });
+    sendJson(res, 500, { error: { message: 'failed to update account', type: 'server_error' } });
+    return;
+  }
+  // legacyKey 同样走独立加密槽（zen usage 用）。落库失败显式 500 + 审计 note。
+  if (v.value.legacyKey !== undefined && !deps.store!.setLegacyKey(id, v.value.legacyKey)) {
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.patch', accountId: id, ok: false, note: 'legacy key save failed', ip: auditIp(req) });
+    sendJson(res, 500, { error: { message: 'failed to update account', type: 'server_error' } });
+    return;
   }
   sendAccount(res, 200, deps, id);
 }
@@ -639,7 +684,8 @@ async function handlePatch(req: IncomingMessage, res: ServerResponse, deps: Admi
 /** DELETE /__admin/api/accounts/:id：删账户 + 从 pool 移除其全部 key。 */
 function handleDelete(req: IncomingMessage, res: ServerResponse, deps: AdminDeps, id: number): void {
   const store = deps.store!;
-  if (store.get(id) == null) {
+  const before = store.get(id);
+  if (before == null) {
     sendNotFound(res, `account ${id} not found`);
     return;
   }
@@ -649,10 +695,26 @@ function handleDelete(req: IncomingMessage, res: ServerResponse, deps: AdminDeps
     sendJson(res, 500, { error: { message: 'failed to delete account', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.delete', accountId: id, ok: true, note: null, ip: auditIp(req) });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.delete', accountId: id, ok: true, note: before.name, ip: auditIp(req) });
   for (const key of removed) deps.pool.removeKey(key);
+  removeUpstreamKeyModelAccess(deps, removed);
   res.writeHead(204, { 'content-length': '0' });
   res.end();
+}
+
+/**
+ * 清理一批明文 upstream key 的 model_access 授权行（D-P2-3）。key 被删后遗留的
+ * upstream-key 行会继续约束 sha256(key) 对应的 key：同一个 key 值以后换账号重新
+ * 添加时，仍被旧自定义模型限制（面板看不出来为什么受限）。删行 = 清除自定义
+ * 回退全局默认。subject_id 与数据面口径一致：sha256(key) 全 hex（MODEL-ACCESS §2.2）。
+ * 明文只在进程内流转（进 sha256 即丢），绝不进日志/响应。
+ */
+function removeUpstreamKeyModelAccess(deps: AdminDeps, keys: string[]): void {
+  const ma = deps.modelAccess ?? (deps.db != null ? new ModelAccessStore(deps.db) : null);
+  if (ma == null) return;
+  for (const key of keys) {
+    ma.setCustom('upstream-key', createHash('sha256').update(key, 'utf8').digest('hex'), null);
+  }
 }
 
 /** POST /__admin/api/accounts/:id/keys：加一个 key（落盘 + pool 热加载）。 */
@@ -680,7 +742,7 @@ async function handleAddKey(req: IncomingMessage, res: ServerResponse, deps: Adm
     sendJson(res, 400, { error: { message, type: 'invalid_request_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.add-key', accountId: id, ok: true, note: null, ip: auditIp(req) });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.add-key', accountId: id, ok: true, note: keyFingerprint(key), ip: auditIp(req) });
   deps.pool.addKey(key, id);
   sendAccount(res, 200, deps, id);
 }
@@ -698,8 +760,9 @@ function handleRemoveKey(req: IncomingMessage, res: ServerResponse, deps: AdminD
     sendNotFound(res, `no key with fingerprint ${fingerprint} in account ${id}`);
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.remove-key', accountId: id, ok: true, note: null, ip: auditIp(req) });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.remove-key', accountId: id, ok: true, note: keyFingerprint(removed), ip: auditIp(req) });
   deps.pool.removeKey(removed);
+  removeUpstreamKeyModelAccess(deps, [removed]);
   res.writeHead(204, { 'content-length': '0' });
   res.end();
 }
@@ -744,8 +807,27 @@ async function handleRenameKey(req: IncomingMessage, res: ServerResponse, deps: 
     sendJson(res, 500, { error: { message: 'failed to update key nickname', type: 'server_error' } });
     return;
   }
-  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.rename-key', accountId: id, ok: true, note: null, ip: auditIp(req) });
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.rename-key', accountId: id, ok: true, note: keyFingerprint(plain), ip: auditIp(req) });
   sendAccount(res, 200, deps, id);
+}
+
+/**
+ * GET /__admin/api/accounts/:id/keys/plain：该账号全部 key 明文（面板复制用）。
+ * 凭证级读端点：路由处已过 isAdminRequest + adminOriginAllowed（读也防跨站）。
+ * 明文来自 store.keysOf 的进程内解密，只出现在响应体，不进日志/审计。
+ * 响应形状对齐 legacy 的 keys/plain（`{keys: [{plain, ...}]}`）——前端复制按钮
+ * 一次拿全量，行级复制由前端按指纹挑。
+ */
+async function handleAccountKeysPlain(req: IncomingMessage, res: ServerResponse, deps: AdminDeps, id: number): Promise<void> {
+  const store = deps.store!;
+  if (store.get(id) == null) {
+    sendNotFound(res, `account ${id} not found`);
+    return;
+  }
+  const plainKeys = store.keysOf(id) ?? [];
+  // 带掩码与明文一起给：前端行级复制按 fingerprint 匹配（列表里同 fp 的 key）。
+  const keys = plainKeys.map((plain) => ({ plain, fingerprint: keyFingerprint(plain) }));
+  sendJson(res, 200, { ok: true, data: { keys } });
 }
 
 /** POST /__admin/api/accounts/:id/billing：手动刷新余额（绕过调度器立即抓一次）。 */
@@ -769,6 +851,7 @@ async function handleRefreshBilling(req: IncomingMessage, res: ServerResponse, d
       // console 通道调用失败（null = 调用失败，不是合法空值）——区分 auth 与
       // 上游故障，报出真实原因，而不是误导性的「no balance in console response」。
       const auth = cc.cookieStatus?.(id) === 'invalid' || cc.lastError?.(id) === 'auth';
+      deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.billing-refresh', accountId: id, ok: false, note: auth ? 'console auth invalid' : 'console channel error', ip: auditIp(req) });
       sendJson(res, 502, {
         error: {
           message: auth
@@ -787,19 +870,26 @@ async function handleRefreshBilling(req: IncomingMessage, res: ServerResponse, d
         return Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined;
       };
       const units = pick(rec.combinedAvailableMicroCents) ?? pick(rec.balanceMicroCents);
-      // 无可用余额字段（缺字段 / null / 非数字）→ 该账号没有余额数据：
-      // 余额置空（面板显示 —），刷新 lastBillingAt，不算失败。
-      store.setBilling(id, { balanceUnits: units ?? null, at: Date.now() });
+      // 部分更新语义（setBilling §5.4）：余额字段缺失/非法（undefined）时保留历史
+      // 余额，只在字段显式为 null（上游明确无余额）时清空 —— 否则一次缺字段的
+      // 刷新会把历史余额抹成 null（面板显示 —），刷新 lastBillingAt，不算失败。
+      const patch: { balanceUnits?: number | null; at: number } = { at: Date.now() };
+      if (units !== undefined) patch.balanceUnits = units;
+      else if (rec.combinedAvailableMicroCents === null || rec.balanceMicroCents === null) patch.balanceUnits = null;
+      store.setBilling(id, patch);
+      deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.billing-refresh', accountId: id, ok: true, note: 'ok', ip: auditIp(req) });
       sendAccount(res, 200, deps, id);
       return;
     }
     // 响应形状异常（非对象）→ 可读错误而非笼统 failed。
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.billing-refresh', accountId: id, ok: false, note: 'unexpected console shape', ip: auditIp(req) });
     sendJson(res, 502, { error: { message: 'billing refresh failed: unexpected console response shape', type: 'server_error' } });
     return;
   }
   const r = await refreshBilling(deps.cfg, toBillingAccounts(store), id, deps.log ?? console.log, deps.fetchImpl);
   if (!r.ok) {
     // §6.3：无 cookie → 400；其余抓取失败（网络/非 2xx/解析不出）→ 502。
+    deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.billing-refresh', accountId: id, ok: false, note: r.reason, ip: auditIp(req) });
     if (r.reason === 'no workspace/cookie') {
       sendJson(res, 400, { error: { message: 'account has no billing cookie', type: 'invalid_request_error' } });
       return;
@@ -807,6 +897,7 @@ async function handleRefreshBilling(req: IncomingMessage, res: ServerResponse, d
     sendJson(res, 502, { error: { message: `billing refresh failed: ${r.reason}`, type: 'server_error' } });
     return;
   }
+  deps.db?.insertAdminAudit({ at: Date.now(), op: 'account.billing-refresh', accountId: id, ok: true, note: 'ok', ip: auditIp(req) });
   sendAccount(res, 200, deps, id);
 }
 
@@ -971,12 +1062,19 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     background: var(--bg); border-bottom: 1px solid var(--border-muted);
   }
   .tab {
+    position: relative;
     border: 0; border-bottom: 2px solid transparent; border-radius: 0;
     padding: 7px 12px 5px; font-size: 13px; font-weight: 500;
     color: var(--text-muted); background: transparent;
   }
   .tab:hover:not(.active) { color: var(--text); border-bottom-color: transparent; }
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  /* 新版本红点（OTA）：设置 tab 右上角小圆点，有可用更新时亮起。 */
+  .tab-dot {
+    position: absolute; top: 5px; right: 3px;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--danger);
+  }
 
   /* ── buttons：oc-btn 模板控件体系 ─────────────────────
      基类 + 修饰符（primary/ghost/danger/sm）。旧类名（.primary/.ghost/.danger/
@@ -1131,9 +1229,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .oc-chip.oc-chip-danger { background: var(--danger); color: #fff; border-color: transparent; }
   .oc-chip.st-region, .oc-chip.st-unknown, .badge.st-region, .badge.st-unknown { color: var(--text-muted); }
   .retry { color: var(--warn); font-size: 12px; white-space: nowrap; }
-  /* 操作菜单平时隐身，卡片 hover 才现身（危险操作不给误触机会）。 */
+  /* 操作菜单平时隐身，卡片 hover 才现身（危险操作不给误触机会）。触屏（hover
+     不存在）与键盘（Tab 聚焦进菜单）必须可达：focus-within + hover:none 兜底。 */
   .ops { margin-left: auto; display: flex; align-items: center; position: relative; opacity: 0; transition: opacity .15s; }
   .card:hover .ops { opacity: 1; }
+  .ops:focus-within { opacity: 1; }
+  @media (hover: none) { .ops { opacity: 1; } }
   .ops-btn { padding: 1px 8px; color: var(--text-muted); }
 
   /* ── dropdown（opencode 风格：surface 底、边框、阴影、hover 高亮）── */
@@ -1307,6 +1408,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .ws-legacy { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; }
   .ws-switch { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
   .ws-chip, .oc-chip-ws { max-width: 220px; }
+  /* 详情页区块锚点导航条：横向 wrap 的 chip 链，点击平滑滚动到区块。 */
+  .detail-nav-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 20px; }
+  .detail-nav-row .oc-chip { cursor: pointer; }
   /* 请求明细：dashboard 的 .log 两行式（表头行 + 条目行） */
   .log {
     background: var(--surface); border: 1px solid var(--border);
@@ -1371,6 +1475,21 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .key-row:hover .del { opacity: 1; }
   .key-row .del:hover { color: var(--danger); border-color: var(--danger); }
   .key-add { display: flex; gap: 6px; margin-top: 8px; }
+
+  /* ── model access（chip 选择器：全局白名单 + 密钥级授权）── */
+  .ma-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .ma-chip {
+    font-size: 12px; padding: 3px 10px; border-radius: var(--radius);
+    border: 1px solid var(--border-muted); background: var(--surface);
+    color: var(--text-2); cursor: pointer; font-family: inherit; line-height: 150%;
+  }
+  .ma-chip:hover { border-color: var(--accent); }
+  .ma-chip.on { background: rgba(0,122,255,.18); border-color: var(--accent); color: var(--text); }
+  .ma-chip.off { opacity: .55; }
+  .ma-chip .ma-x { margin-left: 5px; font-weight: 700; }
+  .ma-chip.dis { opacity: .4; cursor: not-allowed; }
+  .ma-opt-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #ma-search { max-width: 240px; }
 
   /* ── empty state（dashed + 80px 上下 padding）────── */
   .empty {
@@ -1499,6 +1618,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .oc-dot.ok, .st-dot.ok { background: var(--ok); }
   .oc-dot.warn, .st-dot.warn { background: var(--warn); }
   .oc-dot.bad, .st-dot.bad { background: var(--danger); }
+  /* OTA 更新进度/日志（sec-update + update-overlay）。 */
+  .ota-progress { text-align: center; font-size: 13px; color: var(--text); padding: 20px 0; }
+  .ota-commits { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+  .ota-commit { font-size: 12px; color: var(--text-2); }
 
   /* ── v5：分发密钥 tab（状态徽章 + 明文展示弹层）── */
   .oc-chip.tok-active, .badge.tok-active { color: var(--ok); border-color: rgba(48,209,88,.4); }
@@ -1579,7 +1702,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   <button class="tab" data-tab="accounts" data-i18n="tabAccounts">Accounts</button>
   <button class="tab" data-tab="usage" data-i18n="tabUsage">Usage</button>
   <button class="tab" data-tab="tokens" data-i18n="tabTokens">Keys</button>
-  <button class="tab" data-tab="settings" data-i18n="tabSettings">Settings</button>
+  <button class="tab" data-tab="access" data-i18n="tabModelAccess">Model Access</button>
+  <button class="tab" data-tab="settings" data-i18n="tabSettings">Settings<span class="tab-dot" id="tab-dot-update" hidden></span></button>
 </nav>
 
 <div class="layout">
@@ -1694,6 +1818,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
             <button class="oc-btn" id="detail-oauth" data-i18n="oauthInstead">or sign in with OpenCode instead</button>
           </div>
         </div>
+        <!-- 订阅置顶（用户要求：Go 订阅及旧版 key 相关放最上面）：
+             go（Go 订阅）→ legacy-key（旧版 API key 配置，可复制）→ legacy
+             （旧版 key 列表）→ legacy-billing（旧版计费），随后才是工作区/模型/
+             余额等 console 区块。锚点导航 detail-nav 同步本顺序。 -->
+        <div id="detail-nav"></div>
+        <div id="detail-go"></div>
+        <div id="detail-legacy-key"></div>
+        <div id="detail-legacy"></div>
+        <div id="detail-legacy-billing"></div>
         <div id="detail-workspace"></div>
         <div id="detail-models"></div>
         <div id="detail-billing"></div>
@@ -1706,9 +1839,6 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         <div id="detail-sa"></div>
         <div id="detail-providers"></div>
         <div id="detail-pricing"></div>
-        <div id="detail-go"></div>
-        <div id="detail-legacy"></div>
-        <div id="detail-legacy-billing"></div>
       </section>
     </div>
 
@@ -1815,6 +1945,57 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       </section>
     </div>
 
+    <div id="view-access" hidden>
+      <section id="sec-access-global">
+        <h1 data-i18n="maGlobalTitle">Global allowlist</h1>
+        <div class="sub" data-i18n="maGlobalSub">default models for keys without a custom override</div>
+        <div class="panel">
+          <div class="oc-form">
+            <div class="oc-field oc-full">
+              <label data-i18n="maGlobalModels">allowed models</label>
+              <div class="ma-chips" id="ma-global-chips"></div>
+              <div class="oc-hint" id="ma-global-hint"></div>
+            </div>
+            <div class="ma-opt-row">
+              <button class="oc-btn oc-btn-primary" id="ma-global-save" data-i18n="save">save</button>
+              <button class="oc-btn oc-btn-ghost" id="ma-global-reset" data-i18n="maResetGlobal">reset to code default</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="sec-access-search">
+        <div class="oc-form ma-opt-row">
+          <input class="oc-input" id="ma-search" placeholder="..." autocomplete="off">
+          <select class="oc-select" id="ma-filter">
+            <option value="" data-i18n="maFilterAll">all types</option>
+            <option value="upstream-key" data-i18n="maFilterUpstream">upstream</option>
+            <option value="token" data-i18n="maFilterToken">token</option>
+            <option value="api-key" data-i18n="maFilterApiKey">api key</option>
+          </select>
+          <button class="oc-btn oc-btn-ghost" id="ma-refresh" data-i18n="maRefresh">refresh</button>
+        </div>
+      </section>
+
+      <section id="sec-access-upstream">
+        <h1 data-i18n="maUpstreamTitle">Upstream keys</h1>
+        <div class="sub" data-i18n="maUpstreamSub">per-upstream-key model overrides</div>
+        <div class="panel"><div id="ma-upstream"></div></div>
+      </section>
+
+      <section id="sec-access-token">
+        <h1 data-i18n="maTokenTitle">Distribution tokens</h1>
+        <div class="sub" data-i18n="maTokenSub">per-token model overrides</div>
+        <div class="panel"><div id="ma-token"></div></div>
+      </section>
+
+      <section id="sec-access-apikey">
+        <h1 data-i18n="maApiKeyTitle">API keys</h1>
+        <div class="sub" data-i18n="maApiKeySub">per-API-key model overrides</div>
+        <div class="panel"><div id="ma-apikey"></div></div>
+      </section>
+    </div>
+
     <div id="view-settings" hidden>
       <section id="sec-settings-lang">
         <h1 data-i18n="langTitle">Language</h1>
@@ -1879,7 +2060,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           <div class="oc-hint-err oc-full" id="aa-err"></div>
           <button class="oc-btn oc-btn-primary oc-full" id="aa-save" data-i18n="save">save</button>
         </div>
-        <div class="oc-hint" data-i18n="adminPassHint">old sessions stay valid for up to 24h after a password change</div>
+        <div class="oc-hint" data-i18n="adminPassHint">all logged-in sessions are invalidated immediately after a password change; re-login required</div>
       </section>
 
       <section id="sec-admin-keys">
@@ -1903,6 +2084,32 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           <div class="oc-hint" id="exp-loading">…</div>
         </div>
         <div class="oc-hint" data-i18n="expNote">settings come from environment variables and are read at startup — changing them requires a restart</div>
+      </section>
+
+      <section id="sec-update">
+        <h1 data-i18n="otaTitle">Update</h1>
+        <div class="sub" data-i18n="otaSub">GitHub OTA self-update</div>
+        <div class="card">
+          <div class="meta">
+            <span data-i18n="otaCurrent">current version</span>
+            <strong id="ota-current">—</strong>
+            <span class="oc-chip oc-chip-danger" id="ota-disabled-badge" hidden data-i18n="otaDisabled">disabled</span>
+          </div>
+          <div class="meta">
+            <span data-i18n="otaLatest">latest version</span>
+            <strong id="ota-latest">—</strong>
+            <span class="w" id="ota-last-checked"></span>
+          </div>
+          <div class="oc-hint oc-hint-err" id="ota-error" hidden></div>
+          <div class="oc-form">
+            <div class="oc-field oc-full">
+              <button class="oc-btn oc-btn-ghost" id="btn-ota-check" data-i18n="otaCheck">check for updates</button>
+              <button class="oc-btn oc-btn-primary" id="btn-ota-update" hidden data-i18n="otaUpdate">update</button>
+            </div>
+          </div>
+          <div class="meta" id="ota-rollback"></div>
+          <div class="oc-hint" data-i18n="otaHint">updates run only when OTA_ENABLED=1; the service restarts itself</div>
+        </div>
       </section>
 
       <section id="sec-about">
@@ -1974,6 +2181,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   </div>
 </div>
 
+<!-- OTA 更新进度弹层（确认用 confirm-overlay；这里只展示阶段进度与结果） -->
+<div class="overlay" id="update-overlay" hidden>
+  <div class="oc-modal" role="dialog" aria-modal="true">
+    <div class="oc-modal-hd" id="update-title"></div>
+    <div class="oc-modal-bd">
+      <div id="update-body"></div>
+      <div class="oc-hint oc-hint-err" id="update-err"></div>
+      <div class="oc-modal-actions">
+        <button class="oc-btn oc-btn-ghost" id="update-close" data-i18n="otaClose">close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 (function () {
   var I18N = {
@@ -2002,6 +2223,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       refresh: 'refresh balance', addKey: 'add key', remove: 'remove',
       delete: 'delete', confirmDelete: 'Delete this account? Its keys will stop routing.',
       confirmDeleteKey: 'Remove this key from the account?',
+      keyNotFound: 'key not found in account',
       // 状态友好文案（徽标字 + 解释）。
       stUnknown: 'not probed', stOk: 'healthy', stInvalid: 'invalid key',
       stInsufficient: 'insufficient balance', stLimit: 'limit reached',
@@ -2015,19 +2237,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       rename: 'rename', nickname: 'nickname',
       renameHint: 'leave blank to clear the nickname', renamed: 'nickname saved',
       refreshed: 'balance refreshed', opFail: 'request failed',
+      networkFlaky: 'network hiccup, retrying automatically…',
       notConnected: 'not connected', waitingSync: 'connected — balance syncs on next probe', processing: 'processing…',
       logout: 'logout',
       kindUnknown: 'unset', kindSubscription: 'subscription', kindPayg: 'pay as you go',
       goSub: 'Go subscription', goSubHint: 'usage windows from OpenCode Go (opencode.ai)',
       goRolling: 'Rolling (5h)', goWeekly: 'Weekly', goMonthly: 'Monthly',
       goReset: 'resets in', goUseBalance: 'use balance after limit', goChinaModels: 'enable China-hosted models', goNotSubscribed: 'not subscribed',
-      nameRequired: 'name is required', cookieClear: 'leave blank to clear',
+      nameRequired: 'name is required', cookieClear: 'leave blank to clear', cookieKeep: 'leave blank to keep', cookieClearCheckbox: 'clear saved cookie',
       live: 'live',
       tabOverview: 'Overview', tabAccounts: 'Accounts', tabUsage: 'Usage', tabSettings: 'Settings',
       subOverview: 'Overview', subHealth: 'Health',
       subAccounts: 'Accounts', subCreate: 'Create account', subOauth: 'OpenCode sign-in',
       subRequests: 'Request stats', subKeys: 'Key pool',
-      subLanguage: 'Language', subAbout: 'About',
+      subLanguage: 'Language', subUpdate: 'Update', subAbout: 'About',
       usageTitle: 'Request stats', usageSub: 'traffic summary from /__metrics',
       totalRequests: 'total requests', failed: 'failed', streaming: 'streaming',
       avgDuration: 'avg duration', tokens: 'tokens',
@@ -2039,11 +2262,26 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       about: 'About', aboutSub: 'fuckopencode admin panel',
       aboutDesc: 'OpenAI <-> Anthropic protocol gateway for DeepSeek — manage upstream accounts and protocol conversion',
       aboutEndpointAdmin: 'management', aboutEndpointMetrics: 'metrics',
+      otaTitle: 'Update', otaSub: 'GitHub OTA self-update',
+      otaCurrent: 'current version', otaLatest: 'latest version',
+      otaDisabled: 'disabled', otaCheck: 'check for updates', otaChecking: 'checking…',
+      otaUpdate: 'update', otaCheckedAt: 'checked', otaCheckFailed: 'cannot reach the update source',
+      otaPrevPresent: 'previous version kept', otaRolledBack: 'a failed update was rolled back',
+      otaRollbackState: 'rollback',
+      otaHint: 'updates run only when OTA_ENABLED=1; the service restarts itself',
+      otaConfirmTitle: 'Confirm update',
+      otaConfirmBody: 'the service will restart automatically; expect a few seconds of downtime',
+      otaStageCheck: 'checking…', otaStageDownload: 'downloading…', otaStageVerify: 'verifying…',
+      otaStageSwap: 'replacing…', otaStageRestart: 'restarting…',
+      otaRestarting: 'restarting — refresh the page in a moment to see the new version',
+      otaChangelog: 'changelog', otaNoChangelog: 'no changelog available',
+      otaClose: 'close',
       oauthStart: 'Sign in with OpenCode', oauthTitle: 'OpenCode sign-in',
       oauthDesc: 'pair an opencode account via device code',
       oauthUrlLabel: 'verification url', oauthCodeLabel: 'device code',
       oauthHint: 'sign in in the opened page, then return here',
       oauthCopy: 'copy', oauthCopied: 'copied',
+      copied: 'copied',
       oauthPolling: 'polling for approval', oauthStarting: 'starting',
       oauthExpiresIn: 'code expires in', oauthDone: 'account signed in',
       oauthExpired: 'device code expired, retry', oauthDenied: 'sign-in denied, retry',
@@ -2081,11 +2319,11 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       notSet: 'not set', set: 'set',
       membersTitle: 'Members', membersSub: 'people with access to this workspace',
       memberEmail: 'email', role: 'role', joined: 'joined', noMembers: 'no members',
-      saTitle: 'Service accounts', saSub: 'API keys issued on the console',
+      saTitle: 'Service accounts', saSub: 'API keys issued on the console — metered, billed against your zen balance (same channel as legacy API keys; Go subscription is the weekly/monthly window below)',
       saName: 'name', created: 'created', noSa: 'no service accounts',
       createSa: 'create service account',
       // 旧版 workspace（opencode.ai 老控制台）的 key 管控。
-      legacyKeys: 'Legacy API keys', legacySub: 'API keys issued on the legacy console (opencode.ai)',
+      legacyKeys: 'Legacy API keys', legacySub: 'API keys issued on the legacy console (opencode.ai) — metered, billed against your zen balance (Go subscription is the weekly/monthly window below)',
       legacyCreateTitle: 'Create legacy key',
       createKey: 'create key', keyName: 'key name',
       masked: 'masked', creator: 'creator',
@@ -2093,6 +2331,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       delLegacyKeyConfirm: 'Delete this legacy key? It will stop working immediately.',
       legacyCookieMissing: 'legacy console cookie not configured',
       refreshKeys: 'refresh', noLegacyKeys: 'no legacy keys',
+      legacyKeyTitle: 'Legacy API key', legacyKeySub: 'optional: paste the Default API Key from the legacy console — Go usage then reads from the zen JSON API with no cookie',
+      legacyKeyPlaceholder: 'sk-...',
+      legacyKeySave: 'save', legacyKeyClear: 'clear',
+      legacyKeyConfigured: 'configured:', legacyKeyNotConfigured: 'not configured — cookie-free Go usage available',
+      legacyKeySaved: 'legacy API key saved', legacyKeyCleared: 'legacy API key cleared',
+      legacyKeyEmpty: 'paste a legacy API key first',
       providersTitle: 'Providers', providersSub: 'providers available on this account',
       provider: 'provider', modelCount: 'models', status: 'status', noProviders: 'no providers',
       consoleNotConfigured: 'console not configured for this account (env proxy uses local keys only)',
@@ -2201,7 +2445,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       adminAuthTitle: 'Admin account', adminAuthSub: 'login credentials for this panel',
       adminUserLabel: 'username', adminPassLabel: 'password',
       adminPassPlaceholder: 'leave blank to keep current',
-      adminPassHint: 'old sessions stay valid for up to 24h after a password change',
+      adminPassHint: 'all logged-in sessions are invalidated immediately after a password change; re-login required',
       adminPassEnvWarn: 'using the default password — change it',
       adminPassDefaultBadge: 'default password — change it',
       authSaved: 'admin credentials saved', aaNothing: 'nothing to save',
@@ -2221,7 +2465,24 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       tokenRpm: 'rpm limit', tokenRpmHint: 'requests per minute — 0 = unlimited',
       tokenRpmSaved: 'rpm limit saved', tokenRpmInvalid: 'enter a number ≥ 0',
       legacyKeyNotFound: 'key not found in plain list',
-      legacyKeyCopyTitle: 'copy plaintext to clipboard'
+      legacyKeyCopyTitle: 'copy plaintext to clipboard',
+      // Model access tab（MODEL-ACCESS §6）。
+      tabModelAccess: 'Model Access', subModelAccess: 'Model Access',
+      maGlobalTitle: 'Global allowlist', maGlobalSub: 'default models for keys without a custom override',
+      maGlobalModels: 'allowed models',
+      maGlobalFloor: 'hard floor, cannot be removed: ',
+      maResetGlobal: 'reset to code default', maGlobalSaved: 'global allowlist saved',
+      maSearchPh: 'search name / mask',
+      maFilterAll: 'all types', maFilterUpstream: 'upstream', maFilterToken: 'token', maFilterApiKey: 'api key',
+      maRefresh: 'refresh',
+      maUpstreamTitle: 'Upstream keys', maUpstreamSub: 'per-upstream-key model overrides',
+      maTokenTitle: 'Distribution tokens', maTokenSub: 'per-token model overrides',
+      maApiKeyTitle: 'API keys', maApiKeySub: 'per-API-key model overrides',
+      maEmpty: 'no keys configured', maNoMatch: 'no keys match the filter',
+      maCustomBadge: 'custom', maFollowsGlobal: 'follows global',
+      maEditTitle: 'Edit model access', maSaved: 'model access saved',
+      maFollowGlobal: 'follow global (clear)',
+      maNotGrantable: 'only hard-floor models can be granted'
     },
     zh: {
       degradedTitle: '账号数据不可用',
@@ -2248,6 +2509,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       refresh: '刷新余额', addKey: '添加 key', remove: '移除',
       delete: '删除', confirmDelete: '删除该账号？其 key 将停止路由。',
       confirmDeleteKey: '从该账号移除这个 key？',
+      keyNotFound: '账号中未找到该 key',
       // 状态友好文案（徽标字 + 解释）。
       stUnknown: '未探测', stOk: '正常', stInvalid: 'key 失效',
       stInsufficient: '余额不足', stLimit: '达到限额',
@@ -2261,19 +2523,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       rename: '改名', nickname: '昵称',
       renameHint: '留空 = 清除昵称', renamed: '昵称已保存',
       refreshed: '余额已刷新', opFail: '请求失败',
+      networkFlaky: '网络波动，自动重试中…',
       notConnected: '未接入', waitingSync: '已连接 · 余额随下次探测同步', processing: '处理中…',
       logout: '退出',
       kindUnknown: '未标注', kindSubscription: '订阅', kindPayg: '按量',
-      goSub: 'Go 订阅', goSubHint: 'OpenCode Go 的用量窗口（opencode.ai）',
+      goSub: 'Go 订阅', goSubHint: 'OpenCode Go 的用量窗口（opencode.ai）——订阅靠周/月窗口额度，重置后自动恢复；窗口用尽时可「达限额后用余额」转按量',
       goRolling: '滚动（5 小时）', goWeekly: '每周', goMonthly: '每月',
       goReset: '重置于', goUseBalance: '达限额后用余额', goChinaModels: '启用中国区模型', goNotSubscribed: '未订阅',
-      nameRequired: '名称不能为空', cookieClear: '留空 = 清除',
+      nameRequired: '名称不能为空', cookieClear: '留空 = 清除', cookieKeep: '留空 = 不修改', cookieClearCheckbox: '清除已存 cookie',
       live: '实时',
       tabOverview: '总览', tabAccounts: '账号', tabUsage: '用量', tabSettings: '设置',
       subOverview: '概览', subHealth: '健康度',
       subAccounts: '账号列表', subCreate: '创建账号', subOauth: 'OpenCode 登录',
       subRequests: '请求统计', subKeys: 'Key 池',
-      subLanguage: '语言', subAbout: '关于',
+      subLanguage: '语言', subUpdate: '更新', subAbout: '关于',
       usageTitle: '请求统计', usageSub: '来自 /__metrics 的流量汇总',
       totalRequests: '总请求', failed: '失败', streaming: '流式',
       avgDuration: '平均耗时', tokens: 'tokens',
@@ -2285,11 +2548,26 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       about: '关于', aboutSub: 'fuckopencode 管理面板',
       aboutDesc: 'OpenAI 与 Anthropic 协议转换网关，面向 DeepSeek —— 用于管理上游账号与协议转换',
       aboutEndpointAdmin: '管理', aboutEndpointMetrics: '指标',
+      otaTitle: '更新', otaSub: 'GitHub OTA 自更新',
+      otaCurrent: '当前版本', otaLatest: '远端最新',
+      otaDisabled: '已停用', otaCheck: '检查更新', otaChecking: '检查中…',
+      otaUpdate: '更新', otaCheckedAt: '检查于', otaCheckFailed: '无法连接更新源',
+      otaPrevPresent: '保留旧版本', otaRolledBack: '曾有失败更新被回滚',
+      otaRollbackState: '回滚',
+      otaHint: '仅当 OTA_ENABLED=1 时才能更新；更新后服务自动重启',
+      otaConfirmTitle: '确认更新',
+      otaConfirmBody: '服务将自动重启，预计有数秒不可用',
+      otaStageCheck: '检查中…', otaStageDownload: '下载中…', otaStageVerify: '校验中…',
+      otaStageSwap: '替换中…', otaStageRestart: '即将重启…',
+      otaRestarting: '正在重启 —— 稍后刷新页面即可看到新版本',
+      otaChangelog: '更新日志', otaNoChangelog: '暂无更新日志',
+      otaClose: '关闭',
       oauthStart: '通过 OpenCode 登录', oauthTitle: 'OpenCode 登录',
       oauthDesc: '通过设备码绑定 opencode 账号',
       oauthUrlLabel: '验证链接', oauthCodeLabel: '设备码',
       oauthHint: '在打开的页面登录后回到这里',
       oauthCopy: '复制', oauthCopied: '已复制',
+      copied: '已复制',
       oauthPolling: '等待授权中', oauthStarting: '启动中',
       oauthExpiresIn: '设备码过期倒计时', oauthDone: '账号登录成功',
       oauthExpired: '设备码已过期，可重试', oauthDenied: '登录被拒绝，可重试',
@@ -2327,11 +2605,11 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       notSet: '未设置', set: '设置',
       membersTitle: '成员', membersSub: '有权访问该工作区的人员',
       memberEmail: '邮箱', role: '角色', joined: '加入时间', noMembers: '暂无成员',
-      saTitle: '服务账号', saSub: '控制台签发的 API key',
+      saTitle: '服务账号', saSub: '控制台签发的 API key——按量计费，扣 zen 充值余额（与旧版 API key 同属 zen 通道，go 订阅见下方区块）',
       saName: '名称', created: '创建时间', noSa: '暂无服务账号',
       createSa: '创建服务账号',
       // 旧版 workspace（opencode.ai 老控制台）的 key 管控。
-      legacyKeys: '旧版 API key', legacySub: '旧版控制台（opencode.ai）签发的 API key',
+      legacyKeys: '旧版 API key', legacySub: '旧版控制台（opencode.ai）签发的 API key——按量计费，扣 zen 充值余额（go 订阅是另一套周/月窗口额度，见下方 Go 订阅）',
       legacyCreateTitle: '创建旧版 key',
       createKey: '创建 key', keyName: 'key 名称',
       masked: '掩码', creator: '创建者',
@@ -2339,6 +2617,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       delLegacyKeyConfirm: '删除该旧版 key？它将立即失效。',
       legacyCookieMissing: '未配置旧版控制台 cookie',
       refreshKeys: '刷新', noLegacyKeys: '暂无旧版 key',
+      legacyKeyTitle: '旧版 API key', legacyKeySub: '可选：粘贴旧版控制台的 Default API Key——Go 用量改走 zen JSON API，无需 cookie',
+      legacyKeyPlaceholder: 'sk-...',
+      legacyKeySave: '保存', legacyKeyClear: '清除',
+      legacyKeyConfigured: '已配置：', legacyKeyNotConfigured: '未配置——可启用免 cookie 的 Go 用量',
+      legacyKeySaved: '旧版 API key 已保存', legacyKeyCleared: '旧版 API key 已清除',
+      legacyKeyEmpty: '请先粘贴旧版 API key',
       providersTitle: '模型提供方', providersSub: '该账号可用的提供方',
       provider: '提供方', modelCount: '模型数', status: '状态', noProviders: '暂无提供方',
       consoleNotConfigured: '该账号未配置控制台凭据（env 代理仅使用本地 key）',
@@ -2447,7 +2731,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       adminAuthTitle: '管理员账号', adminAuthSub: '本面板的登录凭据',
       adminUserLabel: '用户名', adminPassLabel: '密码',
       adminPassPlaceholder: '留空 = 保持当前密码',
-      adminPassHint: '改密码后旧会话 24h 内仍有效',
+      adminPassHint: '改密码后所有已登录会话立即失效，需重新登录',
       adminPassEnvWarn: '正在使用默认密码，建议修改',
       adminPassDefaultBadge: '默认密码，建议修改',
       authSaved: '登录凭据已保存', aaNothing: '没有需要保存的内容',
@@ -2467,7 +2751,24 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       tokenRpm: '请求频率', tokenRpmHint: '每分钟请求上限 — 0 = 不限',
       tokenRpmSaved: '请求频率已保存', tokenRpmInvalid: '请输入不小于 0 的整数',
       legacyKeyNotFound: '明文列表里找不到该 key',
-      legacyKeyCopyTitle: '复制明文到剪贴板'
+      legacyKeyCopyTitle: '复制明文到剪贴板',
+      // Model access tab（MODEL-ACCESS §6）。
+      tabModelAccess: '模型授权', subModelAccess: '模型授权',
+      maGlobalTitle: '全局白名单', maGlobalSub: '未配置自定义授权的密钥默认可用模型',
+      maGlobalModels: '允许的模型',
+      maGlobalFloor: '硬底线，不可移除：',
+      maResetGlobal: '重置为代码默认', maGlobalSaved: '全局白名单已保存',
+      maSearchPh: '搜索名称 / 掩码',
+      maFilterAll: '全部类型', maFilterUpstream: '上游', maFilterToken: 'token', maFilterApiKey: 'api key',
+      maRefresh: '刷新',
+      maUpstreamTitle: '上游 key', maUpstreamSub: '上游密钥级模型覆盖',
+      maTokenTitle: '分发 token', maTokenSub: 'token 级模型覆盖',
+      maApiKeyTitle: 'API key', maApiKeySub: '管理面 API key 的模型覆盖',
+      maEmpty: '暂无密钥', maNoMatch: '没有匹配的密钥',
+      maCustomBadge: '自定义', maFollowsGlobal: '跟随全局',
+      maEditTitle: '编辑模型授权', maSaved: '模型授权已保存',
+      maFollowGlobal: '跟随全局（清除）',
+      maNotGrantable: '仅硬底线模型可授'
     }
   };
   var lang = (function () {
@@ -2575,7 +2876,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     }).catch(function () { return { ok: false, status: 0, json: null }; });
   }
   function errMsg(r) {
-    return (r.json && r.json.error && r.json.error.message) || (T('opFail') + ' (' + r.status + ')');
+    return (r.json && r.json.error && r.json.error.message) || (r.status === 0 ? T('networkFlaky') : (T('opFail') + ' (' + r.status + ')'));
   }
 
   /** 单条 key 行。指纹来自服务端（末 4 位），原文永不出现在面板。
@@ -2591,6 +2892,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       '<span class="oc-dot ' + (k.healthy ? 'ok' : 'bad') + '"></span>' +
       label +
       '<span class="k-meta">' + meta + '</span>' +
+      '<button class="oc-btn oc-btn-ghost oc-btn-sm" data-action="copykey" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '">' + T('tokenCopy') + '</button>' +
       '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="renamekey" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '">' + T('rename') + '</button>' +
       '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="delkey" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '">' + T('remove') + '</button>' +
       '</div>';
@@ -2678,7 +2980,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           '<option value="payg">payg</option>' +
           '<option value="unknown">unknown</option>' +
         '</select></div>' +
-        '<div class="oc-field oc-full"><label>' + T('cookieLabel') + '</label><input class="oc-input" id="e-cookie-' + a.id + '" type="password" placeholder="' + T('cookieClear') + '" autocomplete="off"></div>' +
+        '<div class="oc-field oc-full"><label>' + T('cookieLabel') + '</label><input class="oc-input" id="e-cookie-' + a.id + '" type="password" placeholder="' + T('cookieKeep') + '" autocomplete="off"></div>' +
+        '<div class="oc-field oc-full"><label class="oc-check"><input type="checkbox" id="e-clearcookie-' + a.id + '"><span class="oc-check-box"></span><span class="oc-check-label">' + T('cookieClearCheckbox') + '</span></label></div>' +
         '<div class="oc-hint-err oc-full" id="e-err-' + a.id + '"></div>' +
         '<button class="oc-btn oc-btn-primary" data-action="save" data-id="' + a.id + '">' + T('save') + '</button>' +
         '<button class="oc-btn" data-action="cancel" data-id="' + a.id + '">' + T('cancel') + '</button>' +
@@ -2840,10 +3143,17 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       var c = previewCache[id];
       if (c && now - c.at < PREVIEW_TTL) continue;
       previewCache[id] = { at: now, usage: null, go: null, gw: null, legacy: null };
-      fetchPreviewUsage(id);
-      fetchPreviewGo(id);
+      // 网关实际代理用量始终可拉（本机数据，任何账号都有）。
       fetchPreviewGateway(id);
-      fetchPreviewLegacy(id);
+      // console usage 预览：只有 hasConsole（配了 cookie/oauth 凭据）的账号才发——
+      // env 等无凭据账号发 console usage 必得 502（实测 2026-08-15 reqid=11），纯噪音。
+      if (list[i].hasConsole) fetchPreviewUsage(id);
+      // legacy go/keys 预览：只有 legacyWorkspaceId 配置的账号才发——无 legacy 的
+      // 账号发 legacy 请求网关 404 → 经盾转 503（实测 reqid=12/14），纯噪音。
+      if (list[i].legacyWorkspaceId) {
+        fetchPreviewGo(id);
+        fetchPreviewLegacy(id);
+      }
     }
   }
   /** 数据到达后回填卡片 DOM（无壳时插入容器；空 html = 失败 → 不动作）。 */
@@ -2956,6 +3266,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
 
   function tick(manual) {
+    if (document.hidden) return;
     fetch('/__admin/api/accounts', { headers: { accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error(String(r.status))); })
       .then(function (d) {
@@ -2966,13 +3277,26 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         loadPreviewData(d.list);
       })
       .catch(function (e) {
+        // 未登录（401）：停止 2s 轮询 —— 否则一直开着的未登录面板页每 2s
+        // 打一组请求全部 401（实测占网关日志量 ~80%，2026-08-15 日志深挖）。
+        // 登录页本身不依赖这些数据；重新登录后页面会整页刷新重新初始化。
+        if (String(e.message).indexOf('401') >= 0) {
+          clearInterval(fcTickTimer);
+          // 未登录时 OTA 状态轮询也停：60s 白打一组 401（与 fcTickTimer 同源噪音）。
+          if (otaTimer) clearInterval(otaTimer);
+          return;
+        }
         $('h-live').className = 'bad'; $('h-live-text').textContent = e.message;
       });
     fetchUsage();
     fetchOverviewTrend();
-    fetchRequests();
-    fetchIpStats();
-    fetchAudit();
+    // 用量 tab 三张表（requests/ipstats/audit）渲染全是 usage 视图内容——非 usage
+    // 视图每 2s 白打 3 个请求；切到 usage 后下个 tick 自然补拉（2s 延迟可接受）。
+    if (curView === 'usage') {
+      fetchRequests();
+      fetchIpStats();
+      fetchAudit();
+    }
     // 分发密钥 60s 自动刷新兜底：TTL 过期后 tick 负责续命（总览费用/密钥卡）。
     loadTokens(false);
     // 预览数据（用量/Go）60s 自动刷新兜底：render 指纹不变时 tick 也负责续命。
@@ -2988,6 +3312,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       loadGo(detailState.id, !manual);
       loadLegacyKeys(detailState.id, !manual);
       loadLegacyBilling(detailState.id, !manual);
+      renderLegacyKey();
     }
   }
 
@@ -3030,10 +3355,23 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     var name = $('e-name-' + id).value.trim();
     var kind = $('e-kind-' + id).value;
     var cookie = $('e-cookie-' + id).value;
+    var clearCookie = $('e-clearcookie-' + id) && $('e-clearcookie-' + id).checked;
     if (!name) { $('e-err-' + id).textContent = T('nameRequired'); return; }
-    api('PATCH', '/__admin/api/accounts/' + id, { name: name, kind: kind, cookie: cookie })
+    var body = { name: name, kind: kind };
+    // cookie 输入框打开时恒为空（不回填现值）：空输入 + 未勾选清除 = 不带 cookie
+    // 键（服务端 undefined 不更新，避免把空串提交成 cookie:null 静默清空 billing
+    // cookie）；显式勾选「清除已存 cookie」才发 cookie:''（服务端解析成 null=清除）。
+    if (cookie) body.cookie = cookie;
+    else if (clearCookie) body.cookie = '';
+    api('PATCH', '/__admin/api/accounts/' + id, body)
       .then(function (r) {
-        if (r.ok) { $('edit-' + id).hidden = true; $('e-err-' + id).textContent = ''; tick(true); }
+        if (r.ok) {
+          $('edit-' + id).hidden = true;
+          $('e-err-' + id).textContent = '';
+          var cc = $('e-clearcookie-' + id);
+          if (cc) cc.checked = false;
+          tick(true);
+        }
         else { $('e-err-' + id).textContent = errMsg(r); }
       });
   }
@@ -3065,9 +3403,30 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     });
   }
 
+  /** 复制账户上游 key 明文（H2）：GET keys/plain 一次拿全量，按指纹挑出该行。
+   *  明文只在响应体与剪贴板流转，不进日志。 */
+  function copyKey(id, fp) {
+    api('GET', '/__admin/api/accounts/' + id + '/keys/plain', null)
+      .then(function (r) {
+        if (!r.ok || !r.json || !r.json.data || !r.json.data.keys) { flash(errMsg(r), true); return; }
+        var keys = r.json.data.keys || [];
+        var hit = null;
+        for (var i = 0; i < keys.length; i++) {
+          if (keys[i].fingerprint === fp) { hit = keys[i].plain; break; }
+        }
+        if (hit == null) { flash(T('keyNotFound'), true); return; }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(hit).then(function () {
+            flash(T('tokenCopied'));
+          }, function () { flash(T('opFail'), true); });
+        } else {
+          flash(T('opFail'), true);
+        }
+      });
+  }
+
   /** 改 key 昵称：confirm 弹层内联输入框（留空 = 清除），PATCH keys/:fp。 */
-  function renameKey(id, fp) {
-    var cur = '';
+  function renameKey(id, fp) {    var cur = '';
     var acc = findAccount(id);
     if (acc) {
       var ks = acc.keys || [];
@@ -3146,7 +3505,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // ── tabs / sidebar ─────────────────────────────────
   var VIEWS = {
     overview: 'view-overview', accounts: 'view-accounts',
-    usage: 'view-usage', tokens: 'view-tokens', settings: 'view-settings',
+    usage: 'view-usage', tokens: 'view-tokens', access: 'view-access', settings: 'view-settings',
     'account-detail': 'view-account-detail'
   };
   /** 每个 tab 的子导航：词条键 + 锚点 section id。 */
@@ -3155,10 +3514,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     accounts: [['subAccounts', 'sec-accounts'], ['subCreate', 'sec-create'], ['subOauth', 'sec-oauth']],
     usage: [['subRequests', 'sec-usage-summary'], ['subKeys', 'sec-usage-keys'], ['subIps', 'sec-usage-ips'], ['subAudit', 'sec-usage-audit']],
     tokens: [['subTokens', 'sec-tokens']],
+    access: [['subModelAccess', 'sec-access-global'], ['maUpstreamTitle', 'sec-access-upstream'],
+      ['maTokenTitle', 'sec-access-token'], ['maApiKeyTitle', 'sec-access-apikey']],
     settings: [
       ['subLanguage', 'sec-settings-lang'], ['subModelMap', 'sec-modelmap'],
       ['subAdminAuth', 'sec-admin-auth'], ['subAdminKeys', 'sec-admin-keys'],
-      ['subExperimental', 'sec-experimental'], ['subAbout', 'sec-about'],
+      ['subExperimental', 'sec-experimental'], ['subUpdate', 'sec-update'], ['subAbout', 'sec-about'],
     ],
     'account-detail': [['subDetail', 'sec-account-detail']]
   };
@@ -3220,8 +3581,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     closeMenus();
     saveViewState();
     focusSidebar();
-    if (v === 'settings') { refreshModelMap(); loadSettings(false); }  // 进设置页时拉映射表 + 热改配置
+    if (v === 'settings') { refreshModelMap(); loadSettings(false); loadOtaStatus(false); }  // 进设置页时拉映射表 + 热改配置 + OTA 状态
     if (v === 'tokens') { loadTokens(false); }  // 进密钥页时拉列表（60s 缓存内不重拉）
+    if (v === 'access') { loadModelAccess(); }  // 进 model access 页时拉配置（数据静态，无缓存）
     window.scrollTo(0, 0);
   }
 
@@ -3647,6 +4009,151 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     }
   }
 
+  // ── model access（MODEL-ACCESS §6）────────────────────
+  // 数据静态（配置），不做 2s tick 轮询；进 tab / 写操作后局部刷新。
+  var maData = null;
+  var maGlobalSel = null; // null = 未改动（从数据初始化）；数组 = 已 toggle
+  var maSearch = '';
+  var maFilter = '';
+  var maEdit = null; // { type, subject, cur:[models] }（编辑 modal 内状态）
+  function maHas(list, m) { return list.indexOf(m) >= 0; }
+  function maToggleSel(m) {
+    if (maGlobalSel == null) maGlobalSel = (maData.global.models || []).slice();
+    var i = maGlobalSel.indexOf(m);
+    if (i >= 0) maGlobalSel.splice(i, 1);
+    else maGlobalSel.push(m);
+    renderMaGlobal();
+  }
+  function loadModelAccess() {
+    api('GET', '/__admin/api/model-access', null).then(function (r) {
+      if (r.ok && r.json && r.json.data) {
+        maData = r.json.data;
+        maGlobalSel = null;
+        renderModelAccess();
+      } else {
+        flash(errMsg(r), true);
+      }
+    });
+  }
+  function renderModelAccess() {
+    if (!maData) return;
+    var se = $('ma-search');
+    if (se) se.placeholder = T('maSearchPh');
+    renderMaGlobal();
+    renderMaSection($('ma-upstream'), maData.keys.upstreamKeys, 'upstream-key', maUpstreamLabel);
+    renderMaSection($('ma-token'), maData.keys.tokens, 'token', maTokenLabel);
+    renderMaSection($('ma-apikey'), maData.keys.apiKeys, 'api-key', maApiKeyLabel);
+  }
+  function renderMaGlobal() {
+    if (!maData) return;
+    var g = maData.global;
+    var core = g.core || [];
+    var sel = maGlobalSel == null ? (g.models || []) : maGlobalSel;
+    $('ma-global-chips').innerHTML = core.map(function (m) {
+      var on = maHas(sel, m);
+      return '<button type="button" class="ma-chip' + (on ? ' on' : ' off') + '" data-model="' + esc(m) + '">' +
+        esc(m) + (on ? '<span class="ma-x">&times;</span>' : '') + '</button>';
+    }).join('');
+    $('ma-global-hint').textContent = T('maGlobalFloor') + core.join(', ');
+  }
+  function maUpstreamLabel(k) {
+    return esc(k.fingerprint) + (k.accountName ? ' <span class="w">· ' + esc(k.accountName) + '</span>' : '');
+  }
+  function maTokenLabel(k) {
+    return esc(k.name || k.mask);
+  }
+  function maApiKeyLabel(k) {
+    return esc(k.mask);
+  }
+  function maSectionVisible(type) {
+    return maFilter === '' || maFilter === type;
+  }
+  function maKeyRow(k, type, label) {
+    var badges = '';
+    if (type === 'token') {
+      badges = k.status === 'active'
+        ? '<span class="oc-chip st-ok">' + T('tokenActive') + '</span>'
+        : '<span class="oc-chip st-invalid">' + T('tokenDisabled') + '</span>';
+    }
+    badges += k.custom
+      ? '<span class="oc-chip st-ok">' + T('maCustomBadge') + '</span>'
+      : '<span class="oc-chip">' + T('maFollowsGlobal') + '</span>';
+    return '<div class="key-row">' +
+      '<span class="fp">' + label + '</span>' +
+      badges +
+      '<span class="k-meta">' + esc(k.mask || '') + '</span>' +
+      '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="ma-edit" data-type="' + type + '"' +
+        ' data-subject="' + esc(k.subject || k.fingerprint || '') + '" data-name="' + esc(k.name || '') + '"' +
+        ' data-mask="' + esc(k.mask || '') + '">' + T('edit') + '</button>' +
+      '</div>';
+  }
+  function maKeyMatches(k, q) {
+    if (!q) return true;
+    return (k.name || '').toLowerCase().indexOf(q) >= 0 ||
+      (k.mask || '').toLowerCase().indexOf(q) >= 0 ||
+      (k.accountName || '').toLowerCase().indexOf(q) >= 0;
+  }
+  function renderMaSection(el, rows, type, labelFn) {
+    if (!el) return;
+    if (!maSectionVisible(type)) { el.innerHTML = ''; return; }
+    var q = maSearch.toLowerCase();
+    var filtered = rows.filter(function (k) { return maKeyMatches(k, q); });
+    el.innerHTML = filtered.length
+      ? filtered.map(function (k) { return maKeyRow(k, type, labelFn(k)); }).join('')
+      : (rows.length ? '<div class="oc-hint">' + T('maNoMatch') + '</div>' : '<div class="oc-hint">' + T('maEmpty') + '</div>');
+  }
+  function saveMaGlobal() {
+    if (maGlobalSel == null) maGlobalSel = (maData.global.models || []).slice();
+    api('PUT', '/__admin/api/model-access/global', { models: maGlobalSel.length ? maGlobalSel : null })
+      .then(function (r) {
+        if (r.ok) { flash(T('maGlobalSaved')); loadModelAccess(); }
+        else flash(errMsg(r), true);
+      });
+  }
+  function resetMaGlobal() {
+    api('PUT', '/__admin/api/model-access/global', { models: null })
+      .then(function (r) {
+        if (r.ok) { flash(T('maGlobalSaved')); loadModelAccess(); }
+        else flash(errMsg(r), true);
+      });
+  }
+  function renderMaEditChips() {
+    if (!maEdit) return;
+    var all = maData.models || [];
+    var core = maData.global.core || [];
+    $('ma-edit-chips').innerHTML = all.map(function (m) {
+      var on = maHas(maEdit.cur, m);
+      var grantable = maHas(core, m);
+      return '<button type="button" class="ma-chip' + (on ? ' on' : ' off') + (grantable ? '' : ' dis') + '"' +
+        ' data-ma-opt="' + esc(m) + '"' + (grantable ? '' : ' disabled') + '>' +
+        esc(m) + (on ? '<span class="ma-x">&times;</span>' : '') + '</button>';
+    }).join('');
+  }
+  function editModelAccess(type, subject, name, mask) {
+    var rows = maData.keys[type === 'token' ? 'tokens' : type === 'api-key' ? 'apiKeys' : 'upstreamKeys'];
+    var cur = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if ((row.subject || row.fingerprint || '') === subject && row.custom) cur = row.custom.slice();
+    }
+    maEdit = { type: type, subject: subject, cur: cur };
+    openConfirm({
+      title: T('maEditTitle') + ' — ' + (name || mask || subject.slice(-8)),
+      okText: T('save'),
+      body: '<div class="ma-chips" id="ma-edit-chips"></div>' +
+        '<div class="oc-hint">' + T('maNotGrantable') + '</div>' +
+        '<button type="button" class="oc-btn oc-btn-ghost" data-ma-clear data-type="' + type + '" data-subject="' + esc(subject) + '">' + T('maFollowGlobal') + '</button>',
+      run: function () {
+        api('PUT', '/__admin/api/model-access/keys/' + type + '/' + encodeURIComponent(subject), { models: maEdit.cur.length ? maEdit.cur : null })
+          .then(function (r) {
+            if (r.ok) { closeConfirm(); flash(T('maSaved')); loadModelAccess(); }
+            else { unlockConfirm(); $('confirm-err').textContent = errMsg(r); }
+          });
+      }
+    });
+    renderMaEditChips();
+  }
+
   // ── 请求明细（/__admin/api/requests，按 at 倒序）──
   // 字段契约：{at, status, path, durationMs, inputTokens, outputTokens, model,
   // fingerprint, ua, client, endpoint, error}；client/ua 由服务端解析。
@@ -4032,6 +4539,115 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       }
     });
   }
+  // ── Update（OTA 自更新，sec-update）──────────────────────────
+  var otaCache = null;
+  function loadOtaStatus(force) {
+    return api('GET', '/__admin/api/update/status', null).then(function (r) {
+      if (r.ok && r.json && r.json.ok && r.json.data) {
+        otaCache = r.json.data;
+        renderOtaStatus(otaCache);
+        return otaCache;
+      }
+      return null;
+    });
+  }
+  function renderOtaStatus(s) {
+    var cur = $('ota-current');
+    if (cur) cur.textContent = s.current || '—';
+    var dis = $('ota-disabled-badge');
+    if (dis) dis.hidden = s.enabled !== false; // 停用徽章只在 OTA_ENABLED=0 时亮
+    var lat = $('ota-latest');
+    if (lat) lat.textContent = s.latest || '—';
+    var lc = $('ota-last-checked');
+    if (lc) lc.textContent = s.lastCheckedAt ? ' · ' + T('otaCheckedAt') + ' ' + hhmmss(s.lastCheckedAt) : '';
+    var err = $('ota-error');
+    if (err) {
+      err.hidden = !s.error;
+      err.textContent = s.error ? T('otaCheckFailed') : '';
+    }
+    var up = $('btn-ota-update');
+    if (up) up.hidden = !s.hasUpdate;
+    var rb = $('ota-rollback');
+    if (rb) {
+      var parts = [];
+      if (s.rollback && s.rollback.rollbackPointPresent) parts.push(T('otaPrevPresent'));
+      if (s.rollback && s.rollback.rolledBackBinaryPresent) parts.push(T('otaRolledBack'));
+      rb.textContent = parts.length ? T('otaRollbackState') + ': ' + parts.join(' · ') : '';
+    }
+    // 设置 tab 红点：有新版本且不在设置页 → 亮；否则灭。
+    var dot = $('tab-dot-update');
+    if (dot) dot.hidden = !(s.hasUpdate && curView !== 'settings');
+  }
+  function doOtaCheck() {
+    var btn = $('btn-ota-check');
+    btn.disabled = true;
+    btn.textContent = T('otaChecking');
+    api('POST', '/__admin/api/update/check', {}).then(function (r) {
+      btn.disabled = false;
+      btn.textContent = T('otaCheck');
+      if (r.ok && r.json && r.json.ok && r.json.data) {
+        otaCache = r.json.data;
+        renderOtaStatus(otaCache);
+        if (otaCache.hasUpdate) showOtaChangelog(otaCache);
+      } else {
+        flash(errMsg(r), true);
+      }
+    });
+  }
+  function showOtaChangelog(s) {
+    var body = '<div class="meta">' + esc(s.current) + ' → ' + esc(s.latest) + '</div>';
+    var list = (s.commits && s.commits.length) ? s.commits : null;
+    if (list) {
+      body += '<div class="meta">' + T('otaChangelog') + '</div>' +
+        '<div class="ota-commits">' + list.map(function (c) {
+          return '<div class="ota-commit"><span class="w">' + esc(c.sha) + '</span> ' + esc(c.message) + '</div>';
+        }).join('') + '</div>';
+    } else {
+      body += '<div class="meta">' + T('otaNoChangelog') + '</div>';
+    }
+    openConfirm({
+      title: T('otaConfirmTitle') + ' v' + esc(String(s.latest).replace(/^v/, '')),
+      body: body,
+      okText: T('otaUpdate'),
+      danger: true,
+      run: doOtaPerform
+    });
+  }
+  var OTA_STAGES = ['otaStageCheck', 'otaStageDownload', 'otaStageVerify', 'otaStageSwap', 'otaStageRestart'];
+  var otaStageIdx = 0;
+  var otaStageTimer = null;
+  function runOtaStage() {
+    var b = $('update-body');
+    if (b) b.innerHTML = '<div class="ota-progress">' + T(OTA_STAGES[otaStageIdx % OTA_STAGES.length]) + '</div>';
+    otaStageIdx++;
+  }
+  function doOtaPerform() {
+    closeConfirm();
+    $('update-title').textContent = T('otaTitle');
+    $('update-err').textContent = '';
+    $('update-close').disabled = true;
+    $('update-overlay').hidden = false;
+    otaStageIdx = 0;
+    runOtaStage();
+    otaStageTimer = setInterval(runOtaStage, 1500);
+    api('POST', '/__admin/api/update/perform', {}).then(function (r) {
+      clearInterval(otaStageTimer);
+      if (r.ok && r.json && r.json.ok) {
+        // 成功：服务已安排自重启，前端给出提示（1s 后连接会断）。
+        var b = $('update-body');
+        if (b) b.innerHTML = '<div class="ota-progress">' + T('otaRestarting') + '</div>';
+      } else if (r.status === 0) {
+        // 连接中断 = 服务正在重启（最常见于成功路径的 1s 窗口之后）。
+        var b2 = $('update-body');
+        if (b2) b2.innerHTML = '<div class="ota-progress">' + T('otaRestarting') + '</div>';
+      } else {
+        $('update-err').textContent = errMsg(r);
+        $('update-close').disabled = false;
+      }
+      // 无论成败都刷新一次状态（重启后 status 会给新版本）。
+      setTimeout(function () { loadOtaStatus(true); }, 3000);
+    });
+  }
   // ── API 密钥管理（PATCH apiKeys 是替换语义：删除/添加都要全量明文数组）。
   // 明文只存服务端指纹，面板这边把「本面板添加过的 key」明文缓存进
   // localStorage（mask → plain，mask = '****' + 末 4 位，与后端 keyFingerprint
@@ -4157,6 +4773,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
   // ── OAuth 设备码登录（弹层 + 轮询，后端并行开发中）──
   var oauthTimer = 0, oauthPollTimer = 0, oauthMaxId = 0;
+  /** 主 2s 轮询定时器（未登录 401 时清除，见 tick 的 catch）。 */
+  var fcTickTimer = 0;
 
   function startOAuth() {
     var mx = 0;
@@ -4280,7 +4898,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
 
   // ── UI v3：账户详情（console 数据展示）──────────────
-  var detailState = { id: null, range: '7d', billing: null };
+  // legacyKeyInputFor：detail 视图跨账号复用同一 DOM，记录 legacy key 输入框当前
+  // 归属的账号 id——切账号时必须清掉上一个账号的未保存输入（M3），否则「正在输入」
+  // 守卫跳过渲染 + saveLegacyKey 按 detailState.id 会把 A 的值写进 B。
+  var detailState = { id: null, range: '7d', billing: null, legacyKeyInputFor: null };
   /** microCents → $（1e8 = $1），两位小数。null/undefined/非法输入 → '—'（未知），
    *  不把「没拿到数据」伪装成「没钱」——0 是合法值，显示 $0.00。 */
   var money = function (mc) {
@@ -4349,6 +4970,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
    *  否则 loading 骨架直接显示原始 key 名（DETAIL_BLOCK_KEYS 的 T() 是变量传键，
    *  静态检查看不见）。 */
   var DETAIL_BLOCK_KEYS = [
+    ['detail-go', 'goSub', 'goSubHint'],
+    ['detail-legacy-key', 'legacyKeyTitle', 'legacyKeySub'],
+    ['detail-legacy', 'legacyKeys', 'legacySub'],
+    ['detail-legacy-billing', 'legacyBilling', 'legacyBillingSub'],
     ['detail-workspace', 'workspaceTitle', 'workspaceSub'],
     ['detail-models', 'allowedModelsTitle', 'allowedModelsSub'],
     ['detail-billing', 'balanceTitle', 'balanceSub'],
@@ -4361,10 +4986,23 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     ['detail-sa', 'saTitle', 'saSub'],
     ['detail-providers', 'providersTitle', 'providersSub'],
     ['detail-pricing', 'pricingTitle', 'pricingSub'],
-    ['detail-go', 'goSub', 'goSubHint'],
-    ['detail-legacy', 'legacyKeys', 'legacySub'],
-    ['detail-legacy-billing', 'legacyBilling', 'legacyBillingSub'],
   ];
+  /** 渲染详情页区块锚点导航（detail-nav）：订阅置顶后，用区块标题做锚点，
+   *  点击平滑滚动到对应区块。顺序与 DETAIL_BLOCK_KEYS 一致。 */
+  function renderDetailNav() {
+    var el = $('detail-nav');
+    if (!el) return;
+    var chips = DETAIL_BLOCK_KEYS.map(function (b) {
+      return '<button class="oc-chip" data-scroll-to="' + b[0] + '">' + esc(T(b[1])) + '</button>';
+    }).join('');
+    el.innerHTML = '<div class="detail-nav-row">' + chips + '</div>';
+    el.querySelectorAll('button[data-scroll-to]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var target = $(btn.getAttribute('data-scroll-to'));
+        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    });
+  }
   function loadAccountDetail() {
     var id = detailState.id;
     if (id == null) return;
@@ -4372,6 +5010,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       var el = $(b[0]);
       if (el && !el.innerHTML) el.innerHTML = dBlock(b[1], b[2], '<div class="oc-hint">' + T('loading') + '</div>');
     });
+    renderDetailNav();
     loadBilling(id);
     loadUsage();
     loadModels(id);
@@ -4387,6 +5026,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     loadLegacyBilling(id);
     loadGo(id);
     loadWorkspaces(id);
+    renderLegacyKey();
   }
 
   /** 工作区区块：显示当前 workspace（id + 名称）+ 切换入口。 */
@@ -4565,7 +5205,17 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // sticky 语义不受影响 —— TTL 门只挡「发起请求」，渲染路径根本没进，
   // 错误状态持续显示（见 clearSticky 注释）。
   var LEGACY_DETAIL_TTL = 30 * 1000;
-  var legacyDetailAt = {};  // 'kind:id' -> 最近一次**成功渲染**时间
+  var legacyDetailAt = {};  // 'kind:id' -> 最近一次打点时间（成功渲染；确定性配置错误的失败也打点，见 loadGo）
+  /** 账号是否配置了 legacy workspace（legacyWorkspaceId 非空）。无 legacy 凭据
+   *  的账号（env/OAuth 账号）请求 legacy 三端点必然 404 —— tick 每 2s 打一次，
+   *  经盾 client-fault 重试 3 次等 4 秒才给错误文案（2026-08-15 用户实测：网页
+   *  操作看到「上游返回 404」），纯噪音。加载器统一在入口跳过。 */
+  function legacyEligible(id) {
+    for (var i = 0; i < state.list.length; i++) {
+      if (state.list[i].id === id) return !!state.list[i].legacyWorkspaceId;
+    }
+    return false;
+  }
   function legacyDetailFresh(id, kind, force) {
     var k = kind + ':' + id;
     var now = Date.now();
@@ -4575,14 +5225,92 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     legacyDetailAt[kind + ':' + id] = Date.now();
   }
 
+  // ── 旧版 Default API Key（zen usage，免 cookie）────────────
+  // 数据源是账号列表的 hasLegacyKey/legacyKeyMasked（tick 每 2s 刷新）。输入框
+  // 不回填明文，只显示掩码；正在输入时不重渲染（否则 2s tick 会清掉未保存的输入）。
+  function renderLegacyKey() {
+    var id = detailState.id;
+    if (id == null) return;
+    var el = $('detail-legacy-key');
+    if (!el) return;
+    var a = findAccount(id);
+    if (!a) return;
+    var input = $('detail-legacy-key-paste');
+    // M3：detail 视图跨账号复用同一 DOM。上次渲染的账号（legacyKeyInputFor）与
+    // 当前 id 不同 = 用户切了账号 → 清掉上一个账号的未保存输入，否则会被下面的
+    // 「正在输入」守卫跳过渲染（B 显示 A 的输入），且 saveLegacyKey 用当前
+    // detailState.id=B 会把 A 的值写进 B。同账号的 tick 重渲染不清，保住用户
+    // 正在输入的内容。
+    if (detailState.legacyKeyInputFor !== id) {
+      if (input) input.value = '';
+      detailState.legacyKeyInputFor = id;
+    }
+    if (input && input.value) return; // 用户正在输入，交给 2s tick 下次再同步
+    var has = !!a.hasLegacyKey;
+    var masked = a.legacyKeyMasked || '';
+    var configured = has
+      ? '<div class="oc-hint">' + T('legacyKeyConfigured') + ' ' + esc(masked) +
+        ' <button class="oc-btn oc-btn-ghost oc-btn-sm" data-action="copy-config-legacy-key" title="' + esc(T('legacyKeyCopyTitle')) + '">' + T('tokenCopy') + '</button></div>'
+      : '<div class="oc-hint">' + T('legacyKeyNotConfigured') + '</div>';
+    el.innerHTML = dBlock('legacyKeyTitle', 'legacyKeySub',
+      '<div class="cookie-import">' +
+        '<input class="oc-input oc-grow oc-min-200" id="detail-legacy-key-paste" type="password" placeholder="' + esc(T('legacyKeyPlaceholder')) + '" autocomplete="off">' +
+        '<button class="oc-btn oc-btn-primary" data-action="save-legacy-key">' + T('legacyKeySave') + '</button>' +
+        (has ? '<button class="oc-btn" data-action="clear-legacy-key">' + T('legacyKeyClear') + '</button>' : '') +
+      '</div>' + configured);
+  }
+  function saveLegacyKey() {
+    var id = detailState.id;
+    var val = $('detail-legacy-key-paste').value.trim();
+    if (!val) { flash(T('legacyKeyEmpty'), true); return; }
+    api('PATCH', '/__admin/api/accounts/' + id, { legacyKey: val })
+      .then(function (r) {
+        if (r.ok) { $('detail-legacy-key-paste').value = ''; flash(T('legacyKeySaved')); tick(true); }
+        else flash(errMsg(r), true);
+      });
+  }
+  function clearLegacyKey() {
+    var id = detailState.id;
+    api('PATCH', '/__admin/api/accounts/' + id, { legacyKey: null })
+      .then(function (r) {
+        if (r.ok) { flash(T('legacyKeyCleared')); tick(true); }
+        else flash(errMsg(r), true);
+      });
+  }
+  /** 配置区「复制」：GET legacy-key plain → 剪贴板（明文只在进程内流转，不落 DOM）。 */
+  function copyConfigLegacyKey() {
+    var id = detailState.id;
+    if (id == null) return;
+    api('GET', '/__admin/api/legacy-key/' + id + '/plain', null).then(function (r) {
+      if (r.ok && r.json && r.json.data && r.json.data.key) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(r.json.data.key).then(function () { flash(T('copied')); }, function () { flash(T('opFail'), true); });
+        } else {
+          flash(T('opFail'), true);
+        }
+      } else {
+        flash(errMsg(r), true);
+      }
+    }).catch(function () { flash(T('opFail'), true); });
+  }
+
   function loadGo(id, fromTick) {
+    if (!legacyEligible(id)) return;
     if (legacyDetailFresh(id, 'go', !fromTick)) return;
     api('GET', '/__admin/api/legacy/account/' + id + '/go', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       var el = $('detail-go');
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data || !r.json.data.go) {
         if (r.status === 404) { el.innerHTML = ''; return; }  // 非 legacy workspace 静默隐藏
-        if (r.status === 401 || r.status === 403) { detailErr('go', T('legacyCookieMissing')); return; }
+        if (r.status === 401 || r.status === 403) {
+          // 确定性配置错误（无 cookie / legacy key 无效）：打点 TTL 门，2s tick
+          // 不再反复打上游（zen 401 是确定性的，不会自愈）。用户修好后的手动
+          // 刷新（save/import → tick(true)/loadAccountDetail）是 force，绕过 TTL。
+          // 网络/上游瞬时失败（.catch / 其他状态码）不打点——保留 2s 重试自愈。
+          legacyDetailMark(id, 'go');
+          detailErr('go', T('legacyCookieMissing'));
+          return;
+        }
         detailErr('go', errMsg(r));
         return;
       }
@@ -4871,6 +5599,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   /** 旧版计费：余额（美元）+ 自动充值 + 最近 5 笔支付。失败语义与 legacy keys 同款。
    *  fromTick：2s 轮询发起时 TTL 门生效（服务端 30s 缓存兜底）；用户操作绕过。 */
   function loadLegacyBilling(id, fromTick) {
+    if (!legacyEligible(id)) return;
     if (legacyDetailFresh(id, 'billing', !fromTick)) return;
     api('GET', '/__admin/api/legacy/account/' + id + '/billing', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
@@ -4967,6 +5696,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // 失败语义：404 = 该账号没有 legacy workspace → 静默隐藏区块；
   // cookie 缺失/格式错误 → 明确提示；其余网络错误 → 静默隐藏。
   function loadLegacyKeys(id, fromTick) {
+    if (!legacyEligible(id)) return;
     if (legacyDetailFresh(id, 'keys', !fromTick)) return;
     api('GET', '/__admin/api/legacy/account/' + id + '/keys', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
@@ -5302,6 +6032,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (act === 'save') { saveEdit(id); return; }
     if (act === 'billing') { refreshBalance(id); return; }
     if (act === 'addkey') { addKey(id); return; }
+    if (act === 'copykey') { copyKey(id, btn.getAttribute('data-fp')); return; }
     if (act === 'renamekey') { renameKey(id, btn.getAttribute('data-fp')); return; }
     if (act === 'delkey') { delKey(id, btn.getAttribute('data-fp')); return; }
     if (act === 'delete') { delAccount(id); return; }
@@ -5435,6 +6166,33 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     var c = e.target.closest('button[data-copy]');
     if (c) copyPlain(Number(c.getAttribute('data-copy')), c);
   });
+  // model access tab：行/chip 是动态 innerHTML，走视图委托。
+  $('view-access').addEventListener('click', function (e) {
+    var gc = e.target.closest('[data-model]');
+    if (gc) { maToggleSel(gc.getAttribute('data-model')); return; }
+    var btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    var act = btn.getAttribute('data-action');
+    if (act === 'ma-edit') {
+      editModelAccess(btn.getAttribute('data-type'), btn.getAttribute('data-subject'),
+        btn.getAttribute('data-name'), btn.getAttribute('data-mask'));
+      return;
+    }
+  });
+  var maSearchEl = $('ma-search');
+  if (maSearchEl) maSearchEl.addEventListener('input', function () {
+    maSearch = this.value.trim();
+    renderModelAccess();
+  });
+  var maFilterEl = $('ma-filter');
+  if (maFilterEl) maFilterEl.addEventListener('change', function () {
+    maFilter = this.value;
+    renderModelAccess();
+  });
+  $('ma-global-save').addEventListener('click', saveMaGlobal);
+  $('ma-global-reset').addEventListener('click', resetMaGlobal);
+  $('ma-refresh').addEventListener('click', function () { loadModelAccess(); });
+
   // m1（对抗审查）：关闭即清空明文（DOM + dataset）——「仅此一次」在页面生命周期内也成立。
   function clearPlain() {
     var el = $('plain-list');
@@ -5442,6 +6200,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     $('plain-overlay').hidden = true;
   }
   $('plain-close').addEventListener('click', clearPlain);
+  // Update（OTA）：检查按钮 + 更新进度弹层关闭按钮。
+  $('btn-ota-check').addEventListener('click', doOtaCheck);
+  $('btn-ota-update').addEventListener('click', function () { if (otaCache && otaCache.hasUpdate) showOtaChangelog(otaCache); });
+  $('update-close').addEventListener('click', function () { $('update-overlay').hidden = true; });
+  $('update-overlay').addEventListener('click', function (e) {
+    if (e.target === $('update-overlay')) $('update-overlay').hidden = true;
+  });
   $('plain-overlay').addEventListener('click', function (e) {
     if (e.target === $('plain-overlay')) clearPlain();
   });
@@ -5570,6 +6335,31 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   $('confirm-overlay').addEventListener('click', function (e) {
     if (e.target === $('confirm-overlay')) closeConfirm();
   });
+  // model access 编辑 modal：chip toggle + 「跟随全局（清除）」按钮（confirm-body 动态 HTML）。
+  $('confirm-overlay').addEventListener('click', function (e) {
+    var opt = e.target.closest('.ma-chip[data-ma-opt]');
+    if (opt) {
+      var om = opt.getAttribute('data-ma-opt');
+      if (maEdit) {
+        var i = maEdit.cur.indexOf(om);
+        if (i >= 0) maEdit.cur.splice(i, 1);
+        else maEdit.cur.push(om);
+        renderMaEditChips();
+      }
+      return;
+    }
+    var clr = e.target.closest('button[data-ma-clear]');
+    if (clr) {
+      var type = clr.getAttribute('data-type');
+      var subject = clr.getAttribute('data-subject');
+      api('PUT', '/__admin/api/model-access/keys/' + type + '/' + encodeURIComponent(subject), { models: null })
+        .then(function (r) {
+          if (r.ok) { closeConfirm(); flash(T('maSaved')); loadModelAccess(); }
+          else { $('confirm-err').textContent = errMsg(r); }
+        });
+      return;
+    }
+  });
   $('view-account-detail').addEventListener('click', function (e) {
     var btn = e.target.closest('button[data-action]');
     if (btn) {
@@ -5583,6 +6373,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       if (act === 'copy-legacy-key') { copyLegacyKey(btn.getAttribute('data-keyid')); return; }
       if (act === 'refresh-legacy-keys') { loadLegacyKeys(detailState.id); return; }
       if (act === 'ws-switch') { switchWorkspace(Number(btn.getAttribute('data-id'))); return; }
+      if (act === 'save-legacy-key') { saveLegacyKey(); return; }
+      if (act === 'clear-legacy-key') { clearLegacyKey(); return; }
+      if (act === 'copy-config-legacy-key') { copyConfigLegacyKey(); return; }
       if (act === 'save-models') { saveModels(Number(btn.getAttribute('data-id'))); return; }
       if (act === 'clear-models') { clearModels(Number(btn.getAttribute('data-id'))); return; }
       return;
@@ -5609,10 +6402,18 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (rs) curSub = rs;
   } catch (e) {}
   switchView(curView);
-  tick(); setInterval(tick, 2000);
+  tick(); fcTickTimer = setInterval(tick, 2000);
   setInterval(tickCountdown, 1000);
   // 首拉分发密钥（总览费用/密钥卡 + 密钥 tab 共用这份 60s 缓存）。
   loadTokens(false);
+  // OTA 红点：启动拉一次 + 60s 轮询（后台服务端每 6h 检查一次，这里只是
+  // 把「有新版本」的红点刷到 tab 上；进设置页时 switchView 已拉一次）。
+  var otaTimer = 0;
+  loadOtaStatus(false);
+  otaTimer = setInterval(function () {
+    if (document.hidden) return;
+    loadOtaStatus(false);
+  }, 60000);
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) return;
     tickCountdown();

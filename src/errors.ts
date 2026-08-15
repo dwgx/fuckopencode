@@ -206,10 +206,20 @@ export function classifyUpstreamFailure(
   const errorType = extractUpstreamErrorType(body);
   const errorMessage = extractUpstreamErrorMessage(body);
 
-  // 额度耗尽 ≠ 并发限流。前者按小时/天计（周额度、月配额），短冷却只会让请求
-  // 反复去撞同一个已耗尽的 key；后者几秒就恢复。必须分开，否则要么白等、
-  // 要么白撞。实测上游形态：429 + {"type":"GoUsageLimitError",
+  // free 模型瞬时限流（实测形态：429 + FreeUsageLimitError，message "Rate limit
+  // exceeded. Please try again later."）—— **不是额度窗口**，可能几秒就恢复
+  // （2026-08-14 实测：key 被标 24h 冷却后，直接请求上游返回 200 完整响应）。
+  // 归 rate-limit 短冷却，不冻能用的 key；持续限流时客户端退避重试再撞、再短冷却，
+  // 比 24h 假倒计时强。
+  if (errorType === 'FreeUsageLimitError') return 'rate-limit';
+
+  // 额度耗尽 ≠ 并发限流。前者按小时/天计（周额度、月配额、free 日窗），短冷却
+  // 只会让请求反复去撞同一个已耗尽的 key；后者几秒就恢复。必须分开，否则要么
+  // 白等、要么白撞。实测上游形态：429 + {"type":"GoUsageLimitError",
   // "message":"Weekly usage limit reached. Resets in 19hr 22min."}
+  //
+  // 2026-08-14 补钉：FreeUsageLimitError 已在上方单独摘出归 rate-limit（瞬时），
+  // 不再靠这里的枚举/正则命中（否则又会被 24h 兜底冻住）。
   const quotaSignals =
     errorType === 'GoUsageLimitError' ||
     errorType === 'MonthlyLimitError' ||
@@ -302,11 +312,13 @@ export function classifyAccountError(
     return { status: 'limit', retryMs: resetOr(ACCOUNT_RESET_FALLBACK_24H_MS) };
   }
 
-  // 日额度：重置 + 60s 余量；Go 兜底 1 小时、Black 兜底 24 小时。
+  // 日额度：重置 + 60s 余量；解析不出重置时间时 24 小时兜底（2026-08-14 从
+  // 1h 提升：Go 周额度真实恢复 2 天，1h 兜底让探针每小时重试一次撞 429，
+  // 面板显示「5 分钟/1 小时」假冷却，用户实测确认「只有 2day 是真的」）。
   if (errorType === 'GoUsageLimitError') {
     return {
       status: 'cooldown',
-      retryMs: resetOr(ACCOUNT_RESET_FALLBACK_1H_MS) + ACCOUNT_RESET_MARGIN_MS,
+      retryMs: resetOr(ACCOUNT_RESET_FALLBACK_24H_MS) + ACCOUNT_RESET_MARGIN_MS,
     };
   }
   if (errorType === 'BlackUsageLimitError') {
@@ -316,14 +328,12 @@ export function classifyAccountError(
     };
   }
 
-  // free 模型 IP 日窗限流（实测形态：429 + FreeUsageLimitError，200 请求/天
-  // 按 IP 计、UTC 零点重置）：换 key 没用（IP 维度）——冷却到 UTC 零点，
-  // 避免「1h 冷却 → 重试还 429 → 又 1h」的循环（VPS IP 被限时全池 503）。
-  // 时长 = 到 UTC 零点的毫秒数（最少 1h，最多 24h）。
+  // free 模型限流（FreeUsageLimitError "Rate limit exceeded"）：**可能是瞬时的**
+  // （几秒恢复，2026-08-14 实测：被标 24h 后 key 直接请求上游 200），不是一定
+  // 是 IP 日窗。探针给 15 分钟短重试 —— 恢复就能探到，没恢复 15 分钟后重探，
+  // 比「冷却到 UTC 零点」（最多 24h）的假倒计时合理。
   if (errorType === 'FreeUsageLimitError') {
-    const now = Date.now();
-    const utcMidnight = Math.ceil(now / 86_400_000) * 86_400_000;
-    return { status: 'cooldown', retryMs: Math.max(3600_000, utcMidnight - now) + ACCOUNT_RESET_MARGIN_MS };
+    return { status: 'cooldown', retryMs: ACCOUNT_RETRY_FLOOR_MS };
   }
 
   // 区域限制：24 小时。必须在「裸 429」判定之前 —— RegionError 常以 429/403 形态出现，
