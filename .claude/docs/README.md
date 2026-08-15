@@ -21,11 +21,17 @@
 - `ISSUES.md` — 已知问题，按严重度排，带文件行号和复现条件
 - `PLAN.md` — 接下来做什么，按优先级
 - `CONVENTIONS.md` — 代码与提交风格
-- `SHIELD.md` — 护盾（kiro_shield.py）行为与端口约定（动隧道/端口前必读）
-- `MULTI-ACCOUNT.md` — 多账号面板实现契约（表结构/API/模块划分/已知取舍）
+- `SHIELD.md` — 护盾（kiro_shield.py）行为与端口约定（**已退役停用**，2026-08-15 去盾）
+- `MULTI-ACCOUNT.md` — 多账号面板实现契约（表结构/API/模块划分/已知取舍/legacy 通道）
+- `MODEL-ACCESS.md` — 密钥-模型授权（四级授权链/任意模型可扩展/Model Access tab）
+- `QUOTA.md` — 分发密钥配额计费（$ 单位 microCents/周期重置/定价表/B1·M1-M3 修复）
+- `OTA.md` — GitHub OTA 自更新（release 管线/守卫回滚/rollback 4 场景）
 - `ADMIN-LAYOUT.md` — 管理面板布局设计（tab 结构/设置页/移动端）
 - `CONSOLE-PORT.md` — 新版控制台（console.opencode.ai）REST 端点实测记录
 - `CONSOLE-P0-ENDPOINTS.md` — console 端点 P0 契约（分页字段/返回形状）
+- `docs/PERFORMANCE.md` — 性能实测报告（2026-08-15 nbus 实测：内存/延迟/吞吐/并发门/复测方法；在 `docs/`，不是本目录）
+
+（`WORKFLOW.md` 将由主控另行撰写，届时再补入清单。）
 
 ## 规则
 

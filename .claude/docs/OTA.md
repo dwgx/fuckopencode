@@ -3,14 +3,20 @@
 > 对齐参考实现：cursorapi（updater.mjs/guard.mjs）、kirostudio（update.rs +
 > rollback-guard.sh + health_marker.rs）、windsurf（fs-atomic.js）。2026-08-14 设计，
 > 落地 I-20。
+>
+> **上线状态（2026-08-16 同步）**：OTA 已上线（nbus systemd drop-in +
+> `OTA_ENABLED=1`），v0.3.0 已走 release 管线发布（dist tarball + sha256 资产）。
+> rollback 守卫 shell **4 场景实测全对**（boot 计数/版本裁决/无关失败不误回滚/手动
+> 部署清计数）；真机端到端验收（真触发一次 OTA + 崩溃回滚模拟）仍待做，见 PLAN.md。
 
 ## 0. 关键前提
 
 - 线上 `/root/fuckopencode` 不是 git 仓库，只有 dist/ + data/ + env + dist.prev。
   服务器没有源码/npm/tsc——只有 node。构建只在本地/CI。
-- systemd：Restart=always、MemoryMax=400M、WorkingDirectory=/root/fuckopencode。
+- systemd：Restart=always、MemoryMax=320M（实测线上值；曾漂移为 400M）、
+  WorkingDirectory=/root/fuckopencode。
 - 优雅关停已成型（src/shutdown.ts）：SIGTERM → flush 用量库 → exit(0)。
-- 上游公开仓库 dwgx/fuckopencode，已有 release（v0.2.0）。
+- 上游公开仓库 dwgx/fuckopencode，已有 release（v0.2.0 / v0.3.0）。
 
 ## 1. 更新源与资产
 
@@ -136,7 +142,7 @@ ExecStartPre=/root/fuckopencode/scripts/rollback-guard.sh
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
-MemoryMax=400M          # 原有，别删
+MemoryMax=320M          # 原有，别删
 OOMScoreAdjust=500      # 原有，别删
 ```
 

@@ -19,13 +19,20 @@ OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。
 - 流式转换逐事件打磨：`reasoning_content` 增量、usage 独立尾 chunk、背压、`[DONE]`
 - 多轮工具稳定：`tool_use` / `tool_result` id 一一对应（FIFO）
 - 生产级安全：常量时间鉴权、提示词注入检测、SSRF 防护（含 IPv6）、CSRF、背压、内部错误不泄漏
-- 多账号管理面板（`/__admin`）：账号 CRUD、分发密钥（per-key RPM 限流）、
+- 多账号管理面板（`/__admin`）：账号 CRUD、分发密钥（per-key RPM 限流 + **配额计费**：
+  $ / tokens / 请求数上限、过期时间、日/月周期重置）、**密钥-模型授权**（Model Access，
+  四级授权链：密钥 > 账号 > 全局默认 > 硬底线，全局白名单可扩展任意模型）、
   热配置（settings 表，运行时生效不重启）、操作审计、请求明细/搜索、IP 统计、
-  用量趋势、OAuth device flow 登录
+  用量趋势、OAuth device flow 登录、性能仪表盘、OTA 自更新面板、**i18n 三语（en/zh/ja）**
+- 懒人式接入：配置一个旧版 API key（`legacyKey`）即可零 cookie 显示 Go 订阅额度；
+  OAuth 授权后新版控制台数据自动进来
 - 数据面并发保护：`MAX_CONCURRENT_REQUESTS` 在飞上限（默认 400），超限
   503 + `Retry-After`
-- 模型白名单双层防线：全局白名单（仅 `deepseek-v4-flash` 两个变体，白名单外
-  明确 400）+ 账号级 `allowedModels`（面板可配）
+- 模型白名单四级授权：全局白名单默认 `deepseek-v4-flash` 两个变体、**面板可添加任意
+  模型**（claude-*/gpt-* 等，白名单外明确 400）+ 账号级 `allowedModels` + 密钥级自定义
+  （token / API key / 上游 key），三层之上还有代码硬底线兜底
+- OTA 自更新（默认关，`OTA_ENABLED=1` 开启）：后台检查 GitHub release，校验通过后
+  原子替换 + 自重启，systemd 崩溃回滚守卫
 - 生产级安全：AES-256-GCM 加密落库（账户 key / billing cookie / 分发 token）、
   请求日志凭证脱敏（`sk-*` / `Bearer` / `auth=Fe26.*`）、面板登录限速 +
   Origin 校验、默认密码告警（`adminPassIsDefault` 徽章）
@@ -33,21 +40,75 @@ OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。
 
 ## 快速开始
 
-### 一键部署
+### 三平台安装
 
-clone 仓库（上游 `dwgx/fuckopencode` 或你自己的 fork）后运行安装脚本：
+需要 **Node >= 22.5**（`node:sqlite`，用量持久化；低版本自动降级为内存窗口，
+代理功能不受影响）。三平台都支持 `release` 模式（默认，从 GitHub release 下载
+预构建 dist tarball，服务器不需要 npm/tsc）与 `source` 模式（本机构建源码）。
+
+#### Linux（systemd，推荐）
 
 ```bash
 git clone <仓库地址>
 cd fuckopencode
-./scripts/install.sh
+./scripts/install.sh          # release 模式：下载最新版到 /opt/fuckopencode（root）
+./scripts/install.sh --source # 源码模式：本机构建
 ```
 
-`scripts/install.sh` 支持两种模式：`release`（默认，从 GitHub release 下载预构建
-dist tarball，服务器不需要 npm/tsc）与 `source`（本机构建源码）。需要 **Node >= 22**。
+root 下自动写入 `/etc/systemd/system/fuckopencode.service`（`Restart=always`，
+开机自启 + OTA 自更新守卫）；非 root 回退 nohup + pid 文件（开发场景）。
 
-装完复制模板配置并按需修改：`cp .env.example .env`，必填项只有
+#### macOS（nohup / launchd）
+
+```bash
+git clone <仓库地址>
+cd fuckopencode
+./scripts/install.sh          # 安装到 ~/fuckopencode，nohup 后台启动
+```
+
+开机自启可自行配 launchd（plist 放 `~/Library/LaunchAgents/`，`launchctl load`
+后生效；`ProgramArguments` 里的 node 路径换成 `which node` 的实际路径，
+Apple Silicon 常见 `/opt/homebrew/bin/node`）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.fuckopencode.gateway</string>
+  <key>WorkingDirectory</key><string>/Users/<你>/fuckopencode</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>--max-old-space-size=256</string>
+    <string>/Users/<你>/fuckopencode/dist/main.js</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+#### Windows（PowerShell）
+
+```powershell
+git clone <仓库地址>
+cd fuckopencode
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+PowerShell 5.1+（Windows 10 17063+ 内置 tar 支持 .tar.gz），无需管理员权限：
+GitHub API 取最新 tag → 下载 dist tarball + sha256 校验 → 解压到
+`%ProgramFiles%\fuckopencode`（管理员）或 `%USERPROFILE%\fuckopencode`
+（普通用户，可用 `$env:FC_INSTALL_DIR` 覆盖）→ 生成 `fuckopencode.env` 最小模板
+→ `Start-Process` 后台启动。开机自启可选计划任务（脚本会打印 schtasks 命令）。
+Node 安装：https://nodejs.org 或 `winget install OpenJS.NodeJS.LTS`。
+
+#### 必填环境变量
+
+装完编辑 `fuckopencode.env`（三个平台同名文件），必填只有两项：
 `API_KEYS`（调用方 key）+ `OPENSEA_KEYS` 或 `ANTHROPIC_API_KEY`（上游 key）。
+缺配置时网关 fail-closed（拒绝所有请求），改完重启服务即可。
 
 ### 手动部署
 
@@ -127,7 +188,7 @@ claude
 | `POST /__admin/api/accounts/:id/keys` | 为账号添加上游 key |
 | `PATCH`/`DELETE /__admin/api/accounts/:id/keys/:fp` | 重命名 / 删除账号 key |
 | `GET`/`POST /__admin/api/tokens` | 分发密钥列表 / 创建（token 明文**仅此一次**返回） |
-| `PATCH`/`DELETE /__admin/api/tokens/:id` | 改名 / 状态 / 备注 / `rpmLimit` / 删除 |
+| `PATCH`/`DELETE /__admin/api/tokens/:id` | 改名 / 状态 / 备注 / `rpmLimit` / 配额（`quotaUsd`/`quotaTokens`/`quotaRequests`/`quotaCycle`/`expiresAt`）/ 删除 |
 | `GET /__admin/api/tokens/stats` | 分发密钥用量聚合 |
 | `GET`/`PATCH /__admin/api/settings` | 热配置只读 / 热改（apiKeys 替换语义，改密码使旧会话全部失效） |
 | `GET /__admin/api/audit` | 操作审计（登录/登出/账户/密钥/设置，脱敏摘要） |
@@ -136,8 +197,15 @@ claude
 | `GET /__admin/api/overview/trend` | 用量趋势（24h 按小时 / 7d 按天） |
 | `POST /__admin/api/oauth/start` / `poll` | OAuth device flow 登录（RFC 8628，自动建号） |
 | `GET`/`POST /__admin/api/model-aliases`、`PUT`/`DELETE /__admin/api/model-aliases/:alias` | 模型映射（别名）管理 |
+| `GET /__admin/api/model-access` | 密钥-模型授权全量（全局 + 各 key + 可选项列表） |
+| `PUT /__admin/api/model-access/global` | 全局白名单（可添加任意模型名）/ `PUT .../keys/:type/:subject` 密钥级自定义 |
 | `GET /__admin/api/config` | 实验开关只读状态（env 配置，运行时不可改） |
 | `POST /__admin/api/models/refresh` | 手动刷新上游模型目录 |
+| `GET /__admin/api/performance` | 性能快照（内存/CPU/负载/并发/延迟分位/池状态） |
+| `GET /__admin/api/keys/usage` | 全部 key 窗口用量；`POST /__admin/api/keys/:fp/disable` \| `reset` 手动启停 |
+| `GET /__admin/api/legacy-key/:id/plain` | 旧版 API key 明文复制 |
+| `PUT /__admin/api/legacy/account/:id/go-toggle` | 账号 Go 开关（`{useBalance?}` \| `{chinaModels?}`，只带被切换键） |
+| `GET`/`POST /__admin/api/update/check` / `perform` | OTA 版本检查 / 执行更新（`OTA_ENABLED=1` 才允许写盘） |
 
 管理面鉴权：本机直连免 key（`DASHBOARD_OPEN`），或 API key，或面板登录会话
 cookie；写操作与敏感读端点一律再做 Origin 校验（防跨站）。`DASHBOARD_PUBLIC`
@@ -155,13 +223,33 @@ cookie；写操作与敏感读端点一律再做 Origin 校验（防跨站）。
 
 ### 模型白名单
 
-全局白名单是**代码常量**（非环境变量）：仅 `deepseek-v4-flash`（订阅端点，
-cost=0）与 `deepseek-v4-flash-free`（按量端点）两个变体。白名单外的模型名
+默认全局白名单是**代码常量**：仅 `deepseek-v4-flash`（订阅端点，cost=0）与
+`deepseek-v4-flash-free`（按量端点）两个变体；但**面板可以添加任意合法模型名**
+（`claude-*/gpt-*` 等上游模型，Model Access 页的「可选模型」网格 + 手动输入），
+添加的模型透传上游、由上游裁决是否支持（上游 400/404 如实回传）。白名单外的模型名
 明确 400（不再静默回落），错误响应列出可用模型。别名（`MODEL_MAP` env +
-后台 `model-aliases` 管理）映射结果必须落在白名单内。
+后台 `model-aliases` 管理）映射结果必须在生效白名单内。
 
-账号级 `allowedModels`（面板 `PATCH /__admin/api/accounts/:id`，上限 50 项）
-进一步收紧单个账号可用模型；选号时与全局白名单取交集（账号不能突破全局底线）。
+授权是四级链，**配置层覆盖低层（替换语义，不是交集）**：
+
+```
+密钥级自定义（Model Access 页，可配 token / API key / 上游 key）
+  > 账号级 allowedModels（PATCH /__admin/api/accounts/:id，上限 50 项）
+  > 全局默认（settings 热配置 allowedModels，面板可加/删模型）
+  > 代码硬底线（deepseek 两个，兜底）
+```
+
+## 性能
+
+实测于 2026-08-15，nbus VPS（2 核 1.9G）生产机：
+
+- 内存：网关 RSS ≈ 93MB（256M 堆上限的 36%），24h 零 OOM、零崩溃
+- 延迟：本机 healthz p50 0.47ms / p95 1.74ms；`/v1/models` p50 0.58ms / p95 1.13ms
+- 吞吐：20 并发压测 healthz 935 rps、`/v1/models` 1250 rps，错误率 0
+- 并发门：数据面在飞上限默认 400，超限 503 + `Retry-After`
+
+完整报告（环境/内存/CPU/延迟分布/吞吐/并发门/复测方法）见
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
 ## 安全
 
@@ -323,7 +411,9 @@ src/
 ├── console.ts          # 新版控制台 REST 数据通道
 ├── legacy.ts           # 旧版控制台（opencode.ai）key 通道
 ├── oauth.ts            # OAuth device flow 登录（RFC 8628）
-├── tokens.ts           # 分发密钥（AES 加密落库 + 用量聚合）
+├── tokens.ts           # 分发密钥（AES 加密落库 + 用量聚合 + 配额计费）
+├── money.ts            # 金额换算唯一权威（microCents ↔ 美元）
+├── modelaccess.ts      # 密钥-模型授权 store（四级授权链）
 ├── settings.ts         # 热配置（settings 表，env 为默认、db 覆盖）
 ├── modelmap.ts         # 模型映射 db 持久化 + 默认别名种子
 ├── ratelimit.ts        # 分发 token 的 per-key RPM 限流（滑动窗口）

@@ -43,6 +43,7 @@ OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。暴露 OpenAI `/v1/c
 | [.claude/docs/SHIELD.md](.claude/docs/SHIELD.md) | 动端口、隧道、或排查上游波动前必读（盾在网关前面） |
 | [.claude/docs/PLAN.md](.claude/docs/PLAN.md) | 接下来做什么 |
 | [.claude/docs/CONVENTIONS.md](.claude/docs/CONVENTIONS.md) | 写代码/提交前对一遍风格 |
+| [.claude/docs/WORKFLOW.md](.claude/docs/WORKFLOW.md) | 开发工作流（派发/TDD/review/门禁/避免的坑），开始任务前过一遍 |
 
 文档分工：`README.md` 给使用者，`.claude/docs/` 给维护者，`docs/site/` 是对外宣传页（独立产物，不是文档）。
 

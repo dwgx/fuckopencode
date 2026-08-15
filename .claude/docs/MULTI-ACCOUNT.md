@@ -642,6 +642,10 @@ GET /__metrics   （仅 isAdminRequest 通过的请求包含此段）
   - 前端另有 TTL 门（admin.ts legacyDetailFresh/legacyDetailMark，成功渲染才打点，
     失败保留 2s 自愈重试）。
 - 详情端点：`/__admin/api/legacy/account/:id/{keys,go,billing}` + 写操作 + `/keys/plain`。
+- **go 开关契约（2026-08-15 改）**：`PUT /__admin/api/legacy/account/:id/go-toggle`，
+  body 只带被切换键 `{useBalance?}|{chinaModels?}`（原 `POST /go/use-balance` 已弃用）；
+  失败回滚 + sticky 保留。zen API 无「中国区模型」开关字段，go 端点合并数据源
+  （zen 窗口 + cookie HTML 开关，`mergeLegacyGoStatus`）。
 
 ## 9. 上线与运维注意
 
