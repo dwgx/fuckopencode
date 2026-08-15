@@ -33,6 +33,24 @@ OpenAI ↔ Anthropic 协议转换网关，面向 DeepSeek。
 
 ## 快速开始
 
+### 一键部署
+
+clone 仓库（上游 `dwgx/fuckopencode` 或你自己的 fork）后运行安装脚本：
+
+```bash
+git clone <仓库地址>
+cd fuckopencode
+./scripts/install.sh
+```
+
+`scripts/install.sh` 支持两种模式：`release`（默认，从 GitHub release 下载预构建
+dist tarball，服务器不需要 npm/tsc）与 `source`（本机构建源码）。需要 **Node >= 22**。
+
+装完复制模板配置并按需修改：`cp .env.example .env`，必填项只有
+`API_KEYS`（调用方 key）+ `OPENSEA_KEYS` 或 `ANTHROPIC_API_KEY`（上游 key）。
+
+### 手动部署
+
 ```bash
 npm install
 npm run build
@@ -170,6 +188,9 @@ cost=0）与 `deepseek-v4-flash-free`（按量端点）两个变体。白名单�
 
 ## 配置
 
+完整带注释模板见 [.env.example](.env.example)，复制为 `.env` 后按需修改；
+本节的表是逐项说明（默认值以代码为准，见 `src/config.ts`）。
+
 环境变量：
 
 ### 服务与上游
@@ -253,6 +274,28 @@ cost=0）与 `deepseek-v4-flash-free`（按量端点）两个变体。白名单�
 累计，代理功能不受影响。库里 API key 只存脱敏指纹（`****XXXX` 末 4 位），
 **分发 token 存完整指纹**；requests 表同时落 path/ua/client/ip/cost，详细请求页
 与 IP 统计即来源于此（管理鉴权后才可见）。
+
+## OTA 自更新
+
+OTA（over-the-air）自更新：后台检查 GitHub release，发现更高版本时从 release
+下载预构建 dist tarball（`fuckopencode-v<tag>-dist.tar.gz` + 独立信道取的
+sha256），校验通过后原子替换并自重启，实现免登录更新。默认全关（`OTA_ENABLED=0`，
+fail-closed）；关着时面板仍显示更新状态，只是 perform（写盘 + 自重启）403。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `OTA_ENABLED` | `0` | 总开关；`1` = 允许写盘 + 自重启 |
+| `OTA_REPO` | `dwgx/fuckopencode` | 更新源仓库 owner/repo |
+| `OTA_TOKEN` | 空 | 私有仓库 token；配了只走直连、不交给 gh-proxy，永不进日志/响应 |
+| `OTA_CHECK_INTERVAL_MS` | `21600000`（6h） | 后台版本检查周期；`0` = 关闭（只检查不自动应用） |
+
+第三方部署注意：
+
+- `OTA_REPO` 必须指向你自己的仓库，且仓库要配 `.github/workflows/release.yml`
+  （push `vX.Y.Z` tag 触发：typecheck + test + build + 打包 dist tarball +
+  算 sha256 + 上传 release 资产）。OTA 会校验 `dist/version.txt == tag`，
+  版本只升不降。
+- 自重启需要 supervisor（systemd/launchd）托管；裸跑前台进程时 perform 会拒绝。
 
 ## 架构
 
