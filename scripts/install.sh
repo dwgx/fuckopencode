@@ -23,6 +23,8 @@
 #     .env.example 缺失则用内置最小模板兜底。
 #   - 零外部依赖：bash + curl + tar + awk + grep + node。不需要 git/rsync。
 #   - 生产形态：dist/ + data/ + scripts/ + fuckopencode.env，由 systemd 托管。
+#   - Windows（MSYS/MINGW/CYGWIN/Git Bash）请改用 scripts/install.ps1
+#     （PowerShell 安装，对标本脚本的 release 模式）。
 # =============================================================================
 set -euo pipefail
 
@@ -74,6 +76,10 @@ fuckopencode 一键安装脚本（OpenAI<->Anthropic 协议转换网关）
   ./scripts/install.sh --source            # 从源码构建
   ./scripts/install.sh --version v0.2.0    # 装指定版本
   ./scripts/install.sh update              # 更新并重启
+
+Windows:
+  install.sh 仅支持 Linux / macOS。Windows 请用 PowerShell：
+  powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 EOF
 }
 
@@ -83,7 +89,14 @@ IS_MAC=0; SYSTEMD=0
 case "$OS" in
   Darwin) IS_MAC=1 ;;
   Linux)  [ -d /run/systemd/system ] && SYSTEMD=1 ;;
-  *) die "不支持的系统：$OS（仅 Linux / macOS）" ;;
+  # Windows（MSYS/MINGW/CYGWIN/Git Bash）：install.sh 不支持，改用 PowerShell。
+  MINGW*|MSYS*|CYGWIN*)
+    printf "${C_YELLOW}  Windows 环境（${OS}）：install.sh 仅支持 Linux / macOS。${C_OFF}\n"
+    printf "${C_CYAN}  请改用 PowerShell 安装脚本：${C_OFF}\n"
+    printf '    powershell -ExecutionPolicy Bypass -File scripts\\install.ps1\n'
+    exit 1
+    ;;
+  *) die "不支持的系统：$OS（仅 Linux / macOS / Windows（PowerShell 安装脚本））" ;;
 esac
 
 IS_ROOT=0
@@ -109,7 +122,7 @@ require_node() {
   Debian/Ubuntu:  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs
   RHEL/Fedora:    sudo dnf install -y nodejs
   macOS:          brew install node  （或 nvm install 22）
-  Windows/WSL:    建议 WSL2 + 上面任一 Linux 指引，或用 nvm-windows"
+  Windows/WSL:    建议 WSL2 + 上面任一 Linux 指引；原生 Windows 用 nvm-windows，部署用 scripts/install.ps1"
   fi
   local v major minor
   v="$(node -v | sed 's/^v//')"
