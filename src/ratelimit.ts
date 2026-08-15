@@ -132,3 +132,80 @@ export class RpmLimiter {
     }
   }
 }
+
+/**
+ * 每 key 的 TPM（每分钟 token 消耗）限流器 —— 固定自然分钟窗口。
+ *
+ * 与 RpmLimiter 的差异：RPM 数请求，TPM 数 token（输入+输出+缓存读），
+ * 对齐 new-api 的 TPM 概念（QUOTA 扩展）。窗口是「自然分钟」：
+ * windowStart = floor(now/60000)*60000，跨分钟即归零 —— TPM 是软预算，
+ * 分钟窗口语义足够，不需要 RPM 的秒级滑动窗精度。
+ *
+ * # 语义（TPM 预估取舍，主控任务：请求前检查已用，不做预扣/预估）
+ *
+ * - 数据面校验（verify）：`used >= limit` → 429。**不预估**本次请求会消耗
+ *   多少 token —— 当前分钟已用超过上限就拒，未超就放行；放行后 settle 累加，
+ *   过量就过量（窗口滚动即恢复）。不做「max_tokens + input 粗估」预扣：
+ *   预扣要么低估（被流式长输出打穿）要么高估（误拒正常请求），而完成时
+ *   累加真实用量零误差 —— 与 settle 配额同哲学（QUOTA.md §2 不做预扣）。
+ * - settle：请求完成时 add 真实用量（input+output+cacheRead，与配额 tokens
+ *   口径一致）。并发在飞的多个请求共享同一分钟窗口，先到先得，可能小幅
+ *   超额 —— 与 RPM 429 的「拒绝也计数」不同，被 429 拒的请求**不消耗**
+ *   TPM（check 只读不改窗口），窗口滚动后自动恢复。
+ *
+ * # 并发安全
+ *
+ * 同 RpmLimiter：全同步无 await，事件循环天然串行。
+ *
+ * # 清理
+ *
+ * 惰性：每 CLEANUP_EVERY 次 check 顺手 prune 掉已滑出窗口的 key（复用
+ * RpmLimiter 的 CLEANUP_EVERY 节奏），防 Map 无限增长。
+ */
+export class TpmLimiter {
+  private windows = new Map<string, { windowStart: number; used: number }>();
+  private checks = 0;
+
+  /** 当前跟踪的 key 数（测试/观测用）。 */
+  size(): number {
+    return this.windows.size;
+  }
+
+  /** 当前分钟已用 token（视图/校验共用）。窗口跨分钟自动归零。 */
+  used(key: string, now: number = Date.now()): number {
+    const w = this.windows.get(key);
+    if (!w) return 0;
+    if (now >= w.windowStart + WINDOW_MS) return 0;
+    return w.used;
+  }
+
+  /**
+   * 判定一次请求是否允许（请求前检查已用，不预扣）。`limit <= 0` = 不限流
+   * （恒放行；check 不写窗口 —— 被拒请求不消耗 TPM）。`now` 可注入（测试）。
+   */
+  check(key: string, limit: number, now: number = Date.now()): { allowed: boolean; used: number } {
+    const used = this.used(key, now);
+    const allowed = limit <= 0 || used < limit;
+    if (++this.checks % CLEANUP_EVERY === 0) this.prune(now);
+    return { allowed, used };
+  }
+
+  /** 结算：累加本次用量到当前分钟窗口（跨分钟自动开新窗口）。 */
+  add(key: string, tokens: number, now: number = Date.now()): void {
+    if (tokens <= 0) return;
+    const windowStart = Math.floor(now / WINDOW_MS) * WINDOW_MS;
+    const w = this.windows.get(key);
+    if (!w || now >= w.windowStart + WINDOW_MS) {
+      this.windows.set(key, { windowStart, used: tokens });
+    } else {
+      w.used += tokens;
+    }
+  }
+
+  /** 删除 `now` 之前已滑出窗口的 key。惰性：只在 check 定期触发。 */
+  prune(now: number = Date.now()): void {
+    for (const [key, w] of this.windows) {
+      if (now >= w.windowStart + WINDOW_MS) this.windows.delete(key);
+    }
+  }
+}

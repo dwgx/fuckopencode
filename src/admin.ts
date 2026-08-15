@@ -1005,9 +1005,10 @@ async function handleDeleteModelAlias(
 export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>fuckopencode — admin</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <title>fuckopencode — admin</title>
 <style>
   :root {
     --bg: #0c0c0e;
@@ -1144,8 +1145,26 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   /* ── sections（opencode 骨架：h1 uppercase + muted 副行）── */
   section { padding: 40px 0 24px; border-bottom: 1px solid var(--border-muted); margin-bottom: 64px; }
   section:last-child { border-bottom: 0; }
+  /* 设置页分组卡片（服务/安全/运行/关于）：一组相关 section 收进一张卡，
+     section 之间用弱分隔线而不是 64px 大间距——dashboard 分组语义。 */
+  .settings-group {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 0 20px 8px; margin-bottom: 28px;
+  }
+  .settings-group > section {
+    border-bottom: 0; padding: 24px 0 20px; margin-bottom: 0;
+  }
+  .settings-group > section + section { border-top: 1px solid var(--border-muted); }
+  .settings-group-hd {
+    font-size: 11px; color: var(--text-muted); text-transform: uppercase;
+    letter-spacing: .03em; padding: 16px 0 0;
+  }
   h1 { font-size: 24px; font-weight: 500; text-transform: uppercase; letter-spacing: -0.03125rem; color: var(--text); }
   .sub { color: var(--text-muted); font-size: 15px; margin-top: 3px; }
+  /* 区块头带操作按钮（全部收起/展开等）：标题 + 副行在左，工具按钮在右。 */
+  .sec-hd { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .sec-hd .sub { margin-bottom: 0; }
+  .sec-tools { display: flex; gap: 6px; }
   .w { color: var(--text-disabled); }
   /* 提示体系：oc-hint（普通说明）+ oc-hint-err（错误）。块级错误用
      oc-hint oc-hint-err（padding 来自 oc-hint）；表单/弹层内错误只挂
@@ -1158,6 +1177,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .form-error:empty, .go-err:empty, .oc-hint-err:empty { display: none; }
   .grow { flex: 1; min-width: 0; }
   .cut { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  /* 纯 CSS 悬浮提示（opencode 风格：dark elevated 气泡 + 细边框 + 阴影）：
+     挂 data-tip 属性即生效，无需 JS；用于按钮/图标的补充说明。 */
+  .oc-tooltip { position: relative; z-index: 2; cursor: help; }
+  .oc-tooltip::after {
+    content: attr(data-tip);
+    position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 60;
+    max-width: 260px; width: max-content; padding: 6px 10px;
+    background: var(--elevated); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: 0 4px 12px rgba(0,0,0,.3);
+    color: var(--text-2); font-size: 12px; line-height: 150%; white-space: normal;
+    text-transform: none; letter-spacing: normal;
+    opacity: 0; pointer-events: none; transition: opacity .15s;
+  }
+  .oc-tooltip:hover::after { opacity: 1; }
 
   /* ── degraded 提示条（数据面不可用时顶部亮红）────── */
   #degraded {
@@ -1179,6 +1212,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .stats { display: flex; gap: 40px; margin-top: 14px; flex-wrap: wrap; }
   .stat .v { font-size: 24px; font-weight: 600; color: var(--text); line-height: 120%; }
   .stat .l { font-size: 11px; color: var(--text-muted); text-transform: uppercase; margin-top: 2px; }
+  /* KPI 一排卡片（总览 stats + 详情 d-stats 统计数字）。 */
+  .stats .stat, .d-stats .stat {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 16px; min-width: 120px;
+  }
+  .d-stats .stat { min-width: 132px; }
   .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
 
   /* ── forms：oc-form / oc-field 模板控件体系 ────────────
@@ -1207,6 +1246,37 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .oc-w64 { width: 64px; flex: none; }
   .oc-shrink { width: auto; flex: none; }
   .oc-min-200 { min-width: 200px; }
+  /* ── 数字输入自绘 spinner（kirostudio 风格）────────────
+     隐藏浏览器原生步进（各浏览器外观不一致、主题不搭），右侧由 JS 挂两个
+     小箭头（▲▼），点击走 document 委托 stepUp/stepDown。原生伪元素画在
+     input 内部不可交互，故 JS 包一层 .num-wrap + .num-stepper。 */
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+  .num-wrap { position: relative; display: inline-flex; vertical-align: middle; max-width: 100%; }
+  .num-wrap > input[type="number"] { padding-right: 22px; }
+  .num-stepper {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 16px;
+    display: flex; flex-direction: column; align-items: stretch;
+    border-left: 1px solid var(--border-muted);
+  }
+  .num-spin {
+    flex: 1; border: 0; border-radius: 0; padding: 0; min-width: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-muted); background: transparent; cursor: pointer;
+  }
+  .num-spin:hover { color: var(--text); background: var(--accent-alpha); }
+  .num-spin:active { color: var(--accent); }
+  .num-spin-div { height: 1px; background: var(--border-muted); flex: none; }
+  .num-spin-up::before, .num-spin-down::before {
+    content: ''; display: block; width: 0; height: 0;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+  }
+  .num-spin-up::before { border-bottom: 5px solid currentColor; }
+  .num-spin-down::before { border-top: 5px solid currentColor; }
+  /* 弹层表单字段（oc-field 是 stretch 列）：wrapper 接力撑满格子，输入填满。 */
+  .oc-field .num-wrap { display: flex; }
+  .oc-field .num-wrap > input[type="number"] { flex: 1; min-width: 0; }
 
   /* ── account card ────────────────────────────────── */
   /* 账号卡：对齐 .panel 模板（同一套盒子），类名保留供 JS 选择器使用。 */
@@ -1214,6 +1284,17 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius); padding: 16px 20px; margin-bottom: 12px;
   }
+  /* 设置页「关于」区 secret.key 备份高亮警告卡：红色边框 + 标题红字。 */
+  .backup-warn { border-color: rgba(255, 69, 58, .45); }
+  .backup-warn .bw-title { color: var(--danger); font-weight: 600; }
+  /* 账号列表：卡片式网格（一排 2-3 张紧凑卡，不再竖排堆叠）。 */
+  #accounts {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr));
+    gap: 12px; align-items: start;
+  }
+  #accounts .card { margin-bottom: 0; }
+  /* 空态（无账号）横跨整排，不挤进单个网格列。 */
+  #accounts .empty { grid-column: 1 / -1; }
   .card-hd { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .card-hd .name { color: var(--text); font-weight: 500; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(100%, 340px); }
   .badge, .oc-chip {
@@ -1235,7 +1316,37 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .card:hover .ops { opacity: 1; }
   .ops:focus-within { opacity: 1; }
   @media (hover: none) { .ops { opacity: 1; } }
+  /* 触屏没有 hover：key 行的行内操作（改名/移除/禁用）直接常显，不然点不到。 */
+  @media (hover: none) { .key-row .del { opacity: 1; } }
   .ops-btn { padding: 1px 8px; color: var(--text-muted); }
+  /* 账号卡收起/展开：头部（名称/状态/摘要/操作）保留，次要信息整块隐藏。
+     data-collapsed 由 JS 翻转，chevron 用 CSS 边框三角（无 emoji）。 */
+  .card-bd { min-width: 0; }
+  .card[data-collapsed="1"] .card-bd { display: none; }
+  .card-toggle {
+    flex: none; width: 26px; padding: 2px 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--text-muted);
+  }
+  .card-toggle::before {
+    content: ''; display: block; width: 0; height: 0;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid currentColor;
+    transition: transform .15s;
+  }
+  .card[data-collapsed="1"] .card-toggle::before { transform: rotate(180deg); }
+  /* 卡片头「在飞」徽章：key 正在被请求时显示红点 + 数量（收起状态也能看到
+     请求负载——card-bd 隐藏但头部保留）。无在飞时隐藏。 */
+  .card-inflight {
+    display: inline-flex; align-items: center; gap: 4px;
+    color: var(--danger); font-size: 12px; white-space: nowrap;
+  }
+  .card-inflight::before {
+    content: ''; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--danger); animation: inflightPulse 1.2s ease-in-out infinite;
+  }
+  @keyframes inflightPulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+  .card-inflight[hidden] { display: none; }
 
   /* ── dropdown（opencode 风格：surface 底、边框、阴影、hover 高亮）── */
   /* .dd 必须 inline-block：默认块级 div 会撑满 section 全宽，菜单 right:0 就
@@ -1328,36 +1439,21 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .meter-fill { height: 100%; background: var(--accent); border-radius: var(--radius); transition: width .3s; }
   .meter-l { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
 
-  /* ── 账号预览卡 v4：容器化数据区（余额/用量/Go 三格并列）── */
-  .preview-cols {
-    display: grid; grid-template-columns: minmax(150px, 1fr) 1.2fr 1.2fr;
-    gap: 10px; margin-top: 12px; align-items: stretch;
+  /* ── 账号卡展开 v5：两栏——左侧主要信息（编辑/状态/keys），右侧压缩 3 行额度
+     （余额 / 用量 / Go）。右侧每行 = 紧凑小字 label + 值，替代旧的三大盒竖排。 */
+  .card-bd { display: grid; grid-template-columns: minmax(0, 1fr) minmax(200px, 280px); gap: 16px; }
+  .card-main { min-width: 0; }
+  .card-stats { min-width: 0; align-self: start; }
+  .card-stats .st-row {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+    font-size: 12px; padding: 4px 0; border-bottom: 1px solid var(--border-muted);
   }
-  .preview-box { min-width: 0; }
-  .preview-box .p-title {
-    font-size: 10px; color: var(--text-muted); text-transform: uppercase;
-    letter-spacing: .03em; margin-bottom: 8px;
-  }
-  /* 容器 B：余额大数字（balance-card 解壳进 preview-box，防嵌套双框） */
-  .preview-balance .balance-row { margin-top: 0; gap: 0; }
-  .preview-balance .balance-card { padding: 0; min-width: 0; }
-  .preview-balance .balance-card .v { font-size: 22px; }
-  .preview-balance .meter { margin-top: 8px; max-width: none; }
-  /* 容器 C：用量三小格（请求数/输出 tokens/成本） */
-  .preview-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-  .p-cell .p-k { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .03em; }
-  .p-cell .p-v { font-size: 15px; font-weight: 600; color: var(--text); line-height: 130%; margin-top: 3px; }
-  /* 容器 D：Go 三窗口迷你进度条 */
-  .p-go-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-  .p-go-row:last-child { margin-bottom: 0; }
-  .p-go-l { font-size: 10px; color: var(--text-muted); width: 80px; flex: none; white-space: nowrap; }
-  .p-go-bar { flex: 1; height: 5px; background: var(--surface); border: 1px solid var(--border-muted); border-radius: var(--radius); overflow: hidden; min-width: 0; }
-  .p-go-fill { display: block; height: 100%; background: var(--accent); border-radius: var(--radius); }
-  .p-go-pct { font-size: 11px; font-weight: 600; color: var(--text-2); width: 36px; text-align: right; flex: none; }
-  /* 未连接/等待同步提示占满整行 */
-  .preview-cols .p-note { grid-column: 1 / -1; margin-top: 0; }
+  .card-stats .st-row:last-child { border-bottom: 0; }
+  .card-stats .st-k { color: var(--text-muted); white-space: nowrap; }
+  .card-stats .st-v { color: var(--text); text-align: right; white-space: nowrap; }
   @media (max-width: 48rem) {
-    .preview-cols { grid-template-columns: 1fr; }
+    .card-bd { grid-template-columns: 1fr; }
+    .card-stats { border-top: 1px solid var(--border-muted); padding-top: 8px; }
   }
 
   .detail {
@@ -1408,9 +1504,19 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .ws-legacy { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; }
   .ws-switch { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
   .ws-chip, .oc-chip-ws { max-width: 220px; }
-  /* 详情页区块锚点导航条：横向 wrap 的 chip 链，点击平滑滚动到区块。 */
-  .detail-nav-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 20px; }
-  .detail-nav-row .oc-chip { cursor: pointer; }
+  /* 详情页分组 tab 条：复用 .tab 样式（下划线 active），次级尺寸。 */
+  .sub-tabs { display: flex; flex-wrap: wrap; gap: 2px; margin: 2px 0 16px; border-bottom: 1px solid var(--border-muted); }
+  .sub-tabs .tab { font-size: 12px; }
+  /* 密钥页配额列：已用/上限 + 状态徽章两行。 */
+  .t-quota { font-size: 12px; }
+  .t-quota-badge { margin-top: 4px; }
+  /* 编辑密钥弹层：配额分区标题（小号大写 + 弱分隔线，靠 margin 撑开不用
+     padding——modal-bd 会把 oc-hint 的 padding 清零）。 */
+  .t-quota-sect {
+    border-top: 1px solid var(--border-muted);
+    font-size: 11px; text-transform: uppercase; letter-spacing: .03em;
+    color: var(--text-muted);
+  }
   /* 请求明细：dashboard 的 .log 两行式（表头行 + 条目行） */
   .log {
     background: var(--surface); border: 1px solid var(--border);
@@ -1474,10 +1580,14 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .key-row .del { opacity: 0; padding: 1px 8px; }
   .key-row:hover .del { opacity: 1; }
   .key-row .del:hover { color: var(--danger); border-color: var(--danger); }
+  /* 账号卡内 key 行按钮多（用量/复制/禁用/改名/移除）：窄卡允许换行，不横向溢出。 */
+  .card .keys .key-row { flex-wrap: wrap; }
   .key-add { display: flex; gap: 6px; margin-top: 8px; }
 
   /* ── model access（chip 选择器：全局白名单 + 密钥级授权）── */
   .ma-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .ma-avail-hd { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  .ma-avail-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; max-height: 180px; overflow-y: auto; }
   .ma-chip {
     font-size: 12px; padding: 3px 10px; border-radius: var(--radius);
     border: 1px solid var(--border-muted); background: var(--surface);
@@ -1490,6 +1600,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .ma-chip.dis { opacity: .4; cursor: not-allowed; }
   .ma-opt-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   #ma-search { max-width: 240px; }
+  .ma-add-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+  .ma-add-row input { flex: 1; min-width: 0; }
 
   /* ── empty state（dashed + 80px 上下 padding）────── */
   .empty {
@@ -1609,6 +1721,26 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   .spark { display: block; width: 100%; height: 26px; margin-top: 6px; }
   .spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
 
+  /* ── v6：总览性能仪表盘（sec-perf）── 与 stats2 同盒子，另加 meter 条 */
+  .perf-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 14px; }
+  .perf-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; min-width: 0; }
+  .perf-card .pc-l { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .03em; }
+  .perf-card .pc-v { font-size: 20px; font-weight: 600; color: var(--text); line-height: 120%; }
+  .perf-card .pc-v small { font-size: 12px; color: var(--text-muted); font-weight: 400; }
+  .perf-meter { margin-top: 8px; }
+  .perf-meter-bg { height: 6px; background: var(--border-muted); border-radius: var(--radius); overflow: hidden; }
+  .perf-meter-fill { height: 100%; background: var(--accent); border-radius: var(--radius); transition: width .3s; }
+  .perf-meter-fill.warn { background: #e6b450; }
+  .perf-meter-fill.danger { background: var(--danger); }
+  .perf-cols { display: flex; gap: 12px; margin-top: 8px; }
+  .perf-col { min-width: 0; }
+  .perf-col .n { font-size: 16px; font-weight: 600; color: var(--text); line-height: 120%; }
+  .perf-col .l { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .03em; }
+  .perf-dots { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .perf-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border-muted); }
+  .perf-dot.ok { background: var(--ok); }
+  .perf-dot.bad { background: var(--danger); }
+
   /* ── v5：状态列表（网关/上游/账号/分发密钥/兼容修复）── */
   .st-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border-muted); font-size: 12px; }
   .st-row:last-child { border-bottom: 0; }
@@ -1668,6 +1800,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   /* ≤40rem：表格/表单多列变单列，表格缩水（8px 12px 单元格 + 12px 字号 + 隐藏一列） */
   @media (max-width: 40rem) {
     .form, .edit { grid-template-columns: 1fr; }
+    /* 账号卡片网格降级为单列（紧凑卡 → 纵向流）。 */
+    #accounts { grid-template-columns: 1fr; }
     .tbl th, .tbl td { padding: 8px 12px; font-size: 12px; }
     .tbl .t-hide { display: none; }
     .d-stats { gap: 24px; }
@@ -1735,6 +1869,14 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         <div class="oc-hint" id="health-note"></div>
       </section>
 
+      <!-- 性能仪表盘（设置页开关控制显示；关 = 隐藏整个区块，tick 也不拉数据） -->
+      <section id="sec-perf">
+        <h1 data-i18n="perfTitle">Performance</h1>
+        <div class="sub" data-i18n="perfSub">process, system and gateway health at a glance</div>
+        <div class="perf-grid" id="perf"><div class="oc-hint">…</div></div>
+        <div class="oc-hint" id="perf-status"></div>
+      </section>
+
       <section id="sec-status">
         <h1 data-i18n="statusTitle">Status</h1>
         <div class="sub" data-i18n="statusSub">gateway, upstream pool, accounts and distribution keys at a glance</div>
@@ -1750,8 +1892,16 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
     <div id="view-accounts" hidden>
       <section id="sec-accounts">
-        <h1 data-i18n="accountsTitle">Accounts</h1>
-        <div class="sub" data-i18n="accountsSub">per-account status, balance and keys</div>
+        <div class="sec-hd">
+          <div>
+            <h1 data-i18n="accountsTitle">Accounts</h1>
+            <div class="sub" data-i18n="accountsSub">per-account status, balance and keys</div>
+          </div>
+          <div class="sec-tools">
+            <button class="oc-btn oc-btn-ghost oc-btn-sm" id="btn-collapse-all" data-i18n="collapseAll">collapse all</button>
+            <button class="oc-btn oc-btn-ghost oc-btn-sm" id="btn-expand-all" data-i18n="expandAll">expand all</button>
+          </div>
+        </div>
         <div id="accounts"></div>
       </section>
 
@@ -1760,7 +1910,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         <div class="sub" data-i18n="createSub">register an upstream account, keys are encrypted at rest</div>
         <div class="oc-form">
           <div class="oc-field">
-            <label data-i18n="name">name</label>
+            <label for="c-name" data-i18n="name">name</label>
             <input class="oc-input" id="c-name" autocomplete="off">
           </div>
           <div class="oc-field">
@@ -1768,22 +1918,22 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
             <div class="dd">
               <button id="c-kind-toggle" class="oc-btn dd-toggle">subscription</button>
               <div class="dd-menu" id="c-kind-menu" hidden>
-                <button class="oc-btn dd-item" data-kind="subscription">subscription</button>
-                <button class="oc-btn dd-item" data-kind="payg">payg</button>
-                <button class="oc-btn dd-item" data-kind="unknown">unknown</button>
+                <button class="oc-btn dd-item" data-kind="subscription" data-i18n="kindSubscription">subscription</button>
+                <button class="oc-btn dd-item" data-kind="payg" data-i18n="kindPayg">payg</button>
+                <button class="oc-btn dd-item" data-kind="unknown" data-i18n="kindUnknown">unknown</button>
               </div>
             </div>
           </div>
           <div class="oc-field oc-full">
-            <label data-i18n="workspaceId">workspace id</label>
+            <label for="c-ws" data-i18n="workspaceId">workspace id</label>
             <input class="oc-input" id="c-ws" autocomplete="off" placeholder="ws_...">
           </div>
           <div class="oc-field oc-full">
-            <label data-i18n="keysLabel">keys (comma separated)</label>
+            <label for="c-keys" data-i18n="keysLabel">keys (comma separated)</label>
             <input class="oc-input" id="c-keys" autocomplete="off" placeholder="sk-ant-xxx, sk-ant-yyyy">
           </div>
           <div class="oc-field oc-full">
-            <label data-i18n="cookieLabel">cookie (optional)</label>
+            <label for="c-cookie" data-i18n="cookieLabel">cookie (optional)</label>
             <input class="oc-input" id="c-cookie" type="password" autocomplete="off">
           </div>
           <div class="oc-hint-err oc-full" id="c-err"></div>
@@ -1811,34 +1961,45 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           <div class="cookie-warn-t" id="detail-cookie-t"></div>
           <div class="cookie-import" id="detail-cookie-import">
             <button class="oc-btn oc-btn-primary" id="detail-import" data-i18n="importFromBrowser">import from browser</button>
-            <input class="oc-input oc-grow oc-min-200" id="detail-cookie-paste" placeholder="auth=..." autocomplete="off">
+            <input class="oc-input oc-grow oc-min-200" id="detail-cookie-paste" aria-label="cookie" placeholder="auth=..." autocomplete="off">
             <button class="oc-btn" id="detail-paste-save" data-i18n="importCookie">import</button>
           </div>
           <div class="cookie-import" id="detail-oauth-row">
             <button class="oc-btn" id="detail-oauth" data-i18n="oauthInstead">or sign in with OpenCode instead</button>
           </div>
         </div>
-        <!-- 订阅置顶（用户要求：Go 订阅及旧版 key 相关放最上面）：
-             go（Go 订阅）→ legacy-key（旧版 API key 配置，可复制）→ legacy
-             （旧版 key 列表）→ legacy-billing（旧版计费），随后才是工作区/模型/
-             余额等 console 区块。锚点导航 detail-nav 同步本顺序。 -->
+        <!-- 订阅置顶（用户要求：Go 订阅及旧版 key 相关放最上面）：go（Go 订阅）→
+             legacy-key（旧版 API key 配置，可复制）→ legacy（旧版 key 列表）→
+             legacy-billing（旧版计费）。16 个区块按 5 组 tab 分组（.detail-group）：
+             订阅 & Keys / 工作区 & 模型 / 财务 / 组织 / 定价；tab 只显隐不懒加载，
+             load* 调用保持不变。 -->
         <div id="detail-nav"></div>
-        <div id="detail-go"></div>
-        <div id="detail-legacy-key"></div>
-        <div id="detail-legacy"></div>
-        <div id="detail-legacy-billing"></div>
-        <div id="detail-workspace"></div>
-        <div id="detail-models"></div>
-        <div id="detail-billing"></div>
-        <div id="detail-usage"></div>
-        <div id="detail-models-usage"></div>
-        <div id="detail-users-usage"></div>
-        <div id="detail-autorecharge"></div>
-        <div id="detail-budgets"></div>
-        <div id="detail-members"></div>
-        <div id="detail-sa"></div>
-        <div id="detail-providers"></div>
-        <div id="detail-pricing"></div>
+        <div class="detail-group" data-group="sub">
+          <div id="detail-go"></div>
+          <div id="detail-legacy-key"></div>
+          <div id="detail-legacy"></div>
+          <div id="detail-legacy-billing"></div>
+        </div>
+        <div class="detail-group" data-group="ws">
+          <div id="detail-workspace"></div>
+          <div id="detail-models"></div>
+        </div>
+        <div class="detail-group" data-group="finance">
+          <div id="detail-billing"></div>
+          <div id="detail-usage"></div>
+          <div id="detail-models-usage"></div>
+          <div id="detail-users-usage"></div>
+          <div id="detail-autorecharge"></div>
+          <div id="detail-budgets"></div>
+        </div>
+        <div class="detail-group" data-group="org">
+          <div id="detail-members"></div>
+          <div id="detail-sa"></div>
+          <div id="detail-providers"></div>
+        </div>
+        <div class="detail-group" data-group="pricing">
+          <div id="detail-pricing"></div>
+        </div>
       </section>
     </div>
 
@@ -1865,12 +2026,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       <section id="sec-usage-recent">
         <h1 data-i18n="detailRequests">Detailed requests</h1>
         <div class="req-tools">
-          <input class="oc-input oc-grow" id="req-q" placeholder="search path/status/model/client/ua/error" autocomplete="off" spellcheck="false">
+          <input class="oc-input oc-grow" id="req-q" placeholder="search path/status/model/client/ua/error" autocomplete="off" spellcheck="false" aria-label="search requests">
           <label class="oc-check req-all" title="包含健康检查/记账等噪音请求">
             <input type="checkbox" id="req-all">
             <span data-i18n="reqShowAll">show all requests</span>
           </label>
-          <select class="oc-select oc-shrink" id="req-size" title="page size">
+          <select class="oc-select oc-shrink" id="req-size" title="page size" aria-label="page size">
             <option value="20" selected>20</option>
             <option value="50">50</option>
             <option value="100">100</option>
@@ -1885,7 +2046,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         </div>
         <div class="req-nav">
           <span class="req-info" id="req-info"></span>
-          <input class="oc-input oc-w64" id="req-page" type="number" min="1" step="1" autocomplete="off" title="jump to page">
+          <input class="oc-input oc-w64" id="req-page" type="number" min="1" step="1" autocomplete="off" title="jump to page" aria-label="jump to page">
           <button class="oc-btn" id="req-go" data-i18n="reqGo">go</button>
           <button class="oc-btn" id="req-prev" data-i18n="reqPrev">prev</button>
           <button class="oc-btn" id="req-next" data-i18n="reqNext">next</button>
@@ -1934,7 +2095,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           <table class="tbl">
             <thead><tr>
           <th data-i18n="name">name</th><th data-i18n="status">status</th><th data-i18n="masked">mask</th>
-          <th data-i18n="tokenUsage">usage</th><th class="t-hide" data-i18n="tokenCreatedAt">created</th>
+          <th data-i18n="tokenUsage">usage</th><th data-i18n="quota">quota</th><th class="t-hide" data-i18n="tokenCreatedAt">created</th>
           <th class="t-rpm-hd" data-i18n="tokenRpm">rpm</th><th></th>
             </tr></thead>
             <tbody id="tokens-rows"></tbody>
@@ -1956,6 +2117,21 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
               <div class="ma-chips" id="ma-global-chips"></div>
               <div class="oc-hint" id="ma-global-hint"></div>
             </div>
+            <div class="oc-field oc-full">
+              <div class="ma-add-row">
+                <input class="oc-input" id="ma-global-add" list="ma-global-options" placeholder="..." autocomplete="off" spellcheck="false" aria-label="add model">
+                <datalist id="ma-global-options"></datalist>
+                <button class="oc-btn oc-btn-ghost" id="ma-global-add-btn" data-i18n="maGlobalAdd">add</button>
+              </div>
+              <div class="oc-hint" data-i18n="maGlobalAddHint">add upstream model names — unsupported ones are passed through and the upstream error is returned as-is</div>
+            </div>
+            <div class="oc-field oc-full">
+              <div class="ma-avail-hd">
+                <span class="oc-hint" data-i18n="maAvailTitle">available models (all upstream)</span>
+                <input class="oc-input oc-grow oc-min-160" id="ma-avail-search" placeholder="search…" autocomplete="off" aria-label="search available models">
+              </div>
+              <div class="ma-avail-grid" id="ma-avail-grid"></div>
+            </div>
             <div class="ma-opt-row">
               <button class="oc-btn oc-btn-primary" id="ma-global-save" data-i18n="save">save</button>
               <button class="oc-btn oc-btn-ghost" id="ma-global-reset" data-i18n="maResetGlobal">reset to code default</button>
@@ -1966,8 +2142,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
       <section id="sec-access-search">
         <div class="oc-form ma-opt-row">
-          <input class="oc-input" id="ma-search" placeholder="..." autocomplete="off">
-          <select class="oc-select" id="ma-filter">
+          <input class="oc-input" id="ma-search" placeholder="..." autocomplete="off" aria-label="search model access">
+          <select class="oc-select" id="ma-filter" aria-label="filter by type">
             <option value="" data-i18n="maFilterAll">all types</option>
             <option value="upstream-key" data-i18n="maFilterUpstream">upstream</option>
             <option value="token" data-i18n="maFilterToken">token</option>
@@ -1997,6 +2173,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     </div>
 
     <div id="view-settings" hidden>
+      <div class="settings-group">
+        <div class="settings-group-hd" data-i18n="settingsGroupService">service</div>
       <section id="sec-settings-lang">
         <h1 data-i18n="langTitle">Language</h1>
         <div class="sub" data-i18n="langSub">interface language</div>
@@ -2008,6 +2186,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           </div>
         </div>
         <div class="oc-hint" data-i18n="langNote">language preference is stored in localStorage</div>
+      </section>
+
+      <section id="sec-perf-toggle">
+        <h1 data-i18n="perfPanel">Performance panel</h1>
+        <div class="sub" data-i18n="perfPanelSub">show the performance dashboard on the overview page</div>
+        <div class="exp-row">
+          <span class="exp-name" data-i18n="perfPanel">Performance panel</span>
+          <span class="exp-desc oc-hint" id="perf-state-hint"></span>
+          <button class="oc-switch exp-toggle" id="perf-toggle" data-on="1" role="switch" aria-checked="true">
+            <span class="oc-switch-track"><span class="oc-switch-knob"></span></span>
+            <span class="oc-switch-sr">on</span>
+          </button>
+        </div>
+        <div class="oc-hint" data-i18n="perfPanelNote">stored in localStorage, default on</div>
       </section>
 
       <section id="sec-modelmap">
@@ -2022,11 +2214,11 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         </div>
         <div class="oc-form">
           <div class="oc-field">
-            <label data-i18n="modelAlias">alias</label>
+            <label for="mm-alias" data-i18n="modelAlias">alias</label>
             <input class="oc-input" id="mm-alias" placeholder="claude-mythos-5" autocomplete="off" spellcheck="false">
           </div>
           <div class="oc-field">
-            <label data-i18n="modelTarget">target</label>
+            <label for="mm-target" data-i18n="modelTarget">target</label>
             <input class="oc-input" id="mm-target" list="mm-targets" placeholder="deepseek-v4-flash-free" autocomplete="off" spellcheck="false">
             <datalist id="mm-targets">
               <option value="deepseek-v4-flash"></option>
@@ -2034,7 +2226,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
             </datalist>
           </div>
           <div class="oc-field oc-full">
-            <label data-i18n="modelNote">note</label>
+            <label for="mm-note" data-i18n="modelNote">note</label>
             <input class="oc-input" id="mm-note" placeholder="optional" autocomplete="off">
           </div>
           <div class="oc-hint-err oc-full" id="mm-err"></div>
@@ -2043,16 +2235,19 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         <div class="oc-hint" data-i18n="modelMapNote">Claude Code sends claude-* model names; the gateway looks up this table first and maps to the target — takes effect immediately</div>
       </section>
 
+      </div>
+      <div class="settings-group">
+        <div class="settings-group-hd" data-i18n="settingsGroupSecurity">security</div>
       <section id="sec-admin-auth">
         <h1 data-i18n="adminAuthTitle">Admin account</h1>
         <div class="sub" data-i18n="adminAuthSub">login credentials for this panel</div>
         <div class="oc-form">
           <div class="oc-field">
-            <label><span data-i18n="adminUserLabel">username</span> <span class="oc-chip-src" id="aa-user-src"></span></label>
+            <label for="aa-user"><span data-i18n="adminUserLabel">username</span> <span class="oc-chip-src" id="aa-user-src"></span></label>
             <input class="oc-input" id="aa-user" autocomplete="off">
           </div>
           <div class="oc-field">
-            <label><span data-i18n="adminPassLabel">password</span> <span class="oc-chip-src" id="aa-pass-src"></span>
+            <label for="aa-pass"><span data-i18n="adminPassLabel">password</span> <span class="oc-chip-src" id="aa-pass-src"></span>
               <span class="oc-chip oc-chip-danger" id="aa-pass-badge" hidden></span></label>
             <input class="oc-input" id="aa-pass" type="password" placeholder="..." autocomplete="new-password">
             <div class="oc-hint oc-hint-err" id="aa-pass-warn" hidden></div>
@@ -2077,6 +2272,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         </div>
       </section>
 
+      </div>
+      <div class="settings-group">
+        <div class="settings-group-hd" data-i18n="settingsGroupRuntime">runtime</div>
       <section id="sec-experimental">
         <h1 data-i18n="expTitle">Experimental</h1>
         <div class="sub" data-i18n="expSub">opt-in features, off by default</div>
@@ -2112,6 +2310,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         </div>
       </section>
 
+      </div>
+      <div class="settings-group">
+        <div class="settings-group-hd" data-i18n="settingsGroupAbout">about</div>
       <section id="sec-about">
         <h1 data-i18n="about">About</h1>
         <div class="sub" data-i18n="aboutSub">fuckopencode admin panel</div>
@@ -2120,7 +2321,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
           <div class="meta"><a href="https://github.com/dwgx/fuckopencode" target="_blank" rel="noopener">github.com/dwgx/fuckopencode</a></div>
           <div class="meta">/__admin — <span data-i18n="aboutEndpointAdmin">management</span> · /__metrics — <span data-i18n="aboutEndpointMetrics">metrics</span> · /__dash — <span data-i18n="aboutEndpointDash">dashboard</span></div>
         </div>
+        <div class="card backup-warn">
+          <div class="meta bw-title" data-i18n="secretBackupTitle">back up secret.key</div>
+          <div class="meta" data-i18n="secretBackupBody">data/secret.key encrypts every stored secret (account keys, cookies, OAuth tokens, distribution tokens). Losing or replacing it makes all of them permanently undecryptable. Copy it to a safe place and back it up with your data.</div>
+        </div>
       </section>
+      </div>
     </div>
   </main>
 </div>
@@ -2209,15 +2415,16 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       keysLabel: 'keys (comma separated)', cookieLabel: 'cookie (optional)',
       create: 'create',
       accountsTitle: 'Accounts', accountsSub: 'per-account status, balance and keys',
+      collapse: 'collapse', expand: 'expand',
+      collapseAll: 'collapse all', expandAll: 'expand all',
       noAccounts: 'No accounts yet', noAccountsSub: 'create one to start managing keys and balance',
-      balance: 'balance', monthlyLimit: 'monthly limit', monthlyUsage: 'monthly usage',
-      previewBalance: 'balance', previewUsage: '7d usage', previewGo: 'go limits',
-      previewGwTitle: 'workspace usage (7d)',
-      previewGwPoolTitle: 'gateway total (7d)',
-      legacyCount: 'legacy keys:', legacyHint: 'view in account details',
-      usedOf: 'of monthly limit',
+      balance: 'balance', monthlyLimit: 'monthly limit',
+      previewUsage: '7d usage', previewGo: 'go limits',
+      legacyHint: 'view in account details',
+      dupKeyBadge: 'shared key', dupKeyHint: 'this legacy key is also used by another account or the key pool',
       lastProbe: 'last probe', lastBilling: 'last billing', never: 'never',
       retryIn: 'retry in', nextProbe: 'next probe in', inFlight: 'in flight',
+      inflightTitle: 'keys currently being requested',
       keysTitle: 'keys', noKeys: 'no keys',
       edit: 'edit', save: 'save', cancel: 'cancel',
       refresh: 'refresh balance', addKey: 'add key', remove: 'remove',
@@ -2244,7 +2451,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       goSub: 'Go subscription', goSubHint: 'usage windows from OpenCode Go (opencode.ai)',
       goRolling: 'Rolling (5h)', goWeekly: 'Weekly', goMonthly: 'Monthly',
       goReset: 'resets in', goUseBalance: 'use balance after limit', goChinaModels: 'enable China-hosted models', goNotSubscribed: 'not subscribed',
-      nameRequired: 'name is required', cookieClear: 'leave blank to clear', cookieKeep: 'leave blank to keep', cookieClearCheckbox: 'clear saved cookie',
+      nameRequired: 'name is required', cookieKeep: 'leave blank to keep', cookieClearCheckbox: 'clear saved cookie',
       live: 'live',
       tabOverview: 'Overview', tabAccounts: 'Accounts', tabUsage: 'Usage', tabSettings: 'Settings',
       subOverview: 'Overview', subHealth: 'Health',
@@ -2255,13 +2462,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       totalRequests: 'total requests', failed: 'failed', streaming: 'streaming',
       avgDuration: 'avg duration', tokens: 'tokens',
       keypoolTitle: 'Key pool', keypoolSub: 'per-key health and in-flight load',
-      recentRequests: 'Recent requests', noRequests: 'no requests yet',
+      noRequests: 'no requests yet',
       langTitle: 'Language', langSub: 'interface language',
       langNote: 'language preference is stored in localStorage',
-      langEn: 'EN', langZh: '中文',
+      langEn: 'EN', langZh: '中文', langJa: '日本語',
       about: 'About', aboutSub: 'fuckopencode admin panel',
       aboutDesc: 'OpenAI <-> Anthropic protocol gateway for DeepSeek — manage upstream accounts and protocol conversion',
       aboutEndpointAdmin: 'management', aboutEndpointMetrics: 'metrics',
+      secretBackupTitle: 'back up secret.key',
+      secretBackupBody: 'data/secret.key encrypts every stored secret (account keys, cookies, OAuth tokens, distribution tokens). Losing or replacing it makes all of them permanently undecryptable. Copy it to a safe place and back it up with your data.',
       otaTitle: 'Update', otaSub: 'GitHub OTA self-update',
       otaCurrent: 'current version', otaLatest: 'latest version',
       otaDisabled: 'disabled', otaCheck: 'check for updates', otaChecking: 'checking…',
@@ -2270,7 +2479,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       otaRollbackState: 'rollback',
       otaHint: 'updates run only when OTA_ENABLED=1; the service restarts itself',
       otaConfirmTitle: 'Confirm update',
-      otaConfirmBody: 'the service will restart automatically; expect a few seconds of downtime',
+
       otaStageCheck: 'checking…', otaStageDownload: 'downloading…', otaStageVerify: 'verifying…',
       otaStageSwap: 'replacing…', otaStageRestart: 'restarting…',
       otaRestarting: 'restarting — refresh the page in a moment to see the new version',
@@ -2290,6 +2499,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       oauthRetry: 'retry', oauthInvalid: 'OAuth credential invalid, sign in again',
       oauthInstead: 'or sign in with OpenCode instead',
       detail: 'details', back: 'back', subDetail: 'Account detail',
+      // 详情页分组 tab（5 组：订阅 & Keys / 工作区 & 模型 / 财务 / 组织 / 定价）。
+      detailTabSub: 'Subscription & Keys', detailTabWs: 'Workspace & Models',
+      detailTabFinance: 'Finance', detailTabOrg: 'Organization', detailTabPricing: 'Pricing',
       // 工作区区块（显示当前 workspace + 切换）。
       workspaceTitle: 'Workspace', workspaceSub: 'current console workspace and switching',
       currentWorkspace: 'current workspace', wsLegacy: 'legacy workspace',
@@ -2368,7 +2580,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       oauthLoggedIn: 'Logged in as',
       // 用量明细表头（dashboard 同款列 + 请求详情列）。
       hTime: 'time', hStatus: 'status', hRequest: 'request', hMs: 'ms', hTokens: 'tokens',
-      hClient: 'client', hFp: 'key', hUa: 'user agent',
+      hClient: 'client',
       // 请求明细（分页 + 搜索 + 跳页 + 每页条数 + IP 统计）。
       detailRequests: 'Detailed requests', reqPrev: 'prev', reqNext: 'next', reqPage: 'page',
       reqGo: 'go',
@@ -2396,16 +2608,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       mmConfirmDel: 'Delete this mapping? Requests using this alias will fall back to the default model.',
       // 波 2：旧版计费 + P0 面板 + 观测计数 + 实验功能。
       legacyBilling: 'Legacy billing', legacyBillingSub: 'balance, auto reload and payment history on the legacy console (opencode.ai)',
-      legacyReload: 'auto reload', paymentHistory: 'payment history', amount: 'amount', noPayments: 'no payments yet',
-      legacyBillingUnavailable: 'legacy billing data unavailable',
+      legacyReload: 'auto reload', paymentHistory: 'payment history', noPayments: 'no payments yet',
       costTrend: 'daily cost (7d)', noTrend: 'no cost data in range',
       modelUsageTitle: 'Model usage', modelUsageSub: 'cost and tokens by model',
       userUsageTitle: 'Member usage', userUsageSub: 'requests and tokens by member',
-      spent: 'spent', exceeded: 'exceeded', resetsAt: 'resets at', noMemberBudget: 'no member budget data',
-      memberBudgetTitle: 'Member budgets', memberBudgetSub: 'per-member monthly spending status',
+      spent: 'spent', exceeded: 'exceeded', resetsAt: 'resets at',
+      memberBudgetTitle: 'Member budgets',
       pricingTitle: 'Model pricing', pricingSub: 'price per million tokens (v2/config)',
-      inPerMtok: 'input', outPerMtok: 'output', noPricing: 'no pricing data',
-      fixCountTitle: 'compat fixes', fixRewritten: 'rewritten', fixStripped: 'stripped', fixCompressed: 'compressed', fixNone: 'no compat fixes yet',
+      inPerMtok: 'input', outPerMtok: 'output',
+      fixCountTitle: 'compat fixes', fixRewritten: 'rewritten', fixStripped: 'stripped', fixCompressed: 'compressed',
       expTitle: 'Experimental', expSub: 'opt-in features, off by default',
       expNote: 'changes apply immediately and persist across restarts',
       expUnavailable: 'experimental settings unavailable',
@@ -2428,7 +2639,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       tokenActive: 'active', tokenDisabled: 'disabled',
       tokenUsage: 'usage', tokenCreatedAt: 'created',
       tokenEditTitle: 'Edit token', tokenNote: 'note', tokenNotePlaceholder: 'optional',
-      tokenSaved: 'token updated', tokenDeleted: 'token deleted',
+      tokenDeleted: 'token deleted',
       tokenEnabled: 'token enabled', tokenDisabledMsg: 'token disabled',
       tokenDisable: 'disable', tokenEnable: 'enable',
       tokenDeleteConfirm: 'Delete this token? Clients using it will stop working immediately.',
@@ -2449,7 +2660,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       adminPassEnvWarn: 'using the default password — change it',
       adminPassDefaultBadge: 'default password — change it',
       authSaved: 'admin credentials saved', aaNothing: 'nothing to save',
-      sourceEnv: 'source: env', sourceDb: 'source: panel',
+      sourceEnv: 'source: env', sourceDb: 'source: panel', codeDefault: 'code default',
       apiKeysTitle: 'API keys', apiKeysSub: 'keys accepted for management access',
       apiKeysEmpty: 'no api keys', apiKeysAdd: 'add', apiKeysAddTitle: 'Add API key',
       apiKeysCopy: 'copy plaintext',
@@ -2464,15 +2675,30 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       // 批次 2：RPM 限流配置 + legacy key 明文复制。
       tokenRpm: 'rpm limit', tokenRpmHint: 'requests per minute — 0 = unlimited',
       tokenRpmSaved: 'rpm limit saved', tokenRpmInvalid: 'enter a number ≥ 0',
+      // 配额（QUOTA.md §7）：每密钥 $ / tokens / 请求上限 + 周期 + 过期 + 状态。
+      quota: 'quota',
+      quotaUsd: '$ quota', quotaTokens: 'token quota', quotaRequests: 'request quota',
+      quotaCycle: 'reset cycle', quotaCycleNone: 'none', quotaCycleDaily: 'daily', quotaCycleMonthly: 'monthly',
+      quotaExpires: 'expires at', quotaExpiresHint: 'blank = never expires (0)',
+      quotaHint: '0 = unlimited', quotaNone: 'no quota',
+      quotaTpm: 'TPM (tokens per minute)', ipWhitelist: 'IP whitelist',
+      ipWhitelistHint: 'comma-separated IPs or CIDR, blank = allow all',
+      quotaBadgeOk: 'ok', quotaBadgeExhausted: 'exhausted', quotaBadgeExpired: 'expired',
+      quotaInvalid: 'enter a valid quota (numbers ≥ 0)', quotaSaved: 'quota saved',
       legacyKeyNotFound: 'key not found in plain list',
       legacyKeyCopyTitle: 'copy plaintext to clipboard',
       // Model access tab（MODEL-ACCESS §6）。
       tabModelAccess: 'Model Access', subModelAccess: 'Model Access',
-      maGlobalTitle: 'Global allowlist', maGlobalSub: 'default models for keys without a custom override',
+      maGlobalTitle: 'Global allowlist',       maGlobalSub: 'default models for keys without a custom override',
+      maAvailTitle: 'available models (all upstream)',
       maGlobalModels: 'allowed models',
-      maGlobalFloor: 'hard floor, cannot be removed: ',
+      maGlobalFloor: 'code default (reset base): ',
+      maGlobalAdd: 'add', maGlobalAddHint: 'add upstream model names — unsupported ones are passed through and the upstream error is returned as-is',
+      maGlobalEmpty: 'no models selected',
+      maAddInvalid: 'invalid model name: ',
       maResetGlobal: 'reset to code default', maGlobalSaved: 'global allowlist saved',
       maSearchPh: 'search name / mask',
+      maFilter: 'filter by type',
       maFilterAll: 'all types', maFilterUpstream: 'upstream', maFilterToken: 'token', maFilterApiKey: 'api key',
       maRefresh: 'refresh',
       maUpstreamTitle: 'Upstream keys', maUpstreamSub: 'per-upstream-key model overrides',
@@ -2482,7 +2708,83 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       maCustomBadge: 'custom', maFollowsGlobal: 'follows global',
       maEditTitle: 'Edit model access', maSaved: 'model access saved',
       maFollowGlobal: 'follow global (clear)',
-      maNotGrantable: 'only hard-floor models can be granted'
+      maNotGrantable: 'only models in the global allowlist can be granted',
+      // 额度耗尽类错误友好文案（friendlyQuota）：识别 GoUsageLimitError /
+      // FreeUsageLimitError / 月额度 / 余额不足 → 短文案 + 重置时间；原文在 title 可展开。
+      quotaGo: 'Go usage limit reached', quotaFree: 'rate limited',
+      quotaGeneric: 'usage limit reached', quotaBalance: 'insufficient balance',
+      quotaResetsPre: 'resets in ', quotaResetsPost: '',
+      // 账号 key 行增强：用量弹层 + 手动启停 + 引导创建分发密钥。
+      keyUsage: 'usage', keyUsageHint: 'requests, tokens and cost for this upstream key',
+      keyUsageTitle: 'Key usage', keyUsageNoData: 'no usage data yet',
+      keyDisable: 'disable', keyDisableHint: 'stop routing this key (manual)',
+      keyReset: 'reset', keyResetHint: 're-enable this key',
+      manualPermanent: 'disabled permanently',
+      keyDisabledMsg: 'key disabled', keyEnabledMsg: 'key re-enabled',
+      gotoKeys: 'keys', keyQuotaGuide: 'create a quota distribution token in the Keys tab so clients can use this pool',
+      // 设置页分组卡片（服务/安全/运行/关于）。
+      settingsGroupService: 'service', settingsGroupSecurity: 'security',
+      settingsGroupRuntime: 'runtime', settingsGroupAbout: 'about',
+      // 总览性能仪表盘。
+      subPerf: 'Performance',
+      perfTitle: 'Performance', perfSub: 'process, system and gateway health at a glance',
+      perfRss: 'memory (rss)', perfCpu: 'cpu', perfLoad: 'load',
+      perfConcurrent: 'concurrency', perfLatency: 'latency', perfPool: 'key pool',
+      perfUptime: 'up', perfHide: 'hidden', perfShow: 'shown',
+      perfPanel: 'Performance panel', perfPanelSub: 'show the performance dashboard on the overview page',
+      perfPanelNote: 'stored in localStorage, default on',
+      // i18n 修复轮：静态 placeholder/title + 请求行 key 前缀 + 配额 tooltip + 实验描述单位。
+      reqSearchPh: 'search path/status/model/client/ua/error',
+      reqPageSize: 'page size', reqJumpTo: 'jump to page',
+      searchPh: 'search…', optionalPh: 'optional',
+      reqKey: 'key', quotaRemaining: 'remaining $', chars: 'chars',
+      // 上游 key 禁用原因（disabledReason 枚举 → 友好文案，与 dashboard kindText 同款）。
+      drQuota: 'quota exhausted', drAuth: 'invalid credential',
+      drRate: 'rate limited', drTransient: 'repeated transient errors', drManual: 'disabled manually',
+      // 服务端表单校验高频消息（其余 fail() 消息待后续轮次处理）。
+      serverErrNameTooLong: 'name must be at most 100 characters',
+      serverErrKind: 'invalid kind (subscription / payg / unknown)',
+      serverErrKeysBad: 'invalid keys format',
+      serverErrKeyTooLong: 'each key must be at most 200 characters',
+      serverErrKeysTooMany: 'at most 20 keys',
+      serverErrBody: 'request body must be a JSON object',
+      serverErrWsType: 'workspace id must be a string',
+      serverErrCookieType: 'cookie must be a string',
+      serverErrWsTooLong: 'workspace id must be at most 200 characters',
+      serverErrCookieTooLong: 'cookie must be at most 4096 characters',
+      serverErrLegacyWsRequired: 'legacy workspace id must be a non-empty string or null',
+      serverErrLegacyWsTooLong: 'legacy workspace id must be at most 200 characters',
+      serverErrLegacyCookieType: 'legacy cookie must be a string or null',
+      serverErrLegacyCookieTooLong: 'legacy cookie must be at most 2048 characters',
+      serverErrLegacyKeyType: 'legacy key must be a string or null',
+      serverErrLegacyKeyTooLong: 'legacy key must be at most 2048 characters',
+      serverErrAllowedModelsType: 'allowed models must be an array of strings',
+      serverErrAllowedModelsTooMany: 'allowed models must have at most 50 entries',
+      serverErrAllowedModelsEmpty: 'allowed models must not contain empty entries',
+      serverErrAllowedModelType: 'each allowed model must be a string',
+      serverErrAllowedModelTooLong: 'each allowed model must be at most 100 characters',
+      serverErrAliasType: 'alias must be a string',
+      serverErrAliasFormat: 'alias must be 1-100 characters of letters, digits, dot, dash or underscore',
+      serverErrTargetType: 'target must be a string',
+      serverErrTargetRequired: 'target must be a non-empty string of at most 100 characters',
+      serverErrNoteType: 'note must be a string or null',
+      serverErrNoteTooLong: 'note must be at most 200 characters',
+      serverErrNameType: 'name must be a string',
+      serverErrNameRange: 'name must be 1-100 characters',
+      serverErrStatus: 'status must be active or disabled',
+      serverErrQuotaUsd: 'quota usd must be a non-negative number',
+      serverErrQuotaTokens: 'quota tokens must be a non-negative integer',
+      serverErrQuotaRequests: 'quota requests must be a non-negative integer',
+      serverErrQuotaTpm: 'quota tpm must be a non-negative integer',
+      serverErrExpires: 'expires must be a non-negative integer (epoch ms, 0 = never)',
+      serverErrRpm: 'rpm limit must be an integer 0-1000000',
+      serverErrTokenPlainType: 'token plaintext must be a string or null',
+      serverErrTokenPlainLen: 'token plaintext must be 1-256 characters',
+      serverErrModelsRequired: 'models is required',
+      serverErrSubjectRequired: 'subject is required',
+      serverErrNicknameType: 'nickname must be a string or null',
+      serverErrNicknameTooLong: 'nickname must be at most 30 characters',
+      serverErrNicknameFailed: 'failed to update key nickname'
     },
     zh: {
       degradedTitle: '账号数据不可用',
@@ -2492,19 +2794,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       healthTitle: '健康度', healthSub: '账户状态一览',
       createTitle: '创建账号', createSub: '注册一个上游账号，key 加密落盘',
       name: '名称', kind: '类型', workspaceId: '工作区 id',
-      keysLabel: 'key（逗号分隔）', cookieLabel: 'cookie（可选）',
+      keysLabel: '密钥（逗号分隔）', cookieLabel: 'Cookie（可选）',
       create: '创建',
       accountsTitle: '账号', accountsSub: '账户状态、余额与 key',
+      collapse: '收起', expand: '展开',
+      collapseAll: '全部收起', expandAll: '全部展开',
       noAccounts: '暂无账号', noAccountsSub: '创建一个账号开始管理 key 与余额',
-      balance: '余额', monthlyLimit: '月额度', monthlyUsage: '月用量',
-      previewBalance: '余额', previewUsage: '7 天用量', previewGo: 'Go 额度',
-      previewGwTitle: '7 天 workspace 用量',
-      previewGwPoolTitle: '7 天网关总用量',
-      legacyCount: '个 legacy key', legacyHint: '查看账号详情',
-      usedOf: '月额度已用',
+      balance: '余额', monthlyLimit: '月额度',
+      previewUsage: '7 天用量', previewGo: 'Go 额度',
+      legacyHint: '查看账号详情',
+      dupKeyBadge: '共用密钥', dupKeyHint: '该 legacy key 与其他账号或 key 池共用',
       lastProbe: '最近探针', lastBilling: '最近抓取', never: '从未',
       retryIn: '剩余冷却', nextProbe: '下次探测', inFlight: '在飞',
-      keysTitle: 'key', noKeys: '暂无 key',
+      inflightTitle: '当前正在被请求的 key 数',
+      keysTitle: '密钥', noKeys: '暂无 key',
       edit: '编辑', save: '保存', cancel: '取消',
       refresh: '刷新余额', addKey: '添加 key', remove: '移除',
       delete: '删除', confirmDelete: '删除该账号？其 key 将停止路由。',
@@ -2530,7 +2833,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       goSub: 'Go 订阅', goSubHint: 'OpenCode Go 的用量窗口（opencode.ai）——订阅靠周/月窗口额度，重置后自动恢复；窗口用尽时可「达限额后用余额」转按量',
       goRolling: '滚动（5 小时）', goWeekly: '每周', goMonthly: '每月',
       goReset: '重置于', goUseBalance: '达限额后用余额', goChinaModels: '启用中国区模型', goNotSubscribed: '未订阅',
-      nameRequired: '名称不能为空', cookieClear: '留空 = 清除', cookieKeep: '留空 = 不修改', cookieClearCheckbox: '清除已存 cookie',
+      nameRequired: '名称不能为空', cookieKeep: '留空 = 不修改', cookieClearCheckbox: '清除已存 cookie',
       live: '实时',
       tabOverview: '总览', tabAccounts: '账号', tabUsage: '用量', tabSettings: '设置',
       subOverview: '概览', subHealth: '健康度',
@@ -2539,15 +2842,17 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       subLanguage: '语言', subUpdate: '更新', subAbout: '关于',
       usageTitle: '请求统计', usageSub: '来自 /__metrics 的流量汇总',
       totalRequests: '总请求', failed: '失败', streaming: '流式',
-      avgDuration: '平均耗时', tokens: 'tokens',
+      avgDuration: '平均耗时', tokens: '令牌',
       keypoolTitle: 'Key 池', keypoolSub: '逐 key 健康度与在飞负载',
-      recentRequests: '最近请求', noRequests: '暂无请求',
+      noRequests: '暂无请求',
       langTitle: '语言', langSub: '界面语言',
       langNote: '语言偏好保存在 localStorage',
-      langEn: 'EN', langZh: '中文',
+      langEn: 'EN', langZh: '中文', langJa: '日本語',
       about: '关于', aboutSub: 'fuckopencode 管理面板',
       aboutDesc: 'OpenAI 与 Anthropic 协议转换网关，面向 DeepSeek —— 用于管理上游账号与协议转换',
       aboutEndpointAdmin: '管理', aboutEndpointMetrics: '指标',
+      secretBackupTitle: '请备份 secret.key',
+      secretBackupBody: 'data/secret.key 加密了所有落库密钥（账户 key / cookie / OAuth / 分发 token）。一旦丢失或更换，这些数据将永久无法解密。请把 secret.key 复制到安全位置（如密码管理器），并连同 data 目录一起备份。',
       otaTitle: '更新', otaSub: 'GitHub OTA 自更新',
       otaCurrent: '当前版本', otaLatest: '远端最新',
       otaDisabled: '已停用', otaCheck: '检查更新', otaChecking: '检查中…',
@@ -2556,7 +2861,6 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       otaRollbackState: '回滚',
       otaHint: '仅当 OTA_ENABLED=1 时才能更新；更新后服务自动重启',
       otaConfirmTitle: '确认更新',
-      otaConfirmBody: '服务将自动重启，预计有数秒不可用',
       otaStageCheck: '检查中…', otaStageDownload: '下载中…', otaStageVerify: '校验中…',
       otaStageSwap: '替换中…', otaStageRestart: '即将重启…',
       otaRestarting: '正在重启 —— 稍后刷新页面即可看到新版本',
@@ -2576,6 +2880,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       oauthRetry: '重试', oauthInvalid: 'OAuth 凭据失效，请重新授权',
       oauthInstead: '或用 OpenCode 登录',
       detail: '详情', back: '返回', subDetail: '账号详情',
+      // 详情页分组 tab（5 组：订阅 & Keys / 工作区 & 模型 / 财务 / 组织 / 定价）。
+      detailTabSub: '订阅 & Keys', detailTabWs: '工作区 & 模型',
+      detailTabFinance: '财务', detailTabOrg: '组织', detailTabPricing: '定价',
       // 工作区区块（显示当前 workspace + 切换）。
       workspaceTitle: '工作区', workspaceSub: '当前控制台工作区与切换',
       currentWorkspace: '当前工作区', wsLegacy: '旧版工作区',
@@ -2609,7 +2916,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       saName: '名称', created: '创建时间', noSa: '暂无服务账号',
       createSa: '创建服务账号',
       // 旧版 workspace（opencode.ai 老控制台）的 key 管控。
-      legacyKeys: '旧版 API key', legacySub: '旧版控制台（opencode.ai）签发的 API key——按量计费，扣 zen 充值余额（go 订阅是另一套周/月窗口额度，见下方 Go 订阅）',
+      legacyKeys: '旧版 API 密钥', legacySub: '旧版控制台（opencode.ai）签发的 API key——按量计费，扣 zen 充值余额（go 订阅是另一套周/月窗口额度，见下方 Go 订阅）',
       legacyCreateTitle: '创建旧版 key',
       createKey: '创建 key', keyName: 'key 名称',
       masked: '掩码', creator: '创建者',
@@ -2617,7 +2924,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       delLegacyKeyConfirm: '删除该旧版 key？它将立即失效。',
       legacyCookieMissing: '未配置旧版控制台 cookie',
       refreshKeys: '刷新', noLegacyKeys: '暂无旧版 key',
-      legacyKeyTitle: '旧版 API key', legacyKeySub: '可选：粘贴旧版控制台的 Default API Key——Go 用量改走 zen JSON API，无需 cookie',
+      legacyKeyTitle: '旧版 API 密钥', legacyKeySub: '可选：粘贴旧版控制台的 Default API Key——Go 用量改走 zen JSON API，无需 cookie',
       legacyKeyPlaceholder: 'sk-...',
       legacyKeySave: '保存', legacyKeyClear: '清除',
       legacyKeyConfigured: '已配置：', legacyKeyNotConfigured: '未配置——可启用免 cookie 的 Go 用量',
@@ -2653,8 +2960,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       delSaConfirm: '删除该服务账号？其 API key 将失效。',
       oauthLoggedIn: '已登录为',
       // 用量明细表头（dashboard 同款列 + 请求详情列）。
-      hTime: '时间', hStatus: '状态', hRequest: '请求', hMs: '耗时', hTokens: 'tokens',
-      hClient: '客户端', hFp: 'key', hUa: 'UA',
+      hTime: '时间', hStatus: '状态', hRequest: '请求', hMs: '耗时', hTokens: '令牌',
+      hClient: '客户端',
       // 请求明细（分页 + 搜索 + 跳页 + 每页条数 + IP 统计）。
       detailRequests: '详细请求', reqPrev: '上一页', reqNext: '下一页', reqPage: '页',
       reqGo: '跳转',
@@ -2682,16 +2989,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       mmConfirmDel: '删除该映射？使用此别名的请求将回落到默认模型。',
       // 波 2：旧版计费 + P0 面板 + 观测计数 + 实验功能。
       legacyBilling: '旧版计费', legacyBillingSub: '旧版控制台（opencode.ai）的余额、自动充值与支付历史',
-      legacyReload: '自动充值', paymentHistory: '支付历史', amount: '金额', noPayments: '暂无支付记录',
-      legacyBillingUnavailable: '旧版计费数据不可用',
+      legacyReload: '自动充值', paymentHistory: '支付历史', noPayments: '暂无支付记录',
       costTrend: '每日成本（7 天）', noTrend: '该范围内无成本数据',
       modelUsageTitle: '模型消费', modelUsageSub: '按模型的成本与 tokens',
       userUsageTitle: '成员消费', userUsageSub: '按成员的请求与 tokens',
-      spent: '已用', exceeded: '超限', resetsAt: '重置于', noMemberBudget: '暂无成员预算数据',
-      memberBudgetTitle: '成员预算', memberBudgetSub: '成员月度支出状态',
+      spent: '已用', exceeded: '超限', resetsAt: '重置于',
+      memberBudgetTitle: '成员预算',
       pricingTitle: '模型定价', pricingSub: '每百万 token 价格（v2/config）',
-      inPerMtok: '输入', outPerMtok: '输出', noPricing: '暂无定价数据',
-      fixCountTitle: '兼容修复', fixRewritten: '改写', fixStripped: '剥除', fixCompressed: '压缩', fixNone: '暂无兼容修复',
+      inPerMtok: '输入', outPerMtok: '输出',
+      fixCountTitle: '兼容修复', fixRewritten: '改写', fixStripped: '剥除', fixCompressed: '压缩',
       expTitle: '实验功能', expSub: '默认关闭的可选功能',
       expNote: '修改立即生效并持久保存',
       expUnavailable: '实验功能设置不可用',
@@ -2714,7 +3020,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       tokenActive: '启用', tokenDisabled: '已禁用',
       tokenUsage: '用量', tokenCreatedAt: '创建时间',
       tokenEditTitle: '编辑密钥', tokenNote: '备注', tokenNotePlaceholder: '可选',
-      tokenSaved: '密钥已更新', tokenDeleted: '密钥已删除',
+      tokenDeleted: '密钥已删除',
       tokenEnabled: '密钥已启用', tokenDisabledMsg: '密钥已禁用',
       tokenDisable: '禁用', tokenEnable: '启用',
       tokenDeleteConfirm: '删除该密钥？使用它的客户端将立即失效。',
@@ -2735,7 +3041,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       adminPassEnvWarn: '正在使用默认密码，建议修改',
       adminPassDefaultBadge: '默认密码，建议修改',
       authSaved: '登录凭据已保存', aaNothing: '没有需要保存的内容',
-      sourceEnv: '来源: env', sourceDb: '来源: 面板',
+      sourceEnv: '来源: env', sourceDb: '来源: 面板', codeDefault: '代码默认',
       apiKeysTitle: 'API 密钥', apiKeysSub: '管理面接受的密钥',
       apiKeysEmpty: '暂无 API 密钥', apiKeysAdd: '添加', apiKeysAddTitle: '添加 API 密钥',
       apiKeysCopy: '复制明文',
@@ -2746,36 +3052,515 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       apiKeysSaved: 'API 密钥已保存', settingsSaved: '设置已保存',
       subAdminAuth: '管理员账号', subAdminKeys: 'API 密钥', subExperimental: '实验功能',
       // 批次 2：账号卡余额来源标注。
-      balanceOrg: '余额（org）',
+      balanceOrg: '余额（组织）',
       // 批次 2：RPM 限流配置 + legacy key 明文复制。
       tokenRpm: '请求频率', tokenRpmHint: '每分钟请求上限 — 0 = 不限',
       tokenRpmSaved: '请求频率已保存', tokenRpmInvalid: '请输入不小于 0 的整数',
+      // 配额（QUOTA.md §7）：每密钥 $ / tokens / 请求上限 + 周期 + 过期 + 状态。
+      quota: '配额',
+      quotaUsd: '美元配额', quotaTokens: 'token 配额', quotaRequests: '请求数配额',
+      quotaCycle: '重置周期', quotaCycleNone: '无', quotaCycleDaily: '每日', quotaCycleMonthly: '每月',
+      quotaExpires: '过期时间', quotaExpiresHint: '留空 = 永久有效（0）',
+      quotaHint: '0 = 不限', quotaNone: '未设配额',
+      quotaTpm: 'TPM（每分钟 token 上限）', ipWhitelist: 'IP 白名单',
+      ipWhitelistHint: '逗号分隔的 IP 或 CIDR，留空 = 不限制',
+      quotaBadgeOk: '正常', quotaBadgeExhausted: '已耗尽', quotaBadgeExpired: '已过期',
+      quotaInvalid: '请输入合法配额（不小于 0 的数字）', quotaSaved: '配额已保存',
       legacyKeyNotFound: '明文列表里找不到该 key',
       legacyKeyCopyTitle: '复制明文到剪贴板',
       // Model access tab（MODEL-ACCESS §6）。
       tabModelAccess: '模型授权', subModelAccess: '模型授权',
-      maGlobalTitle: '全局白名单', maGlobalSub: '未配置自定义授权的密钥默认可用模型',
+      maGlobalTitle: '全局白名单',       maGlobalSub: '未配置自定义授权的密钥默认可用模型',
+      maAvailTitle: '可选模型（上游全部）',
       maGlobalModels: '允许的模型',
-      maGlobalFloor: '硬底线，不可移除：',
+      maGlobalFloor: '代码默认值（重置基准）：',
+      maGlobalAdd: '添加', maGlobalAddHint: '添加上游模型名 — 上游不支持的模型会透传，上游错误原样返回',
+      maGlobalEmpty: '未选择任何模型',
+      maAddInvalid: '非法模型名：',
       maResetGlobal: '重置为代码默认', maGlobalSaved: '全局白名单已保存',
       maSearchPh: '搜索名称 / 掩码',
-      maFilterAll: '全部类型', maFilterUpstream: '上游', maFilterToken: 'token', maFilterApiKey: 'api key',
+      maFilter: '按类型筛选',
+      maFilterAll: '全部类型', maFilterUpstream: '上游', maFilterToken: '分发令牌', maFilterApiKey: 'API 密钥',
       maRefresh: '刷新',
-      maUpstreamTitle: '上游 key', maUpstreamSub: '上游密钥级模型覆盖',
-      maTokenTitle: '分发 token', maTokenSub: 'token 级模型覆盖',
-      maApiKeyTitle: 'API key', maApiKeySub: '管理面 API key 的模型覆盖',
+      maUpstreamTitle: '上游密钥', maUpstreamSub: '上游密钥级模型覆盖',
+      maTokenTitle: '分发令牌', maTokenSub: 'token 级模型覆盖',
+      maApiKeyTitle: 'API 密钥', maApiKeySub: '管理面 API key 的模型覆盖',
       maEmpty: '暂无密钥', maNoMatch: '没有匹配的密钥',
       maCustomBadge: '自定义', maFollowsGlobal: '跟随全局',
       maEditTitle: '编辑模型授权', maSaved: '模型授权已保存',
       maFollowGlobal: '跟随全局（清除）',
-      maNotGrantable: '仅硬底线模型可授'
+      maNotGrantable: '仅全局白名单内模型可授',
+      // 额度耗尽类错误友好文案（friendlyQuota）。quotaResetsPre/Post 配合
+      // 语言词序（en: resets in X；zh: X 后重置）。
+      quotaGo: 'Go 订阅额度已用尽', quotaFree: '限流中',
+      quotaGeneric: '额度已用尽', quotaBalance: '余额不足',
+      quotaResetsPre: '', quotaResetsPost: ' 后重置',
+      // 账号 key 行增强：用量弹层 + 手动启停 + 引导创建分发密钥。
+      keyUsage: '用量', keyUsageHint: '该上游 key 的请求、tokens 与成本',
+      keyUsageTitle: 'key 用量', keyUsageNoData: '暂无用量数据',
+      keyDisable: '禁用', keyDisableHint: '停止路由该 key（手动禁用）',
+      keyReset: '恢复', keyResetHint: '重新启用该 key',
+      manualPermanent: '永久停用',
+      keyDisabledMsg: 'key 已禁用', keyEnabledMsg: 'key 已恢复',
+      gotoKeys: '密钥', keyQuotaGuide: '在密钥页创建带配额的分发密钥，客户端即可使用该 key 池',
+      // 设置页分组卡片（服务/安全/运行/关于）。
+      settingsGroupService: '服务', settingsGroupSecurity: '安全',
+      settingsGroupRuntime: '运行', settingsGroupAbout: '关于',
+      // 总览性能仪表盘。
+      subPerf: '性能',
+      perfTitle: '性能', perfSub: '进程、系统与网关健康度一览',
+      perfRss: '内存 RSS', perfCpu: 'CPU', perfLoad: '负载',
+      perfConcurrent: '并发', perfLatency: '延迟', perfPool: 'Key 池',
+      perfUptime: '已运行', perfHide: '已隐藏', perfShow: '显示中',
+      perfPanel: '性能面板', perfPanelSub: '在总览页显示性能仪表盘',
+      perfPanelNote: '保存在 localStorage，默认开启',
+      // i18n 修复轮：静态 placeholder/title + 请求行 key 前缀 + 配额 tooltip + 实验描述单位。
+      reqSearchPh: '搜索 路径/状态/模型/客户端/UA/错误',
+      reqPageSize: '每页条数', reqJumpTo: '跳到第几页',
+      searchPh: '搜索…', optionalPh: '可选',
+      reqKey: '密钥', quotaRemaining: '剩余 $', chars: '字符',
+      // 上游 key 禁用原因（disabledReason 枚举 → 友好文案，与 dashboard kindText 同款）。
+      drQuota: '额度耗尽', drAuth: '凭据无效',
+      drRate: '限流', drTransient: '连续瞬时错误', drManual: '手动停用',
+      // 服务端表单校验高频消息（其余 fail() 消息待后续轮次处理）。
+      serverErrNameTooLong: '名称最多 100 个字符',
+      serverErrKind: '类型不合法（subscription / payg / unknown）',
+      serverErrKeysBad: 'key 格式不正确',
+      serverErrKeyTooLong: '单个 key 最多 200 字符',
+      serverErrKeysTooMany: '最多 20 个 key',
+      serverErrBody: '请求体必须是 JSON 对象',
+      serverErrWsType: '工作区 id 必须是字符串',
+      serverErrCookieType: 'cookie 必须是字符串',
+      serverErrWsTooLong: '工作区 id 最多 200 个字符',
+      serverErrCookieTooLong: 'cookie 最多 4096 个字符',
+      serverErrLegacyWsRequired: '旧版工作区 id 必须是非空字符串或 null',
+      serverErrLegacyWsTooLong: '旧版工作区 id 最多 200 个字符',
+      serverErrLegacyCookieType: '旧版 cookie 必须是字符串或 null',
+      serverErrLegacyCookieTooLong: '旧版 cookie 最多 2048 个字符',
+      serverErrLegacyKeyType: '旧版 API key 必须是字符串或 null',
+      serverErrLegacyKeyTooLong: '旧版 API key 最多 2048 个字符',
+      serverErrAllowedModelsType: '可用模型必须是字符串数组',
+      serverErrAllowedModelsTooMany: '可用模型最多 50 个',
+      serverErrAllowedModelsEmpty: '可用模型不能包含空项',
+      serverErrAllowedModelType: '每个可用模型必须是字符串',
+      serverErrAllowedModelTooLong: '每个可用模型最多 100 个字符',
+      serverErrAliasType: '别名必须是字符串',
+      serverErrAliasFormat: '别名需 1-100 个字符，限字母数字与 ._-',
+      serverErrTargetType: '目标必须是字符串',
+      serverErrTargetRequired: '目标必须是非空字符串且最多 100 个字符',
+      serverErrNoteType: '备注必须是字符串或 null',
+      serverErrNoteTooLong: '备注最多 200 个字符',
+      serverErrNameType: '名称必须是字符串',
+      serverErrNameRange: '名称需 1-100 个字符',
+      serverErrStatus: '状态必须是 active 或 disabled',
+      serverErrQuotaUsd: '美元配额必须是非负数',
+      serverErrQuotaTokens: 'token 配额必须是非负整数',
+      serverErrQuotaRequests: '请求数配额必须是非负整数',
+      serverErrQuotaTpm: 'TPM 必须是非负整数',
+      serverErrExpires: '过期时间必须是非负整数（毫秒时间戳，0 = 永久）',
+      serverErrRpm: 'RPM 必须是 0-1000000 的整数',
+      serverErrTokenPlainType: '密钥明文必须是字符串或 null',
+      serverErrTokenPlainLen: '密钥明文需 1-256 个字符',
+      serverErrModelsRequired: 'models 字段必填',
+      serverErrSubjectRequired: 'subject 字段必填',
+      serverErrNicknameType: '昵称必须是字符串或 null',
+      serverErrNicknameTooLong: '昵称最多 30 个字符',
+      serverErrNicknameFailed: '更新 key 昵称失败'
+    },
+    ja: {
+      degradedTitle: 'アカウントデータを利用できません',
+      overview: '概要', overviewSub: 'アカウント・残高・キー健全性',
+      accountsLabel: 'アカウント', healthy: '正常',
+      totalBalance: '残高合計', cooldown: 'クールダウン中',
+      healthTitle: '健全性', healthSub: 'アカウント状態の一覧',
+      createTitle: 'アカウント作成', createSub: 'アップストリームアカウントを登録、キーは暗号化して保存',
+      name: '名前', kind: '種別', workspaceId: 'ワークスペース ID',
+      keysLabel: 'キー（カンマ区切り）', cookieLabel: 'Cookie（任意）',
+      create: '作成',
+      accountsTitle: 'アカウント', accountsSub: 'アカウント状態・残高・キー',
+      collapse: '折りたたむ', expand: '展開',
+      collapseAll: 'すべて折りたたむ', expandAll: 'すべて展開',
+      noAccounts: 'アカウントがまだありません', noAccountsSub: 'アカウントを作成してキーと残高を管理',
+      balance: '残高', monthlyLimit: '月額上限',
+      previewUsage: '7 日間の利用量', previewGo: 'Go 上限',
+      legacyHint: 'アカウント詳細を表示',
+      dupKeyBadge: '共有キー', dupKeyHint: 'この legacy キーは他のアカウントまたはキープールと共有されています',
+      lastProbe: '最終プローブ', lastBilling: '最終取得', never: 'なし',
+      retryIn: '再試行まで', nextProbe: '次回プローブまで', inFlight: '処理中',
+      inflightTitle: '現在リクエスト中のキー数',
+      keysTitle: 'キー', noKeys: 'キーがありません',
+      edit: '編集', save: '保存', cancel: 'キャンセル',
+      refresh: '残高を更新', addKey: 'キーを追加', remove: '削除',
+      delete: '削除', confirmDelete: 'このアカウントを削除しますか？キーはルーティングを停止します。',
+      confirmDeleteKey: 'このキーをアカウントから削除しますか？',
+      keyNotFound: 'アカウント内にこのキーが見つかりません',
+      // 状態の表示用テキスト（バッジ文字 + 説明）。
+      stUnknown: '未プローブ', stOk: '正常', stInvalid: 'キー無効',
+      stInsufficient: '残高不足', stLimit: '上限到達',
+      stCooldown: 'クールダウン中', stRegion: 'リージョン制限', stError: 'エラー',
+      stUnknownHint: 'まだプローブされていません — 初回プローブを待っています',
+      // 健全性の説明（概要）。
+      healthNote: '正常 = 直近のプローブ成功',
+      healthNoteWait: ' 個のアカウントが初回プローブ待ち',
+      waitingProbe: '初回プローブ待ち',
+      // キーのニックネーム。
+      rename: 'リネーム', nickname: 'ニックネーム',
+      renameHint: '空欄 = ニックネームをクリア', renamed: 'ニックネームを保存しました',
+      refreshed: '残高を更新しました', opFail: 'リクエストに失敗しました',
+      networkFlaky: 'ネットワーク不安定、自動再試行中…',
+      notConnected: '未接続', waitingSync: '接続済み · 残高は次回プローブ時に同期', processing: '処理中…',
+      logout: 'ログアウト',
+      kindUnknown: '未設定', kindSubscription: 'サブスクリプション', kindPayg: '都度課金',
+      goSub: 'Go サブスクリプション', goSubHint: 'OpenCode Go の利用枠（opencode.ai）——サブスクリプションは週/月の利用枠、リセット後に自動回復。利用枠を使い切った場合は「上限到達後は残高を使用」で都度課金へ切替',
+      goRolling: 'ローリング（5 時間）', goWeekly: '毎週', goMonthly: '毎月',
+      goReset: 'リセット:', goUseBalance: '上限到達後は残高を使用', goChinaModels: '中国モデルを有効化', goNotSubscribed: '未サブスクリプション',
+      nameRequired: '名前は必須です', cookieKeep: '空欄 = 変更しない', cookieClearCheckbox: '保存済み Cookie をクリア',
+      live: 'リアルタイム',
+      tabOverview: '概要', tabAccounts: 'アカウント', tabUsage: '利用量', tabSettings: '設定',
+      subOverview: '概要', subHealth: '健全性',
+      subAccounts: 'アカウント一覧', subCreate: 'アカウント作成', subOauth: 'OpenCode サインイン',
+      subRequests: 'リクエスト統計', subKeys: 'キープール',
+      subLanguage: '言語', subUpdate: '更新', subAbout: '情報',
+      usageTitle: 'リクエスト統計', usageSub: '/__metrics からのトラフィック集計',
+      totalRequests: '総リクエスト', failed: '失敗', streaming: 'ストリーミング',
+      avgDuration: '平均時間', tokens: 'トークン',
+      keypoolTitle: 'キープール', keypoolSub: 'キーごとの健全性と処理中負荷',
+      noRequests: 'リクエストはまだありません',
+      langTitle: '言語', langSub: 'インターフェース言語',
+      langNote: '言語設定は localStorage に保存されます',
+      langEn: 'EN', langZh: '中文', langJa: '日本語',
+      about: '情報', aboutSub: 'fuckopencode 管理パネル',
+      aboutDesc: 'OpenAI と Anthropic のプロトコル変換ゲートウェイ（DeepSeek 向け）——アップストリームアカウントとプロトコル変換を管理',
+      aboutEndpointAdmin: '管理', aboutEndpointMetrics: 'メトリクス',
+      secretBackupTitle: 'secret.key をバックアップしてください',
+      secretBackupBody: 'data/secret.key は保存済みのすべてのシークレット（アカウントキー / Cookie / OAuth / 配布トークン）を暗号化します。紛失・交換すると、これらはすべて恒久的に復号できなくなります。secret.key を安全な場所（パスワードマネージャー等）にコピーし、data ディレクトリごとバックアップしてください。',
+      otaTitle: '更新', otaSub: 'GitHub OTA 自動更新',
+      otaCurrent: '現在のバージョン', otaLatest: '最新バージョン',
+      otaDisabled: '無効', otaCheck: '更新を確認', otaChecking: '確認中…',
+      otaUpdate: '更新', otaCheckedAt: '確認日時', otaCheckFailed: '更新元に接続できません',
+      otaPrevPresent: '旧バージョンを保持', otaRolledBack: '失敗した更新はロールバックされました',
+      otaRollbackState: 'ロールバック',
+      otaHint: 'OTA_ENABLED=1 のときのみ更新できます。更新後はサービスが自動再起動します',
+      otaConfirmTitle: '更新の確認',
+
+      otaStageCheck: '確認中…', otaStageDownload: 'ダウンロード中…', otaStageVerify: '検証中…',
+      otaStageSwap: '置換中…', otaStageRestart: '再起動中…',
+      otaRestarting: '再起動中 — 少し待ってページを更新すると新しいバージョンが表示されます',
+      otaChangelog: '変更ログ', otaNoChangelog: '変更ログはありません',
+      otaClose: '閉じる',
+      oauthStart: 'OpenCode でサインイン', oauthTitle: 'OpenCode サインイン',
+      oauthDesc: 'デバイスコードで opencode アカウントを連携',
+      oauthUrlLabel: '認証 URL', oauthCodeLabel: 'デバイスコード',
+      oauthHint: '開いたページでサインインしてからここに戻ってください',
+      oauthCopy: 'コピー', oauthCopied: 'コピーしました',
+      copied: 'コピーしました',
+      oauthPolling: '承認を待っています', oauthStarting: '起動中',
+      oauthExpiresIn: 'コードの有効期限', oauthDone: 'アカウントにサインインしました',
+      oauthExpired: 'デバイスコードの期限が切れました、再試行してください', oauthDenied: 'サインインが拒否されました、再試行してください',
+      oauthNotFound: 'サインインセッションが見つかりません、再試行してください',
+      oauthFail: 'サインインに失敗しました', oauthNetFail: 'ネットワークエラー',
+      oauthRetry: '再試行', oauthInvalid: 'OAuth 認証情報が無効です、再度サインインしてください',
+      oauthInstead: 'または OpenCode でサインイン',
+      detail: '詳細', back: '戻る', subDetail: 'アカウント詳細',
+      // 詳細ページのグループタブ（5 グループ：サブスクリプション & キー / ワークスペース & モデル / 財務 / 組織 / 料金）。
+      detailTabSub: 'サブスクリプション & キー', detailTabWs: 'ワークスペース & モデル',
+      detailTabFinance: '財務', detailTabOrg: '組織', detailTabPricing: '料金',
+      // ワークスペースセクション（現在のワークスペース + 切替）。
+      workspaceTitle: 'ワークスペース', workspaceSub: '現在のコンソールワークスペースと切替',
+      currentWorkspace: '現在のワークスペース', wsLegacy: 'レガシーワークスペース',
+      noWorkspace: 'ワークスペースが設定されていません',
+      wsManual: 'ワークスペース ID を手動入力…', wsManualHint: '切替は新しいコンソールのワークスペース（org_...）を使用 — 切替後、コンソールデータが再読み込みされます',
+      wsSwitch: '切替', wsSwitchTitle: 'ワークスペースを切替',
+      wsSwitched: 'ワークスペースを切り替えました', wsIdRequired: 'ワークスペース ID を選択または入力してください',
+      // 利用可能モデルセクション（アカウント設定のモデル一覧 + グローバルデフォルト + カタログ状態）。
+      allowedModelsTitle: '利用可能モデル', allowedModelsSub: 'このアカウントがリクエストできるモデル',
+      globalDefault: 'グローバルデフォルト', accountOverride: 'アカウント個別設定',
+      clearToGlobal: 'グローバルに戻す', clearToGlobalHint: '空欄 = グローバルデフォルトを使用',
+      modelCatalog: 'モデルカタログ', catalogModels: ' モデルを読み込み', catalogRefreshed: '最終更新',
+      modelsBlocked: 'パッシブラーニングでブロック', modelsSaved: '利用可能モデルを保存しました',
+      modelsPlaceholder: 'カンマ区切りのモデル名',
+      balanceTitle: '残高', balanceSub: 'コンソールの残高・台帳・支払い方法',
+      currentBalance: '現在の残高', promotional: 'プロモーション残高',
+      ledger: '台帳', paymentMethods: '支払い方法', none: 'なし',
+      detailUsageTitle: '利用量', detailUsageSub: 'コンソールアカウントのリクエストとコスト',
+      requests: 'リクエスト', inputTokens: '入力トークン', outputTokens: '出力トークン',
+      cost: 'コスト', date: '日付',
+      autoRechargeTitle: '自動チャージ', autoRechargeSub: '残高がしきい値を下回ったら自動でチャージ',
+      enabled: '有効', disabled: '無効',
+      threshold: 'しきい値', rechargeAmount: 'チャージ金額',
+      configure: '設定',
+      budgetsTitle: '月次予算', budgetsSub: '組織・ユーザーごとの月次支出上限',
+      orgBudget: '組織予算', userBudget: 'ユーザー予算',
+      notSet: '未設定', set: '設定',
+      membersTitle: 'メンバー', membersSub: 'このワークスペースにアクセスできるユーザー',
+      memberEmail: 'メール', role: 'ロール', joined: '参加日', noMembers: 'メンバーがいません',
+      saTitle: 'サービスアカウント', saSub: 'コンソールで発行された API キー — 従量課金で、zen のチャージ残高から請求されます（レガシー API キーと同じ zen チャネル。Go サブスクリプションは下のブロック）',
+      saName: '名前', created: '作成日時', noSa: 'サービスアカウントがありません',
+      createSa: 'サービスアカウントを作成',
+      // 旧ワークスペース（opencode.ai 旧コンソール）のキー管理。
+      legacyKeys: 'レガシー API キー', legacySub: '旧コンソール（opencode.ai）で発行された API キー — 従量課金で、zen のチャージ残高から請求されます（Go サブスクリプションは別の週/月の利用枠。下の Go サブスクリプション参照）',
+      legacyCreateTitle: 'レガシーキーを作成',
+      createKey: 'キーを作成', keyName: 'キー名',
+      masked: 'マスク', creator: '作成者',
+      keyCreated: 'キーを作成しました', keyDeleted: 'キーを削除しました',
+      delLegacyKeyConfirm: 'このレガシーキーを削除しますか？すぐに使えなくなります。',
+      legacyCookieMissing: '旧コンソールの Cookie が設定されていません',
+      refreshKeys: '更新', noLegacyKeys: 'レガシーキーがありません',
+      legacyKeyTitle: 'レガシー API キー', legacyKeySub: '任意：旧コンソールの Default API Key を貼り付け — Go の利用量は Cookie なしで zen JSON API から取得',
+      legacyKeyPlaceholder: 'sk-...',
+      legacyKeySave: '保存', legacyKeyClear: 'クリア',
+      legacyKeyConfigured: '設定済み：', legacyKeyNotConfigured: '未設定 — Cookie なしの Go 利用量が利用可能',
+      legacyKeySaved: 'レガシー API キーを保存しました', legacyKeyCleared: 'レガシー API キーをクリアしました',
+      legacyKeyEmpty: 'レガシー API キーを貼り付けてください',
+      providersTitle: 'プロバイダー', providersSub: 'このアカウントで利用可能なプロバイダー',
+      provider: 'プロバイダー', modelCount: 'モデル数', status: '状態', noProviders: 'プロバイダーがいません',
+      consoleNotConfigured: 'このアカウントにコンソール認証情報が設定されていません（env プロキシはローカルキーのみ使用）',
+      cookieInvalid: 'コンソールセッションが無効です、下の Cookie を更新してください',
+      cookieMissing: 'コンソールセッションがありません、Cookie をインポートするとコンソールデータを読めます',
+      importFromBrowser: 'ブラウザからインポート',
+      importCookie: 'インポート',
+      cookiePasteEmpty: 'まず Cookie を貼り付けてください',
+      confirm: '確認',
+      arModalTitle: '自動チャージを設定',
+      arEnabled: '自動チャージを有効化',
+      thresholdDollars: 'しきい値（$）', rechargeAmountDollars: 'チャージ金額（$）',
+      arRequiresAmount: '有効にするときはしきい値と金額が必要です',
+      mlModalTitle: '月次予算を設定',
+      invalidNumber: '有効な数値を入力してください',
+      saModalTitle: 'サービスアカウントを作成',
+      saModalName: '名前',
+      cookieModalTitle: 'Cookie をインポート',
+      cookieModalBody: '共有ブラウザからコンソールセッションの Cookie をインポートしますか？',
+      arSaved: '自動チャージを保存しました',
+      mlSaved: '予算を保存しました',
+      saCreated: 'サービスアカウントを作成しました',
+      saDeleted: 'サービスアカウントを削除しました',
+      cookieImported: 'Cookie をインポートしました',
+      cookiePasted: 'Cookie を保存しました',
+      consoleUnavailable: 'コンソールデータを利用できません',
+      usageUnavailable: '利用量データを利用できません',
+      delSaConfirm: 'このサービスアカウントを削除しますか？API キーが使えなくなります。',
+      oauthLoggedIn: 'ログイン中：',
+      // 利用量詳細のヘッダー（dashboard と同じ列 + リクエスト詳細列）。
+      hTime: '時間', hStatus: '状態', hRequest: 'リクエスト', hMs: 'ms', hTokens: 'トークン',
+      hClient: 'クライアント',
+      // リクエスト詳細（ページング + 検索 + ジャンプ + ページサイズ + IP 統計）。
+      detailRequests: 'リクエスト詳細', reqPrev: '前へ', reqNext: '次へ', reqPage: 'ページ',
+      reqGo: '移動',
+      reqShowAll: 'すべてのリクエストを表示',
+      ipStatsTitle: 'トップ IP', ipStatsSub: 'クライアント IP で集計したトラフィック',
+      ipClients: 'クライアント', ipLast: '最終アクセス', ipEmpty: 'まだトラフィックがありません',
+      ipFilterHint: 'この IP でリクエスト詳細を絞り込み',
+      // 操作監査（管理面の書き込み操作のマスク済み記録）。
+      auditTitle: '管理監査', auditSub: '管理パネルでの誰が · いつ · 何を',
+      auditOp: '操作', auditResult: '結果', auditAccount: 'アカウント', auditIp: 'IP',
+      auditOk: '成功', auditFail: '失敗', auditEmpty: 'まだ管理操作がありません',
+      subIps: 'トップ IP',
+      subAudit: '管理監査',
+      aboutEndpointDash: 'ダッシュボード',
+      // モデルマッピング（設定ページ）。
+      subModelMap: 'モデルマッピング',
+      modelMapTitle: 'モデルマッピング', modelMapSub: 'claude-* モデル名を deepseek モデルにマップ',
+      modelAlias: 'エイリアス', modelTarget: 'ターゲット', modelNote: 'メモ',
+      addMapping: 'マッピングを追加',
+      modelMapNote: 'Claude Code は claude-* モデル名を送信します。ゲートウェイはまずこのテーブルを参照してターゲットにマップ — 即時反映',
+      mmEmpty: 'まだマッピングがありません', mmRequired: 'エイリアスとターゲットは必須です',
+      mmSaved: 'マッピングを保存しました', mmDeleted: 'マッピングを削除しました',
+      mmEditTitle: 'マッピングを編集', mmEdited: 'マッピングを更新しました',
+      mmTargetRequired: 'ターゲットは必須です',
+      mmConfirmDel: 'このマッピングを削除しますか？このエイリアスを使うリクエストはデフォルトモデルにフォールバックします。',
+      // 波 2：レガシー請求 + P0 パネル + 観測カウント + 実験機能。
+      legacyBilling: 'レガシー請求', legacyBillingSub: '旧コンソール（opencode.ai）の残高・自動チャージ・支払い履歴',
+      legacyReload: '自動チャージ', paymentHistory: '支払い履歴', noPayments: 'まだ支払い履歴がありません',
+      costTrend: '日次コスト（7 日間）', noTrend: 'この範囲にコストデータがありません',
+      modelUsageTitle: 'モデル利用', modelUsageSub: 'モデルごとのコストとトークン',
+      userUsageTitle: 'メンバー利用', userUsageSub: 'メンバーごとのリクエストとトークン',
+      spent: '使用済み', exceeded: '超過', resetsAt: 'リセット:',
+      memberBudgetTitle: 'メンバー予算',
+      pricingTitle: 'モデル料金', pricingSub: '100万トークンあたりの価格（v2/config）',
+      inPerMtok: '入力', outPerMtok: '出力',
+      fixCountTitle: '互換性修正', fixRewritten: '書き換え', fixStripped: '削除', fixCompressed: '圧縮',
+      expTitle: '実験的機能', expSub: 'オプトイン機能、デフォルトではオフ',
+      expNote: '変更は即時反映され、再起動後も保持されます',
+      expUnavailable: '実験的機能の設定を利用できません',
+      expScaleUsage: '利用量スケーリング', expScaleDesc: 'クライアントに見える利用量をスケーリングして早期のローカル圧縮を促す',
+      expCompact: 'パッシブ圧縮', expCompactDesc: 'しきい値を超えたリクエストボディを送信前に圧縮',
+      expOn: 'オン', expOff: 'オフ',
+      // バッチ 2：配布キータブ。
+      tabTokens: 'キー', subTokens: 'キー',
+      tokensTitle: '配布キー', tokensSub: '共有アップストリームプールを経由するクライアントトークン',
+      tokensNote: 'キー平文は作成時に一度だけ表示、一覧はマスクのみ',
+      tokensEmpty: 'まだトークンがありません', tokensUnavailable: 'トークンデータを利用できません',
+      tokenRefresh: '更新', tokenCreate: 'トークンを作成',
+      tokenName: '名前', tokenCount: '数量（1-10）', tokenNameRequired: '名前は必須です',
+      tokenCustomKey: 'カスタムキー（任意）', tokenCustomKeyPlaceholder: '空欄 = 自動生成',
+      tokenCountInvalid: '数量は 1〜10 にしてください', tokenCreated: 'トークンを作成しました',
+      tokenPlainOnlyOnce: '一度だけ表示 — 今すぐコピーしてください。後から復元できません',
+      tokenCopy: 'コピー', tokenCopied: 'コピーしました', tokenClose: '閉じる',
+      tokenCopyTitle: '完全なトークンをコピー',
+      tokenPlainMissing: '平文は保存されていません（平文保存前の作成）— 再作成すると表示できるようになります',
+      tokenActive: '有効', tokenDisabled: '無効',
+      tokenUsage: '利用量', tokenCreatedAt: '作成日時',
+      tokenEditTitle: 'トークンを編集', tokenNote: 'メモ', tokenNotePlaceholder: '任意',
+      tokenDeleted: 'トークンを削除しました',
+      tokenEnabled: 'トークンを有効化しました', tokenDisabledMsg: 'トークンを無効化しました',
+      tokenDisable: '無効化', tokenEnable: '有効化',
+      tokenDeleteConfirm: 'このトークンを削除しますか？使用中のクライアントはすぐに使えなくなります。',
+      // バッチ 2：概要の健全性（統計カード + 状態リスト）。
+      ovTotalRequests: 'リクエスト', ovSuccessRate: '成功率',
+      ovCostLabel: 'キーコスト', ovKeys: '配布キー',
+      ovTrendNote: 'ゲートウェイ利用履歴の 7 日間集計', ovTrendFallback: 'スナップショット（利用量 DB が利用不可）',
+      statusTitle: '状態', statusSub: 'ゲートウェイ・アップストリームプール・アカウント・配布キーの概要',
+      subStatus: '状態',
+      stGateway: 'ゲートウェイ', stUpstream: 'アップストリームプール', stAccounts: 'アカウント',
+      stDistKeys: '配布キー', stFixes: '互換性修正',
+      stRunning: '実行中', stLoading: '読み込み中…', loading: '読み込み中…',
+      // バッチ 2：設定ページのホットリロード。
+      adminAuthTitle: '管理者アカウント', adminAuthSub: 'このパネルのログイン認証情報',
+      adminUserLabel: 'ユーザー名', adminPassLabel: 'パスワード',
+      adminPassPlaceholder: '空欄 = 現在のパスワードを保持',
+      adminPassHint: 'パスワード変更後、ログイン済みのセッションはすべて即時無効になり、再ログインが必要です',
+      adminPassEnvWarn: 'デフォルトパスワードを使用中です — 変更してください',
+      adminPassDefaultBadge: 'デフォルトパスワード — 変更してください',
+      authSaved: '管理者認証情報を保存しました', aaNothing: '保存するものはありません',
+      sourceEnv: 'ソース: env', sourceDb: 'ソース: パネル', codeDefault: 'コードデフォルト',
+      apiKeysTitle: 'API キー', apiKeysSub: '管理アクセスに受け付けるキー',
+      apiKeysEmpty: 'API キーがありません', apiKeysAdd: '追加', apiKeysAddTitle: 'API キーを追加',
+      apiKeysCopy: '平文をコピー',
+      apiKeysLabel: 'API キー', apiKeysPasteHint: '1 行に 1 つ（パネル管理のキーは保持されます）',
+      apiKeysNoPlain: '平文を取得できません — サーバー設定で管理してください',
+      apiKeysEnvWarn: '平文を復元できない env 由来のキーは保存時に削除されます',
+      apiKeysDeleteConfirm: 'この API キーを削除しますか？使用中のクライアントはすぐに使えなくなります。',
+      apiKeysSaved: 'API キーを保存しました', settingsSaved: '設定を保存しました',
+      subAdminAuth: '管理者アカウント', subAdminKeys: 'API キー', subExperimental: '実験的機能',
+      // バッチ 2：アカウントカードの残高ソース表示。
+      balanceOrg: '残高（組織）',
+      // バッチ 2：RPM レート制限設定 + レガシーキー平文コピー。
+      tokenRpm: 'RPM 制限', tokenRpmHint: '1 分あたりのリクエスト数 — 0 = 無制限',
+      tokenRpmSaved: 'RPM 制限を保存しました', tokenRpmInvalid: '0 以上の数値を入力してください',
+      // クォータ（QUOTA.md §7）：キーごとの $ / トークン / リクエスト上限 + 周期 + 期限 + 状態。
+      quota: 'クォータ',
+      quotaUsd: '$ クォータ', quotaTokens: 'トークンクォータ', quotaRequests: 'リクエストクォータ',
+      quotaCycle: 'リセット周期', quotaCycleNone: 'なし', quotaCycleDaily: '毎日', quotaCycleMonthly: '毎月',
+      quotaExpires: '有効期限', quotaExpiresHint: '空欄 = 期限なし（0）',
+      quotaHint: '0 = 無制限', quotaNone: 'クォータなし',
+      quotaTpm: 'TPM（毎分トークン上限）', ipWhitelist: 'IP ホワイトリスト',
+      ipWhitelistHint: 'カンマ区切りの IP または CIDR、空欄 = 制限なし',
+      quotaBadgeOk: '正常', quotaBadgeExhausted: '枯渇', quotaBadgeExpired: '期限切れ',
+      quotaInvalid: '有効なクォータを入力してください（0 以上）', quotaSaved: 'クォータを保存しました',
+      legacyKeyNotFound: '平文リストにキーが見つかりません',
+      legacyKeyCopyTitle: '平文をクリップボードにコピー',
+      // Model access タブ（MODEL-ACCESS §6）。
+      tabModelAccess: 'モデルアクセス', subModelAccess: 'モデルアクセス',
+      maGlobalTitle: 'グローバル許可リスト',       maGlobalSub: 'カスタム設定のないキーのデフォルトモデル',
+      maAvailTitle: '利用可能モデル（全アップストリーム）',
+      maGlobalModels: '許可モデル',
+      maGlobalFloor: 'コードデフォルト（リセット基準）：',
+      maGlobalAdd: '追加', maGlobalAddHint: 'アップストリームのモデル名を追加 — 非対応モデルはそのまま透過され、アップストリームのエラーがそのまま返されます',
+      maGlobalEmpty: 'モデルが選択されていません',
+      maAddInvalid: '無効なモデル名: ',
+      maResetGlobal: 'コードデフォルトにリセット', maGlobalSaved: 'グローバル許可リストを保存しました',
+      maSearchPh: '名前 / マスクで検索',
+      maFilter: 'タイプで絞り込み',
+      maFilterAll: 'すべてのタイプ', maFilterUpstream: 'アップストリーム', maFilterToken: 'トークン', maFilterApiKey: 'API キー',
+      maRefresh: '更新',
+      maUpstreamTitle: 'アップストリームキー', maUpstreamSub: 'アップストリームキーごとのモデル上書き',
+      maTokenTitle: '配布トークン', maTokenSub: 'トークンごとのモデル上書き',
+      maApiKeyTitle: 'API キー', maApiKeySub: 'API キーごとのモデル上書き',
+      maEmpty: 'キーが設定されていません', maNoMatch: 'フィルタに一致するキーがありません',
+      maCustomBadge: 'カスタム', maFollowsGlobal: 'グローバルに追従',
+      maEditTitle: 'モデルアクセスを編集', maSaved: 'モデルアクセスを保存しました',
+      maFollowGlobal: 'グローバルに追従（クリア）',
+      maNotGrantable: 'グローバル許可リスト内のモデルのみ許可できます',
+      // 利用枠枯渇エラーの表示用テキスト（friendlyQuota）：GoUsageLimitError /
+      // FreeUsageLimitError / 月額 / 残高不足を識別 → 短いテキスト + リセット時間。
+      quotaGo: 'Go サブスクリプションの上限に到達', quotaFree: 'レート制限中',
+      quotaGeneric: '利用上限に到達', quotaBalance: '残高不足',
+      quotaResetsPre: '', quotaResetsPost: ' 後にリセット',
+      // アカウントキー行の強化：利用量ポップアップ + 手動有効/無効 + 配布キー作成ガイド。
+      keyUsage: '利用量', keyUsageHint: 'このアップストリームキーのリクエスト・トークン・コスト',
+      keyUsageTitle: 'キー利用量', keyUsageNoData: 'まだ利用量データがありません',
+      keyDisable: '無効化', keyDisableHint: 'このキーのルーティングを停止（手動）',
+      keyReset: '復元', keyResetHint: 'このキーを再度有効化',
+      manualPermanent: '恒久的に無効化',
+      keyDisabledMsg: 'キーを無効化しました', keyEnabledMsg: 'キーを復元しました',
+      gotoKeys: 'キー', keyQuotaGuide: 'キータブでクォータ付きの配布トークンを作成すると、クライアントがこのプールを使えるようになります',
+      // 設定ページのグループカード（サービス / セキュリティ / ランタイム / 情報）。
+      settingsGroupService: 'サービス', settingsGroupSecurity: 'セキュリティ',
+      settingsGroupRuntime: 'ランタイム', settingsGroupAbout: '情報',
+      // 概要のパフォーマンスダッシュボード。
+      subPerf: 'パフォーマンス',
+      perfTitle: 'パフォーマンス', perfSub: 'プロセス・システム・ゲートウェイの健全性',
+      perfRss: 'メモリ（RSS）', perfCpu: 'CPU', perfLoad: 'ロード',
+      perfConcurrent: '同時実行', perfLatency: 'レイテンシ', perfPool: 'キープール',
+      perfUptime: '稼働', perfHide: '非表示', perfShow: '表示',
+      perfPanel: 'パフォーマンスパネル', perfPanelSub: '概要ページにパフォーマンスダッシュボードを表示',
+      perfPanelNote: 'localStorage に保存、デフォルトでオン',
+      // i18n 修正ラウンド：静的 placeholder/title + リクエスト行のキー接頭辞 + クォータ tooltip + 実験説明の単位。
+      reqSearchPh: 'パス/状態/モデル/クライアント/UA/エラーで検索',
+      reqPageSize: 'ページサイズ', reqJumpTo: 'ページへ移動',
+      searchPh: '検索…', optionalPh: '任意',
+      reqKey: 'キー', quotaRemaining: '残り $', chars: '文字',
+      // アップストリームキーの無効化理由（disabledReason 列挙 → 表示テキスト）。
+      drQuota: 'クォータ枯渇', drAuth: '認証情報が無効',
+      drRate: 'レート制限', drTransient: '一時エラーの連続', drManual: '手動で無効化',
+      // サーバー側フォーム検証の頻出メッセージ（その他の fail() メッセージは今後のラウンドで対応）。
+      serverErrNameTooLong: '名前は 100 文字以内にしてください',
+      serverErrKind: '種別が無効です（subscription / payg / unknown）',
+      serverErrKeysBad: 'キーの形式が無効です',
+      serverErrKeyTooLong: '各キーは 200 文字以内にしてください',
+      serverErrKeysTooMany: 'キーは最大 20 個です',
+      serverErrBody: 'リクエストボディは JSON オブジェクトである必要があります',
+      serverErrWsType: 'ワークスペース ID は文字列である必要があります',
+      serverErrCookieType: 'Cookie は文字列である必要があります',
+      serverErrWsTooLong: 'ワークスペース ID は 200 文字以内にしてください',
+      serverErrCookieTooLong: 'Cookie は 4096 文字以内にしてください',
+      serverErrLegacyWsRequired: 'レガシーワークスペース ID は空でない文字列または null である必要があります',
+      serverErrLegacyWsTooLong: 'レガシーワークスペース ID は 200 文字以内にしてください',
+      serverErrLegacyCookieType: 'レガシー Cookie は文字列または null である必要があります',
+      serverErrLegacyCookieTooLong: 'レガシー Cookie は 2048 文字以内にしてください',
+      serverErrLegacyKeyType: 'レガシー API キーは文字列または null である必要があります',
+      serverErrLegacyKeyTooLong: 'レガシー API キーは 2048 文字以内にしてください',
+      serverErrAllowedModelsType: '許可モデルは文字列の配列である必要があります',
+      serverErrAllowedModelsTooMany: '許可モデルは最大 50 個です',
+      serverErrAllowedModelsEmpty: '許可モデルに空の項目を含めることはできません',
+      serverErrAllowedModelType: '各許可モデルは文字列である必要があります',
+      serverErrAllowedModelTooLong: '各許可モデルは 100 文字以内にしてください',
+      serverErrAliasType: 'エイリアスは文字列である必要があります',
+      serverErrAliasFormat: 'エイリアスは 1〜100 文字で、英数字と ._- のみ使用できます',
+      serverErrTargetType: 'ターゲットは文字列である必要があります',
+      serverErrTargetRequired: 'ターゲットは空でない文字列で 100 文字以内にしてください',
+      serverErrNoteType: 'メモは文字列または null である必要があります',
+      serverErrNoteTooLong: 'メモは 200 文字以内にしてください',
+      serverErrNameType: '名前は文字列である必要があります',
+      serverErrNameRange: '名前は 1〜100 文字にしてください',
+      serverErrStatus: '状態は active または disabled である必要があります',
+      serverErrQuotaUsd: '$ クォータは非負の数である必要があります',
+      serverErrQuotaTokens: 'トークンクォータは非負の整数である必要があります',
+      serverErrQuotaRequests: 'リクエストクォータは非負の整数である必要があります',
+      serverErrQuotaTpm: 'TPM は非負の整数である必要があります',
+      serverErrExpires: '有効期限は非負の整数（エポックミリ秒、0 = 期限なし）である必要があります',
+      serverErrRpm: 'RPM は 0〜1000000 の整数である必要があります',
+      serverErrTokenPlainType: 'トークン平文は文字列または null である必要があります',
+      serverErrTokenPlainLen: 'トークン平文は 1〜256 文字にしてください',
+      serverErrModelsRequired: 'models フィールドは必須です',
+      serverErrSubjectRequired: 'subject フィールドは必須です',
+      serverErrNicknameType: 'ニックネームは文字列または null である必要があります',
+      serverErrNicknameTooLong: 'ニックネームは 30 文字以内にしてください',
+      serverErrNicknameFailed: 'キーのニックネームを更新できませんでした'
     }
   };
   var lang = (function () {
-    try { var v = localStorage.getItem('fc-lang'); if (v === 'zh' || v === 'en') return v; } catch (e) {}
-    return /^zh/i.test(navigator.language || '') ? 'zh' : 'en';
+    try { var v = localStorage.getItem('fc-lang'); if (v === 'zh' || v === 'en' || v === 'ja') return v; } catch (e) {}
+    var nl = navigator.language || ''; if (/^zh/i.test(nl)) return 'zh'; if (/^ja/i.test(nl)) return 'ja'; return 'en';
   })();
   var T = function (k) { return (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k; };
+
+  /** 总览性能区块开关（localStorage fc-perf，默认开；设置页可关）。 */
+  var perfOn = (function () {
+    try { var v = localStorage.getItem('fc-perf'); if (v === '0' || v === '1') return v === '1'; } catch (e) {}
+    return true;
+  })();
 
   var $ = function (id) { return document.getElementById(id); };
   var esc = function (s) {
@@ -2818,6 +3603,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   var statusText = function (st) { return T(STATUS_KEYS[st] || 'stUnknown'); };
   /** 账号类型友好文案（unknown → 未标注；subscription/payg 已有中文）。 */
   var kindText = function (k) { return T(KIND_KEYS[k] || 'kindUnknown'); };
+  /** 上游 key 禁用原因（keypool UpstreamFailureKind）→ 词条（与 dashboard kindText 同款）。 */
+  var DISABLED_KEYS = {
+    'quota-exhausted': 'drQuota', auth: 'drAuth', 'rate-limit': 'drRate',
+    transient: 'drTransient', manual: 'drManual'
+  };
+  var disabledText = function (r) { return r ? T(DISABLED_KEYS[r] || r) : ''; };
   /** 计数格式化（k/M/B）。 */
   var fmt = function (n) {
     n = Number(n) || 0;
@@ -2836,10 +3627,78 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     return m + 'm' + (total - m * 60) + 's';
   };
 
-  var langLabel = function () { return lang === 'zh' ? T('langZh') : T('langEn'); };
+  /** 数字输入自绘 spinner（kirostudio 风格）：隐藏原生步进，右侧挂上下两个
+   *  小箭头。原生伪元素画不出可点击按钮（input 内伪元素不可交互），所以 JS
+   *  包一层 .num-wrap + .num-stepper，点击走 document 委托 stepUp/stepDown。
+   *  幂等：data-num-mounted 标记 + 渲染入口末尾重调（renderTokens/openConfirm/
+   *  render/初始化），tick 重建 DOM 后的新 input 会重新包裹，已包裹的不重复处理。 */
+  function mountNumSpinners(container) {
+    var root = container || document;
+    var inputs = root.querySelectorAll('input[type="number"]');
+    for (var i = 0; i < inputs.length; i++) {
+      var inp = inputs[i];
+      if (inp.dataset.numMounted === '1') continue;
+      inp.dataset.numMounted = '1';
+      var wrap = document.createElement('span');
+      wrap.className = 'num-wrap';
+      inp.parentNode.insertBefore(wrap, inp);
+      wrap.appendChild(inp);
+      var st = document.createElement('span');
+      st.className = 'num-stepper';
+      st.setAttribute('aria-hidden', 'true');
+      st.innerHTML = '<button type="button" class="num-spin num-spin-up" tabindex="-1"></button>' +
+        '<span class="num-spin-div"></span>' +
+        '<button type="button" class="num-spin num-spin-down" tabindex="-1"></button>';
+      wrap.appendChild(st);
+    }
+  }
+
+  // ── 账号卡片收起/展开：localStorage fc-collapsed（{accountId: bool}）记忆 ──
+  var COLLAPSE_KEY = 'fc-collapsed';
+  var collapseCache = null;
+  function loadCollapsed() {
+    if (collapseCache !== null) return collapseCache;
+    var map = {};
+    try {
+      var v = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '{}');
+      if (v && typeof v === 'object') map = v;
+    } catch (e) {}
+    collapseCache = map;
+    return map;
+  }
+  function persistCollapse(map) {
+    collapseCache = map;
+    try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify(map)); } catch (e) {}
+  }
+  /** 单卡翻转：更新 DOM 属性 + localStorage（渲染重建时 accountCard 从缓存读取）。 */
+  function toggleCard(id, cardEl) {
+    var map = loadCollapsed();
+    var next = !(map[id] === true);
+    map[id] = next;
+    persistCollapse(map);
+    if (cardEl) {
+      cardEl.setAttribute('data-collapsed', next ? '1' : '0');
+      var tb = cardEl.querySelector('.card-toggle');
+      if (tb) tb.title = next ? T('expand') : T('collapse');
+    }
+  }
+  /** 全部收起/展开：同步设置所有卡片 + localStorage。 */
+  function setAllCollapsed(collapsed) {
+    var map = {};
+    var cards = document.querySelectorAll('#accounts .card');
+    for (var i = 0; i < cards.length; i++) {
+      var cid = Number(cards[i].getAttribute('data-id'));
+      if (!isFinite(cid)) continue;
+      map[cid] = collapsed;
+      cards[i].setAttribute('data-collapsed', collapsed ? '1' : '0');
+    }
+    persistCollapse(map);
+  }
+
+  var langLabel = function () { return lang === 'zh' ? T('langZh') : lang === 'ja' ? T('langJa') : T('langEn'); };
 
   function applyLang() {
-    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : lang === 'ja' ? 'ja' : 'en';
     var nodes = document.querySelectorAll('[data-i18n]');
     for (var i = 0; i < nodes.length; i++) {
       nodes[i].textContent = T(nodes[i].getAttribute('data-i18n'));
@@ -2847,6 +3706,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     $('btn-lang').textContent = langLabel();
     var b2 = $('btn-settings-lang');
     if (b2) b2.textContent = langLabel();
+    // 静态 placeholder / title（不在 textContent 上，语言切换同步更新）。
+    var phMap = { 'req-q': 'reqSearchPh', 'ma-avail-search': 'searchPh', 'mm-note': 'optionalPh' };
+    for (var phk in phMap) { var pEl = $(phk); if (pEl) pEl.placeholder = T(phMap[phk]); }
+    var ttMap = { 'req-size': 'reqPageSize', 'req-page': 'reqJumpTo' };
+    for (var ttk in ttMap) { var tEl = $(ttk); if (tEl) tEl.title = T(ttMap[ttk]); }
+    // 静态输入框 aria-label（a11y：label 元素 for/id 配对优先，无可见 label 的
+    // 用 aria-label 兜底；语言切换同步更新，避免屏幕阅读器读到英文）。
+    var alMap = { 'req-q': 'reqSearchPh', 'req-size': 'reqPageSize', 'req-page': 'reqJumpTo',
+      'ma-search': 'maSearchPh', 'ma-filter': 'maFilter', 'ma-global-add': 'maGlobalAdd',
+      'ma-avail-search': 'maAvailTitle', 'detail-cookie-paste': 'cookieLabel' };
+    for (var alk in alMap) { var aEl = $(alk); if (aEl) aEl.setAttribute('aria-label', T(alMap[alk])); }
+    // 创建表单类型下拉 toggle：跟随当前选中值（选项文案已是词条，切换语言后重取）。
+    var ctk = $('c-kind-toggle');
+    if (ctk) ctk.textContent = T(KIND_KEYS[cKind] || 'kindUnknown');
     var items = document.querySelectorAll('.dd-item[data-lang]');
     for (var j = 0; j < items.length; j++) {
       if (items[j].getAttribute('data-lang') === lang) items[j].setAttribute('data-selected', 'true');
@@ -2875,24 +3748,136 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       });
     }).catch(function () { return { ok: false, status: 0, json: null }; });
   }
+  /** 服务端表单校验英文消息 → 词条（名称必填/长度/类型/key 格式/别名/白名单/legacy
+   *  等）。未收录的原样透传。动态数字类（如 name must be 1-100 characters）走
+   *  SERVER_MSG_RE 正则匹配，避免逐字硬编码上限值。 */
+  var SERVER_MSG_KEYS = {
+    'name is required and must be a non-empty string': 'nameRequired',
+    'name must be a non-empty string': 'nameRequired',
+    'name must be a string': 'serverErrNameType',
+    'name must be at most 100 characters': 'serverErrNameTooLong',
+    'kind must be one of: subscription, payg, unknown': 'serverErrKind',
+    'keys must be an array of strings': 'serverErrKeysBad',
+    'each key must be a string': 'serverErrKeysBad',
+    'keys must not contain empty entries': 'serverErrKeysBad',
+    'each key must be at most 200 characters': 'serverErrKeyTooLong',
+    'keys must have at most 20 entries': 'serverErrKeysTooMany',
+    'request body must be a JSON object': 'serverErrBody',
+    'workspaceId must be a string': 'serverErrWsType',
+    'workspaceId must be at most 200 characters': 'serverErrWsTooLong',
+    'cookie must be a string': 'serverErrCookieType',
+    'cookie must be at most 4096 characters': 'serverErrCookieTooLong',
+    'legacyWorkspaceId must be a non-empty string or null': 'serverErrLegacyWsRequired',
+    'legacyWorkspaceId must be at most 200 characters': 'serverErrLegacyWsTooLong',
+    'legacyCookie must be a string or null': 'serverErrLegacyCookieType',
+    'legacyCookie must be at most 2048 characters': 'serverErrLegacyCookieTooLong',
+    'legacyKey must be a string or null': 'serverErrLegacyKeyType',
+    'legacyKey must be at most 2048 characters': 'serverErrLegacyKeyTooLong',
+    'allowedModels must be an array of strings': 'serverErrAllowedModelsType',
+    'allowedModels must have at most 50 entries': 'serverErrAllowedModelsTooMany',
+    'allowedModels must not contain empty entries': 'serverErrAllowedModelsEmpty',
+    'each allowed model must be a string': 'serverErrAllowedModelType',
+    'each allowed model must be at most 100 characters': 'serverErrAllowedModelTooLong',
+    'alias must be a string': 'serverErrAliasType',
+    'alias must be 1-100 characters of letters, digits, dot, dash or underscore': 'serverErrAliasFormat',
+    'target must be a string': 'serverErrTargetType',
+    'target must be a non-empty string of at most 100 characters': 'serverErrTargetRequired',
+    'note must be a string or null': 'serverErrNoteType',
+    'status must be active or disabled': 'serverErrStatus',
+    'quotaUsd must be a non-negative number': 'serverErrQuotaUsd',
+    'quotaTokens must be a non-negative integer': 'serverErrQuotaTokens',
+    'quotaRequests must be a non-negative integer': 'serverErrQuotaRequests',
+    'quotaTpm must be a non-negative integer': 'serverErrQuotaTpm',
+    'expiresAt must be a non-negative integer (epoch ms, 0 = never)': 'serverErrExpires',
+    'tokenPlain must be a string or null': 'serverErrTokenPlainType',
+    'tokenPlain must be 1-256 characters': 'serverErrTokenPlainLen',
+    'models is required': 'serverErrModelsRequired',
+    'subject is required': 'serverErrSubjectRequired',
+    'nickname must be a string or null': 'serverErrNicknameType',
+    'nickname must be at most 30 characters': 'serverErrNicknameTooLong',
+    'failed to update key nickname': 'serverErrNicknameFailed',
+    'nothing to update': 'aaNothing'
+  };
+  /** 动态数字上限的服务端消息（精确字符串匹配不到）：正则 → 词条。 */
+  var SERVER_MSG_RE = [
+    [/^name must be 1-\d+ characters$/, 'serverErrNameRange'],
+    [/^note must be at most \d+ characters$/, 'serverErrNoteTooLong'],
+    [/^rpmLimit must be an integer 0-\d+$/, 'serverErrRpm']
+  ];
+  function translateServerMsg(m) {
+    if (!m) return m;
+    var s = String(m);
+    var k = SERVER_MSG_KEYS[s];
+    if (k) return T(k);
+    for (var i = 0; i < SERVER_MSG_RE.length; i++) {
+      if (SERVER_MSG_RE[i][0].test(s)) return T(SERVER_MSG_RE[i][1]);
+    }
+    return m;
+  }
   function errMsg(r) {
-    return (r.json && r.json.error && r.json.error.message) || (r.status === 0 ? T('networkFlaky') : (T('opFail') + ' (' + r.status + ')'));
+    var raw = r.json && r.json.error && r.json.error.message;
+    if (raw) return translateServerMsg(raw);
+    return (r.status === 0 ? T('networkFlaky') : (T('opFail') + ' (' + r.status + ')'));
+  }
+
+  /** 额度耗尽类错误的友好文案（需求 1）：识别上游 quota 错误（GoUsageLimitError /
+   *  FreeUsageLimitError / 月额度 / 余额不足）→ 返回友好短文案（含重置时间）；
+   *  识别不出返回 null（调用方保留原文）。原始文案始终留在 title/tooltip
+   *  可展开，不做销毁。上游形态见 errors.ts：形如 GoUsageLimitError: Weekly usage
+   *  limit reached. Resets in 19hr 22min. 或 FreeUsageLimitError: Rate limit
+   *  exceeded. Please try again later. */
+  function friendlyQuota(msg) {
+    if (!msg) return null;
+    var m = String(msg);
+    var go = /GoUsageLimitError/.test(m);
+    var free = /FreeUsageLimitError|RateLimitError|Rate limit/i.test(m);
+    var insuff = /CreditsError|billing_error|insufficient[_ ]?balance|余额不足/i.test(m);
+    var generic = /MonthlyLimitError|UserLimitError|quota|usage limit|limit reached|额度|用尽/i.test(m);
+    if (!go && !free && !insuff && !generic) return null;
+    var reset = '';
+    var rm = /[Rr]esets?\s+in\s+([^.]+)/.exec(m);
+    if (rm) reset = String(rm[1]).trim();
+    // zh 模式把上游英文时间单位中文化（3 days → 3 天；19hr 22min → 19 小时 22 分钟），
+    // 避免「Go 订阅额度已用尽 · 3 days 后重置」混排；en 或识别不出保持原样。
+    if (reset && lang === 'zh') {
+      reset = reset.replace(/(\d+(?:\.\d+)?)\s*([A-Za-z]+)/g, function (all, n, u) {
+        var units = {
+          day: '天', days: '天', hr: '小时', hrs: '小时', h: '小时', hour: '小时', hours: '小时',
+          min: '分钟', mins: '分钟', m: '分钟', minute: '分钟', minutes: '分钟',
+          sec: '秒', secs: '秒', s: '秒', second: '秒', seconds: '秒',
+          week: '周', weeks: '周', month: '个月', months: '个月', year: '年', years: '年'
+        };
+        return n + ' ' + (units[String(u).toLowerCase()] || u);
+      });
+    }
+    var text = T(go ? 'quotaGo' : free ? 'quotaFree' : insuff ? 'quotaBalance' : 'quotaGeneric');
+    if (reset) text += ' · ' + T('quotaResetsPre') + reset + T('quotaResetsPost');
+    return text;
   }
 
   /** 单条 key 行。指纹来自服务端（末 4 位），原文永不出现在面板。
-   *  有昵称：昵称优先 + 指纹小字；无昵称：只显示指纹。hover 出「改名」「移除」。 */
+   *  有昵称：昵称优先 + 指纹小字；无昵称：只显示指纹。hover 出「用量」「改名」
+   *  「禁用/恢复」「移除」。禁用/恢复（data-action=disable-key|reset-key）走
+   *  POST /keys/:fp/disable|reset（并行服务端 agent 实现）；用量弹层读
+   *  GET /keys/:fp/usage 聚合。 */
   function keyRow(k, accountId) {
     var meta = k.healthy
       ? (k.inFlight > 0 ? T('inFlight') + ' ' + k.inFlight : '')
-      : esc(k.disabledReason || '') + (k.recoverInMs > 0 ? ' · ' + hms(k.recoverInMs) : '');
+      : esc(disabledText(k.disabledReason)) + (k.recoverInMs > 0 ? ' · ' + (k.disabledReason === 'manual' ? T('manualPermanent') : hms(k.recoverInMs)) : '');
     var label = k.nickname
       ? '<span class="fp">' + esc(k.nickname) + '</span> <span class="w">' + esc(k.fingerprint) + '</span>'
       : '<span class="fp">' + esc(k.fingerprint) + '</span>';
+    // 手动启停：有 disabledReason（含手动禁用标记）→ 「恢复」；健康/无原因 → 「禁用」。
+    var stateBtn = k.disabledReason
+      ? '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="reset-key" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '" title="' + T('keyResetHint') + '">' + T('keyReset') + '</button>'
+      : '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="disable-key" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '" title="' + T('keyDisableHint') + '">' + T('keyDisable') + '</button>';
     return '<div class="key-row">' +
       '<span class="oc-dot ' + (k.healthy ? 'ok' : 'bad') + '"></span>' +
       label +
       '<span class="k-meta">' + meta + '</span>' +
+      '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="key-usage" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '" title="' + T('keyUsageHint') + '">' + T('keyUsage') + '</button>' +
       '<button class="oc-btn oc-btn-ghost oc-btn-sm" data-action="copykey" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '">' + T('tokenCopy') + '</button>' +
+      stateBtn +
       '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="renamekey" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '">' + T('rename') + '</button>' +
       '<button class="oc-btn oc-btn-ghost oc-btn-sm del" data-action="delkey" data-id="' + accountId + '" data-fp="' + esc(k.fingerprint) + '">' + T('remove') + '</button>' +
       '</div>';
@@ -2910,46 +3895,21 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         ? '<span class="retry">' + T('nextProbe') + ' ' + hms(a.retryInMs) + '</span>'
         : '<span class="retry" data-rc="' + (now + a.retryInMs) + '">' + T('retryIn') + ' ' + hms(a.retryInMs) + '</span>')
       : '';
-    var detail = a.statusDetail
-      ? '<div class="detail" title="' + esc(a.statusDetail) + '">' + esc(a.statusDetail) + '</div>'
+    // 需求 1：上游原始错误（如 GoUsageLimitError: Weekly usage limit reached.
+    // Resets in 3 days. ...）经 friendlyQuota 包装成友好短文案，原文留在
+    // title 悬浮可展开。
+    var detailRaw = a.statusDetail || '';
+    var detailTxt = friendlyQuota(detailRaw) || detailRaw;
+    var detail = detailRaw
+      ? '<div class="detail" title="' + esc(detailRaw) + '">' + esc(detailTxt) + '</div>'
       : '';
-    var balance = a.balance == null ? '—' : '$' + Number(a.balance).toFixed(2);
-    var limit = a.monthlyLimit == null ? '—' : '$' + Number(a.monthlyLimit).toFixed(2);
-    var usage = a.monthlyUsage == null ? '—' : '$' + Number(a.monthlyUsage).toFixed(2);
-    var pct = a.monthlyPercent == null ? '' : Number(a.monthlyPercent).toFixed(1);
-    var meter = pct === ''
-      ? ''
-      : '<div class="meter"><div class="meter-bg"><div class="meter-fill" style="width:' + pct + '%"></div></div>' +
-        '<div class="meter-l">' + pct + '% ' + T('usedOf') + '</div></div>';
-    // 控制台数据获取不到（billing 从未成功 / cookie 失效）时：余额/月额度/月用量
-    // 三个卡全是「—」，不渲染空容器，只给一行「未连接」提示（详情页有 cookie 导入）。
-    var noConsole = a.balance == null && a.monthlyLimit == null && a.monthlyUsage == null;
-    // 容器 B：余额 + 月额度条。无控制台数据时给单行提示（区分「有凭据但余额
-    // 还没同步」vs「状态异常」）。env 代理账号（hasConsole=false）与控制台无关，
-    // 不渲染任何提示——它只是 key 池，只显示名称/状态/key 信息。
-    var consoleBlock = noConsole
-      ? (a.hasConsole
-        ? ((a.status === 'error' || a.status === 'invalid')
-          ? '<div class="meta s-bad p-note">' + esc(a.statusDetail || T('stError')) + '</div>'
-          : '<div class="meta p-note">' + T('waitingSync') + '</div>')
-        : '')
-      : '<div class="preview-box preview-balance">' +
-          '<div class="p-title">' + T('balanceOrg') + '</div>' +
-          '<div class="balance-row">' +
-            '<div class="balance-card"><div class="v">' + balance + '</div></div>' +
-          '</div>' +
-          meter +
-        '</div>';
-    // 容器 C/D：用量摘要 + Go 三窗口（60s 缓存数据；无数据时整容器隐藏，失败不报错）。
-    // 容器 C 走 previewUsageHtml：网关实际用量优先，org 用量回落（与数据到达时的回填同口径）。
+    // 右侧压缩额度栏数据源：billing（a.balance）+ previewCache（用量/Go 60s 缓存）。
     var pc = previewCache[a.id];
-    var usageBox = pc ? previewUsageHtml(pc) : '';
-    var goBox = pc && pc.go ? previewGoBox(pc.go) : '';
     var keys = a.keys && a.keys.length
       ? a.keys.map(function (k) { return keyRow(k, a.id); }).join('')
       : '<div class="key-row"><span class="w">' + T('noKeys') + '</span></div>';
     // legacy keys 摘要行（render 重建时从缓存读；数据后到时由 fillPreviewLegacy 补插）。
-    var legacyRow = pc ? legacyPreviewRow(pc.legacy) : '';
+    var legacyRow = pc ? legacyPreviewRow(pc.legacy, a.id) : '';
     var ops = '<span class="ops">' +
       '<button class="oc-btn oc-btn-sm ops-btn dd-toggle" data-action="menu" data-id="' + a.id + '">⋮</button>' +
       '<div class="dd-menu" id="ops-menu-' + a.id + '" hidden>' +
@@ -2963,24 +3923,42 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     var unprobed = a.status === 'unknown'
       ? '<div class="meta">' + T('stUnknownHint') + '</div>'
       : '';
-    return '<div class="card" data-id="' + a.id + '">' +
+    // 收起/展开（localStorage fc-collapsed 记忆，刷新后保持）：收起时隐藏
+    // 余额/用量/Go/keys 等次要信息，只留名称/状态/操作一行。
+    var collapsed = loadCollapsed()[a.id] === true;
+    var toggleBtn = '<button class="oc-btn oc-btn-sm card-toggle" data-action="toggle-card" data-id="' + a.id +
+      '" title="' + (collapsed ? T('expand') : T('collapse')) + '"></button>';
+    // 卡片头「在飞」徽章（收起状态也能看到 key 是否在被请求）：池 key 的
+    // inFlight 合计，无在飞隐藏。值由 tick 里的 updateInflightBadges 就地刷新
+    // （renderFingerprint 排除 inFlight，活跃流量下重建列表会清掉编辑表单）。
+    var inflightN = 0;
+    if (a.keys) for (var ik = 0; ik < a.keys.length; ik++) inflightN += (Number(a.keys[ik].inFlight) || 0);
+    var inflight = '<span class="card-inflight" title="' + esc(T('inflightTitle')) + '"' +
+      (inflightN > 0 ? '' : ' hidden') + '>' + esc(T('inFlight')) + ' ' + inflightN + '</span>';
+    return '<div class="card" data-id="' + a.id + '" data-collapsed="' + (collapsed ? '1' : '0') + '">' +
       '<div class="card-hd">' +
         '<span class="name" title="' + esc(a.name) + '">' + esc(a.name) + '</span>' +
         '<span class="oc-chip">' + kindText(a.kind) + '</span>' +
         '<span class="oc-chip st-' + esc(a.status) + '">' + statusText(a.status) + '</span>' +
+        (a.duplicateKey
+          ? '<span class="oc-chip oc-chip-danger" title="' + esc(T('dupKeyHint')) + '">' + T('dupKeyBadge') + (a.duplicateKeyWith ? ' · ' + esc(a.duplicateKeyWith) : '') + '</span>'
+          : '') +
         retry +
+        inflight +
         ops +
+        toggleBtn +
       '</div>' +
-      // 数据区：容器 B（余额）+ 容器 C（用量摘要）+ 容器 D（Go 三窗口）并列。
-      '<div class="preview-cols">' + consoleBlock + usageBox + goBox + '</div>' +
+      '<div class="card-bd">' +
+      '<div class="card-main">' +
+      // 编辑表单（inline edit）
       '<div class="edit" id="edit-' + a.id + '" hidden>' +
-        '<div class="oc-field"><label>' + T('name') + '</label><input class="oc-input" id="e-name-' + a.id + '" value="' + esc(a.name) + '" autocomplete="off"></div>' +
-        '<div class="oc-field"><label>' + T('kind') + '</label><select class="oc-select" id="e-kind-' + a.id + '">' +
-          '<option value="subscription">subscription</option>' +
-          '<option value="payg">payg</option>' +
-          '<option value="unknown">unknown</option>' +
+        '<div class="oc-field"><label for="e-name-' + a.id + '">' + T('name') + '</label><input class="oc-input" id="e-name-' + a.id + '" value="' + esc(a.name) + '" autocomplete="off"></div>' +
+        '<div class="oc-field"><label for="e-kind-' + a.id + '">' + T('kind') + '</label><select class="oc-select" id="e-kind-' + a.id + '">' +
+          '<option value="subscription">' + T('kindSubscription') + '</option>' +
+          '<option value="payg">' + T('kindPayg') + '</option>' +
+          '<option value="unknown">' + T('kindUnknown') + '</option>' +
         '</select></div>' +
-        '<div class="oc-field oc-full"><label>' + T('cookieLabel') + '</label><input class="oc-input" id="e-cookie-' + a.id + '" type="password" placeholder="' + T('cookieKeep') + '" autocomplete="off"></div>' +
+        '<div class="oc-field oc-full"><label for="e-cookie-' + a.id + '">' + T('cookieLabel') + '</label><input class="oc-input" id="e-cookie-' + a.id + '" type="password" placeholder="' + T('cookieKeep') + '" autocomplete="off"></div>' +
         '<div class="oc-field oc-full"><label class="oc-check"><input type="checkbox" id="e-clearcookie-' + a.id + '"><span class="oc-check-box"></span><span class="oc-check-label">' + T('cookieClearCheckbox') + '</span></label></div>' +
         '<div class="oc-hint-err oc-full" id="e-err-' + a.id + '"></div>' +
         '<button class="oc-btn oc-btn-primary" data-action="save" data-id="' + a.id + '">' + T('save') + '</button>' +
@@ -2994,13 +3972,18 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       '</div>' +
       unprobed +
       '<div class="keys">' +
-        '<div class="keys-hd">' + T('keysTitle') + '</div>' +
+        '<div class="keys-hd">' + T('keysTitle') +
+          ' <button class="oc-btn oc-btn-ghost oc-btn-sm oc-tooltip" data-action="goto-tokens" data-id="' + a.id + '" data-tip="' + esc(T('keyQuotaGuide')) + '">' + T('gotoKeys') + '</button>' +
+        '</div>' +
         keys +
         legacyRow +
         '<div class="key-add">' +
-          '<input class="oc-input oc-grow" id="keyin-' + a.id + '" placeholder="sk-..." autocomplete="off">' +
+          '<input class="oc-input oc-grow" id="keyin-' + a.id + '" placeholder="sk-..." autocomplete="off" aria-label="' + T('addKey') + '">' +
           '<button class="oc-btn" data-action="addkey" data-id="' + a.id + '">' + T('addKey') + '</button>' +
         '</div>' +
+      '</div>' +
+      '</div>' +
+      cardStatsHtml(a, pc) +
       '</div>' +
       '</div>';
   }
@@ -3010,85 +3993,80 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // 拉一次，之后 60s 内复用缓存（render 指纹变化重建 DOM 也不重拉）。
   var PREVIEW_TTL = 60 * 1000;
   var previewCache = {};
-  /** 预览容器 C（用量摘要）：请求数/输出 tokens/成本 三小格。无 summary 返回 ''（隐藏）。 */
-  function previewUsageBox(u) {
-    if (!u || !u.summary) return '';
-    var s = u.summary;
-    var req = s.totalRequests != null ? fmt(s.totalRequests) : '—';
-    var out = s.totalOutputTokens != null ? fmt(s.totalOutputTokens) : '—';
-    var cost = s.totalCostMicroCents != null ? money(s.totalCostMicroCents) : '—';
-    return '<div class="preview-box preview-usage">' +
-      '<div class="p-title">' + T('previewUsage') + '</div>' +
-      '<div class="preview-grid">' +
-        '<div class="p-cell"><div class="p-k">' + T('requests') + '</div><div class="p-v">' + req + '</div></div>' +
-        '<div class="p-cell"><div class="p-k">' + T('outputTokens') + '</div><div class="p-v">' + out + '</div></div>' +
-        '<div class="p-cell"><div class="p-k">' + T('cost') + '</div><div class="p-v">' + cost + '</div></div>' +
-      '</div>' +
-      '</div>';
+  /** 卡片右侧压缩额度栏：余额 / 用量 / Go 三行紧凑小字（替代旧的三大盒竖排）。
+   *  数据源 = a.balance（billing）+ previewCache（用量/Go 60s 缓存）。
+   *  - 余额：$ 值，取自 billing 同步。
+   *  - 用量：网关实际用量优先（gw），回落 org 用量 summary 的输出 tokens。
+   *  - Go：周/月两窗口百分比（滚动窗口与周窗口信息重叠，右侧压缩只留周/月）；
+   *    窗口用尽（usagePercent>=100 或 status 命中限流）标红。
+   *  无控制台数据时给「等待同步 / 状态异常」提示；env 代理账号（hasConsole=false）
+   *  纯 key 池，不渲染提示。 */
+  function cardStatsHtml(a, pc) {
+    var rows = [];
+    if (a.balance != null) {
+      rows.push('<div class="st-row"><span class="st-k">' + T('balanceOrg') + '</span>' +
+        '<span class="st-v">$' + Number(a.balance).toFixed(2) + '</span></div>');
+    }
+    var tok = null;
+    if (pc && pc.gw && (pc.gw.inputTokens != null || pc.gw.outputTokens != null)) {
+      tok = fmt((Number(pc.gw.inputTokens) || 0) + (Number(pc.gw.outputTokens) || 0));
+    } else if (pc && pc.usage && pc.usage.summary && pc.usage.summary.totalOutputTokens != null) {
+      tok = fmt(pc.usage.summary.totalOutputTokens);
+    }
+    if (tok != null) {
+      rows.push('<div class="st-row"><span class="st-k">' + T('previewUsage') + '</span>' +
+        '<span class="st-v">' + tok + ' tok</span></div>');
+    }
+    if (pc && pc.go && pc.go.go) {
+      var g = pc.go.go;
+      var goLine = [];
+      var goPush = function (label, w) {
+        if (!w || typeof w.usagePercent !== 'number') return;
+        goLine.push('<span class="' + (isGoWindowExhausted(w) ? 's-bad' : '') + '">' +
+          label + ' ' + Math.round(w.usagePercent) + '%</span>');
+      };
+      goPush(T('goWeekly'), g.weekly);
+      goPush(T('goMonthly'), g.monthly);
+      if (goLine.length) {
+        rows.push('<div class="st-row"><span class="st-k">' + T('previewGo') + '</span>' +
+          '<span class="st-v">' + goLine.join(' · ') + '</span></div>');
+      }
+    }
+    // 无控制台数据：区分「有凭据等同步」vs「状态异常」；env 代理账号无提示。
+    if (a.balance == null && a.monthlyLimit == null && a.monthlyUsage == null && a.hasConsole) {
+      var noteTxt = (a.status === 'error' || a.status === 'invalid')
+        ? esc(friendlyQuota(a.statusDetail) || a.statusDetail || T('stError'))
+        : T('waitingSync');
+      rows.push('<div class="st-row"><span class="st-v s-bad">' + noteTxt + '</span></div>');
+    }
+    if (!rows.length) return '';
+    return '<div class="card-stats">' + rows.join('') + '</div>';
   }
-  /** 预览容器 C'（网关实际代理用量）：请求数/输入+输出 tokens/成本 三小格。
-   *  数据来自 requests 表按账号 legacy keys 指纹归属的聚合（usage-gateway 端点），
-   *  有值（含 0）时优先于 org 用量（usage summary）显示。 */
-  function previewGwBox(g) {
-    if (!g) return '';
-    var req = g.requests != null ? fmt(g.requests) : '—';
-    var tok = (g.inputTokens != null || g.outputTokens != null)
-      ? fmt((Number(g.inputTokens) || 0) + (Number(g.outputTokens) || 0))
-      : '—';
-    var cost = g.costMicroCents != null ? money(g.costMicroCents) : '—';
-    // scope 标注：pool = 网关总用量（env 池）；legacy = 该 workspace 的 key 用量
-    // （outlook/gmail 共享同一旧版 workspace——用量是 workspace 级）。
-    var title = g.scope === 'pool' ? T('previewGwPoolTitle') : T('previewGwTitle');
-    return '<div class="preview-box preview-usage">' +
-      '<div class="p-title">' + title + '</div>' +
-      '<div class="preview-grid">' +
-        '<div class="p-cell"><div class="p-k">' + T('requests') + '</div><div class="p-v">' + req + '</div></div>' +
-        '<div class="p-cell"><div class="p-k">' + T('tokens') + '</div><div class="p-v">' + tok + '</div></div>' +
-        '<div class="p-cell"><div class="p-k">' + T('cost') + '</div><div class="p-v">' + cost + '</div></div>' +
-      '</div>' +
-      '</div>';
+  /** Go 窗口是否用量已用尽：usagePercent>=100，或 status 命中限流/耗尽标记。 */
+  function isGoWindowExhausted(w) {
+    if (!w || typeof w !== 'object') return false;
+    if (typeof w.usagePercent === 'number' && w.usagePercent >= 100) return true;
+    if (typeof w.status === 'string') {
+      return /rate-?limit|limit_reached|exhausted/i.test(w.status);
+    }
+    return false;
   }
-  /** 容器 C 的最终选择：网关实际用量优先，没有则回落 org 用量（现状）。
-   *  两个数据源可能先后到达，都走这个出口才能保证回填结果一致。 */
-  function previewUsageHtml(c) {
-    return c.gw ? previewGwBox(c.gw) : previewUsageBox(c.usage);
-  }
-  /** 预览容器 D（Go 三窗口）：迷你进度条。未订阅（窗口全 null）返回 ''（隐藏）。 */
-  function previewGoBox(g) {
-    if (!g || !g.go) return '';
-    var go = g.go;
-    var row = function (label, w) {
-      if (!w || typeof w.usagePercent !== 'number') return '';
-      var pct = Math.max(0, Math.min(100, w.usagePercent));
-      var pctTxt = pct.toFixed(0) + '%';
-      return '<div class="p-go-row">' +
-        '<span class="p-go-l">' + label + '</span>' +
-        '<span class="p-go-bar"><span class="p-go-fill" style="width:' + pctTxt + '"></span></span>' +
-        '<span class="p-go-pct">' + pctTxt + '</span>' +
-        '</div>';
-    };
-    var rows = row(T('goRolling'), go.rolling) + row(T('goWeekly'), go.weekly) + row(T('goMonthly'), go.monthly);
-    if (!rows) return '';
-    return '<div class="preview-box preview-go">' +
-      '<div class="p-title">' + T('previewGo') + '</div>' + rows +
-      '</div>';
-  }
-  /** 拉取并回填单账号的用量摘要（容器 C）。失败/404 → 保持 null → 容器隐藏。 */
+  /** 拉取并回填单账号的用量摘要（右侧压缩栏）。失败/404 → 保持 null → 行隐藏。 */
   function fetchPreviewUsage(id) {
     api('GET', '/__admin/api/console/account/' + id + '/usage?range=7d', null).then(function (r) {
       var c = previewCache[id];
       if (!c) return;
       if (r.ok && r.json && r.json.ok !== false && r.json.data && r.json.data.summary) c.usage = r.json.data;
-      fillPreviewBox(id, 'usage', previewUsageHtml(c));
+      fillCardStats(id);
     }).catch(function () {});
   }
-  /** 拉取并回填单账号的网关实际代理用量（容器 C'，优先级高于 org 用量）。失败 → 回落 org。 */
+  /** 拉取并回填单账号的网关实际代理用量（优先级高于 org 用量）。失败 → 回落 org。 */
   function fetchPreviewGateway(id) {
     api('GET', '/__admin/api/accounts/' + id + '/usage-gateway?rangeDays=7', null).then(function (r) {
       var c = previewCache[id];
       if (!c) return;
       if (r.ok && r.json && r.json.ok !== false && r.json.data) c.gw = r.json.data;
-      fillPreviewBox(id, 'usage', previewUsageHtml(c));
+      fillCardStats(id);
     }).catch(function () {});
   }
   /** 拉取并回填单账号的 legacy keys 摘要（卡片 key 区显示数量 + 首个名字）。404 = 非 legacy workspace，静默。 */
@@ -3102,22 +4080,27 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       }
     }).catch(function () {});
   }
-  /** legacy keys 摘要行的 HTML：N 个 legacy key + 首个名字（无 legacy 返回 ''）。
-   *  accountCard（render 重建时读缓存）与 fillPreviewLegacy（数据后到时补插）共用。 */
-  function legacyPreviewRow(keys) {
+  /** legacy keys 摘要行的 HTML：逐 key 一行（名字 + 掩码 + 复制按钮），无 legacy 返回 ''。
+   *  accountCard（render 重建时读缓存）与 fillPreviewLegacy（数据后到时补插）共用。
+   *  accountId 用于复制按钮（列表页没有 detailState.id，必须带账户归属）。 */
+  function legacyPreviewRow(keys, accountId) {
     if (!keys || !keys.length) return '';
-    var names = [];
+    var rows = [];
     for (var i = 0; i < keys.length; i++) {
-      if (keys[i] && keys[i].name) names.push(keys[i].name);
+      var k = keys[i];
+      if (!k || !k.id) continue;
+      var name = k.name ? esc(k.name) : '—';
+      var masked = k.masked ? '<span class="w">' + esc(k.masked) + '</span>' : '';
+      rows.push('<div class="key-row legacy-row" title="' + T('legacyHint') + '">' +
+        '<span class="fp cut">' + name + '</span>' + masked +
+        '<button class="oc-btn oc-btn-ghost oc-btn-sm" data-action="copy-legacy-key" data-accountid="' + accountId + '" data-keyid="' + esc(k.id) + '" title="' + T('legacyKeyCopyTitle') + '">' + T('tokenCopy') + '</button>' +
+        '</div>');
     }
-    return '<div class="key-row legacy-row" title="' + T('legacyHint') + '">' +
-      '<span class="w">' + T('legacyCount') + ' ' + keys.length + '</span>' +
-      (names.length ? '<span class="fp cut">' + esc(names[0]) + '</span>' : '') +
-      '</div>';
+    return rows.join('');
   }
   /** 数据后到时补插 legacy 摘要行（防重：已有 .legacy-row 就不再插）。 */
   function fillPreviewLegacy(id, keys) {
-    var html = legacyPreviewRow(keys);
+    var html = legacyPreviewRow(keys, id);
     if (!html) return;
     var card = document.querySelector('.card[data-id="' + id + '"]');
     if (!card) return;
@@ -3126,13 +4109,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (!add) return;
     add.insertAdjacentHTML('beforebegin', html);
   }
-  /** 拉取并回填单账号的 Go 三窗口（容器 D）。失败 → 保持 null → 容器隐藏。 */
+  /** 拉取并回填单账号的 Go 三窗口（右侧压缩栏）。失败 → 保持 null → 行隐藏。 */
   function fetchPreviewGo(id) {
     api('GET', '/__admin/api/legacy/account/' + id + '/go', null).then(function (r) {
       var c = previewCache[id];
       if (!c) return;
       if (r.ok && r.json && r.json.ok !== false && r.json.data && r.json.data.go) c.go = r.json.data;
-      fillPreviewBox(id, 'go', previewGoBox(c.go));
+      fillCardStats(id);
     }).catch(function () {});
   }
   /** 列表渲染后调用：只为缓存缺失/过期的账号发请求（TTL 防 tick 重复拉）。 */
@@ -3156,16 +4139,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       }
     }
   }
-  /** 数据到达后回填卡片 DOM（无壳时插入容器；空 html = 失败 → 不动作）。 */
-  function fillPreviewBox(id, cls, html) {
-    if (!html) return;
+  /** 数据到达后回填卡片右侧压缩栏（重建 .card-stats；空 html = 失败 → 不动作）。 */
+  function fillCardStats(id) {
     var card = document.querySelector('.card[data-id="' + id + '"]');
     if (!card) return;
-    var box = card.querySelector('.preview-' + cls);
-    if (box) { box.outerHTML = html; return; }
-    var cols = card.querySelector('.preview-cols');
-    if (!cols) return;
-    cols.insertAdjacentHTML('beforeend', html);
+    var a = findAccount(id);
+    if (!a) return;
+    var box = card.querySelector('.card-stats');
+    if (!box) return;
+    box.outerHTML = cardStatsHtml(a, previewCache[id]);
   }
 
   /** 健康度列表的单行（总览 tab）。 */
@@ -3197,6 +4179,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       return [a.id, a.name, a.kind, a.status, a.statusDetail, a.retryUntil, a.balance,
         a.monthlyLimit, a.monthlyUsage, a.lastProbeAt, a.lastBillingAt,
         JSON.stringify(a.allowedModels || null), JSON.stringify(a.blockedModels || null),
+        a.duplicateKey ? (a.duplicateKeyWith || '') : '',
         JSON.stringify((a.keys || []).map(function (k) {
           return [k.fingerprint, k.healthy, k.disabledReason, k.nickname];
         }))].join(':');
@@ -3263,6 +4246,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     el.innerHTML = list.map(accountCard).join('');
     // 列表渲染后拉一次预览数据（用量/Go）；TTL 内重复调用是 no-op。
     loadPreviewData(list);
+    // 数字输入 spinner：渲染函数末尾重挂（tick 重建 DOM 后新 input 重新包裹）。
+    mountNumSpinners(el);
   }
 
   function tick(manual) {
@@ -3275,6 +4260,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         // 独立于 render：数据不变 render 跳过时，预览失败缓存（60s TTL）仍能
         // 在过期后重试——否则「首次加载失败 → 容器永远不出现」（审查）。
         loadPreviewData(d.list);
+        // 在飞徽章走独立就地更新（renderFingerprint 排除 inFlight，不重建列表）。
+        updateInflightBadges();
       })
       .catch(function (e) {
         // 未登录（401）：停止 2s 轮询 —— 否则一直开着的未登录面板页每 2s
@@ -3290,6 +4277,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       });
     fetchUsage();
     fetchOverviewTrend();
+    // 总览性能仪表盘（跟随同一 2s tick；区块隐藏时 fetchPerf 内部早退，不发请求）。
+    fetchPerf();
     // 用量 tab 三张表（requests/ipstats/audit）渲染全是 usage 视图内容——非 usage
     // 视图每 2s 白打 3 个请求；切到 usage 后下个 tick 自然补拉（2s 延迟可接受）。
     if (curView === 'usage') {
@@ -3328,6 +4317,21 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       } else {
         nodes[i].textContent = T('retryIn') + ' ' + hms(left);
       }
+    }
+  }
+
+  /** 就地刷新卡片头「在飞」徽章（不重建列表）。renderFingerprint 排除 inFlight，
+   *  活跃流量下 2s 轮询不会因它重建 DOM，徽章必须走这条独立更新路径。 */
+  function updateInflightBadges() {
+    var list = state.list || [];
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i], n = 0;
+      if (a.keys) for (var ik = 0; ik < a.keys.length; ik++) n += (Number(a.keys[ik].inFlight) || 0);
+      var badge = document.querySelector('.card[data-id="' + a.id + '"] .card-inflight');
+      if (!badge) continue;
+      badge.hidden = n <= 0;
+      badge.textContent = T('inFlight') + ' ' + n;
+      badge.setAttribute('data-inflight', String(n));
     }
   }
 
@@ -3425,6 +4429,52 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       });
   }
 
+  /** key 用量弹层：GET /__admin/api/keys/usage（服务端已实现的聚合端点，
+   *  契约 {ok, data:{rangeDays, sinceMs, keys:[{fingerprint, accountId,
+   *  accountName, nickname, healthy, requests, tokens, costMicroCents, lastAt}]}}）。
+   *  按 accountId + fingerprint 双条件匹配（防末 4 位指纹跨账号误中）。cost 单位
+   *  microCents 用 money() 换算美元。找不到 → 「暂无用量」占位而不是报错。
+   *  弹层内附「创建配额分发密钥」引导（用户需求：key 详情丰富）。 */
+  function keyUsage(id, fp) {
+    api('GET', '/__admin/api/keys/usage?rangeDays=7', null).then(function (r) {
+      var hit = null;
+      if (r.ok && r.json && r.json.data && Array.isArray(r.json.data.keys)) {
+        for (var i = 0; i < r.json.data.keys.length; i++) {
+          var k = r.json.data.keys[i];
+          if (k.fingerprint === fp && (k.accountId == null || k.accountId === id)) { hit = k; break; }
+        }
+      }
+      var row = function (label, v) {
+        return '<div class="key-row"><span class="fp">' + label + '</span><span class="k-meta">' + v + '</span></div>';
+      };
+      var rows = hit
+        ? row(T('requests'), hit.requests != null ? fmt(hit.requests) : '—') +
+          row(T('tokens'), hit.tokens != null ? fmt(hit.tokens) : '—') +
+          row(T('cost'), hit.costMicroCents != null ? money(hit.costMicroCents) : '—') +
+          (hit.lastAt ? row(T('ipLast'), hhmmss(hit.lastAt)) : '')
+        : '<div class="oc-hint">' + T('keyUsageNoData') + '</div>';
+      openConfirm({
+        title: T('keyUsageTitle') + ' ' + esc(fp),
+        okText: T('tokenClose'),
+        body: '<div class="keys">' + rows + '</div>' +
+          '<div class="oc-hint">' + T('keyQuotaGuide') + '</div>',
+        run: function () { closeConfirm(); }
+      });
+    }).catch(function () {
+      flash(T('opFail'), true);
+    });
+  }
+  /** 手动启停上游 key（服务端已实现的端点）：POST /keys/:fp/disable（禁用）
+   *  | /keys/:fp/reset（恢复）。指纹取掩码形态（****XXXX，服务端按此校验）。
+   *  成功 flash + tick 刷新（列表/预览重建）；失败 flash 错误。 */
+  function toggleKeyState(id, fp, disable) {
+    api('POST', '/__admin/api/keys/' + encodeURIComponent(fp) + (disable ? '/disable' : '/reset'), {})
+      .then(function (r) {
+        if (r.ok) { flash(disable ? T('keyDisabledMsg') : T('keyEnabledMsg')); tick(true); }
+        else flash(errMsg(r), true);
+      });
+  }
+
   /** 改 key 昵称：confirm 弹层内联输入框（留空 = 清除），PATCH keys/:fp。 */
   function renameKey(id, fp) {    var cur = '';
     var acc = findAccount(id);
@@ -3437,7 +4487,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     openConfirm({
       title: T('rename'),
       okText: T('save'),
-      body: '<div class="oc-form"><div class="oc-field oc-full"><label>' + T('nickname') + '</label>' +
+      body: '<div class="oc-form"><div class="oc-field oc-full"><label for="rk-nickname">' + T('nickname') + '</label>' +
         '<input class="oc-input" id="rk-nickname" maxlength="30" value="' + esc(cur) + '" autocomplete="off"></div>' +
         '<div class="oc-hint">' + T('renameHint') + '</div></div>',
       run: function () {
@@ -3510,7 +4560,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   };
   /** 每个 tab 的子导航：词条键 + 锚点 section id。 */
   var SUBS = {
-    overview: [['subOverview', 'sec-overview'], ['subStatus', 'sec-status'], ['subHealth', 'sec-health']],
+    overview: [['subOverview', 'sec-overview'], ['subPerf', 'sec-perf'], ['subStatus', 'sec-status'], ['subHealth', 'sec-health']],
     accounts: [['subAccounts', 'sec-accounts'], ['subCreate', 'sec-create'], ['subOauth', 'sec-oauth']],
     usage: [['subRequests', 'sec-usage-summary'], ['subKeys', 'sec-usage-keys'], ['subIps', 'sec-usage-ips'], ['subAudit', 'sec-usage-audit']],
     tokens: [['subTokens', 'sec-tokens']],
@@ -3582,7 +4632,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     saveViewState();
     focusSidebar();
     if (v === 'settings') { refreshModelMap(); loadSettings(false); loadOtaStatus(false); }  // 进设置页时拉映射表 + 热改配置 + OTA 状态
-    if (v === 'tokens') { loadTokens(false); }  // 进密钥页时拉列表（60s 缓存内不重拉）
+    if (v === 'tokens') { loadTokens(true); }  // 进密钥页强制拉列表（用量实时，60s 缓存仅限 tick 内）
     if (v === 'access') { loadModelAccess(); }  // 进 model access 页时拉配置（数据静态，无缓存）
     window.scrollTo(0, 0);
   }
@@ -3622,7 +4672,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       ? keys.map(function (k) {
           var meta = k.healthy
             ? T('healthy')
-            : esc(k.disabledReason || '') + (k.recoverInMs > 0 ? ' · ' + hms(k.recoverInMs) : '');
+            : esc(disabledText(k.disabledReason)) + (k.recoverInMs > 0 ? ' · ' + (k.disabledReason === 'manual' ? T('manualPermanent') : hms(k.recoverInMs)) : '');
           return '<div class="key-row">' +
             '<span class="oc-dot ' + (k.healthy ? 'ok' : 'bad') + '"></span>' +
             '<span class="fp">' + esc(k.fingerprint) + '</span>' +
@@ -3793,6 +4843,87 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (lastMetrics) renderOverviewMetrics(lastMetrics, lastTrend);
   }
 
+  // ── 总览性能仪表盘（/__admin/api/performance）──────────────────
+  // 跟随 2s tick 拉取；服务端 10s TTL 兜底。区块被设置页开关隐藏时 tick 不拉。
+  /** 卡片内部一行：label 在上，value 在下（value 已格式化好）。 */
+  function perfCol(label, value) {
+    return '<div class="perf-col"><div class="n">' + value + '</div><div class="l">' + label + '</div></div>';
+  }
+  /** 主题化 meter 条（0-100，可带 warn/danger 语义色）。 */
+  function perfBar(pct, cls) {
+    return '<div class="perf-meter"><div class="perf-meter-bg"><div class="perf-meter-fill' +
+      (cls ? ' ' + cls : '') + '" style="width:' + pct + '%"></div></div></div>';
+  }
+  function renderPerf(d) {
+    var el = $('perf');
+    if (!el) return;
+    var proc = d.process || {}, osd = d.os || {}, gw = d.gateway || {};
+    var lat = d.latency || {}, pool = gw.pool || {};
+    // RSS 条：相对 256M 上限（与服务端 PERF_RSS_CAP_BYTES 同基准）。
+    var rssMb = (Number(proc.rss) || 0) / 1048576;
+    var rssCap = 256;
+    var rssPct = Math.min(100, rssMb / rssCap * 100);
+    var cpu = Number(proc.cpuPercent) || 0;
+    var up = Number(proc.uptime) || 0;
+    var inflight = Number(gw.concurrentInFlight) || 0;
+    var maxc = Math.max(1, Number(gw.maxConcurrent) || 1);
+    var concPct = Math.min(100, inflight / maxc * 100);
+    var load = Array.isArray(osd.loadAvg) ? osd.loadAvg.map(Number) : [0, 0, 0];
+    var okp = Number(pool.healthy) || 0, totp = Number(pool.total) || 0;
+    var dots = [];
+    for (var i = 0; i < totp; i++) {
+      dots.push('<span class="perf-dot' + (i < okp ? ' ok' : ' bad') + '"></span>');
+    }
+    var st = $('perf-status');
+    if (st) {
+      st.textContent = lat.available
+        ? T('perfLatency') + ' · 5m · ' + fmt(lat.count) + ' ' + T('requests')
+        : '—';
+    }
+    el.innerHTML =
+      '<div class="perf-card"><div class="pc-l">' + T('perfRss') + '</div>' +
+        '<div class="pc-v">' + rssMb.toFixed(1) + '<small> MB / ' + rssCap + '</small></div>' +
+        perfBar(rssPct, rssPct >= 85 ? 'danger' : (rssPct >= 60 ? 'warn' : '')) + '</div>' +
+      '<div class="perf-card"><div class="pc-l">' + T('perfCpu') + '</div>' +
+        '<div class="pc-v">' + cpu.toFixed(1) + '%<small> ' + T('perfUptime') + ' ' + hms(up * 1000) + '</small></div>' +
+        perfBar(cpu, cpu >= 70 ? 'danger' : (cpu >= 40 ? 'warn' : '')) + '</div>' +
+      '<div class="perf-card"><div class="pc-l">' + T('perfLoad') + '</div>' +
+        '<div class="perf-cols">' + perfCol('1m', load[0].toFixed(2)) + perfCol('5m', load[1].toFixed(2)) + perfCol('15m', load[2].toFixed(2)) + '</div></div>' +
+      '<div class="perf-card"><div class="pc-l">' + T('perfConcurrent') + '</div>' +
+        '<div class="pc-v">' + inflight + '<small> / ' + maxc + '</small></div>' +
+        perfBar(concPct, concPct >= 80 ? 'danger' : (concPct >= 50 ? 'warn' : '')) + '</div>' +
+      '<div class="perf-card"><div class="pc-l">' + T('perfLatency') + '</div>' +
+        '<div class="perf-cols">' + perfCol('p50', msFmt(lat.p50Ms)) + perfCol('p95', msFmt(lat.p95Ms)) + perfCol('p99', msFmt(lat.p99Ms)) + '</div>' +
+        '<div class="perf-col"><div class="l" style="margin-top:4px">max ' + msFmt(lat.maxMs) + '</div></div></div>' +
+      '<div class="perf-card"><div class="pc-l">' + T('perfPool') + '</div>' +
+        '<div class="pc-v">' + okp + '<small> / ' + totp + ' ' + T('healthy') + '</small></div>' +
+        '<div class="perf-dots">' + dots.join('') + '</div></div>';
+  }
+  function fetchPerf() {
+    if (!perfOn || curView !== 'overview') return;
+    fetch('/__admin/api/performance', { headers: { accept: 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error(String(r.status))); })
+      .then(function (d) {
+        if (d && d.data) renderPerf(d.data);
+        else { var st = $('perf-status'); if (st) st.textContent = '—'; }
+      })
+      .catch(function () { var st2 = $('perf-status'); if (st2) st2.textContent = '—'; });
+  }
+  /** 性能区块显隐 + 设置页开关状态 + 状态提示同步。 */
+  function applyPerfVisibility() {
+    var sec = $('sec-perf');
+    if (sec) sec.hidden = !perfOn;
+    var tg = $('perf-toggle');
+    if (tg) {
+      tg.setAttribute('data-on', perfOn ? '1' : '0');
+      tg.setAttribute('aria-checked', perfOn ? 'true' : 'false');
+      var sr = tg.querySelector('.oc-switch-sr');
+      if (sr) sr.textContent = T(perfOn ? 'expOn' : 'expOff');
+    }
+    var hint = $('perf-state-hint');
+    if (hint) hint.textContent = T(perfOn ? 'perfShow' : 'perfHide');
+  }
+
   // ── 分发密钥（/__admin/api/tokens）：列表 / 创建 / 编辑 / 禁用 / 删除 ──
   // 刷新节奏与 previewCache 同款：进入 tab 时拉一次，60s 内缓存复用（tokens
   // 列表是分钟级变化的数据，不值得跟 2s tick 每轮重拉）；手动「刷新」强制重拉。
@@ -3804,6 +4935,54 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       if (tokensCache.items[i].id === id) return tokensCache.items[i];
     }
     return null;
+  }
+  /** 配额显示解析（字段口径见 tokens.ts TokenQuotaView / QUOTA.md §1）：limit 0 = 无限
+   *  （∞）；有上限的维度显示「已用/上限」。usedUsd/quotaUsd 都是**美元**（B1 后视图
+   *  统一单位），直接 '$'+toFixed(2)，不再过 money()——money 吃 microCents，会把
+   *  已转好的美元压成 $0.00。exhausted/expired/remainingUsd 由服务端按校验口径算好
+   *  下发（tokens.ts computeQuotaStatus，与 quotaCheck 同源），前端不再手写
+   *  ×1e8 对齐或 used≥limit 推导（B1 复发面）。t.quota 由 list 端点附带（服务端
+   *  未就绪时缺字段按未设配额处理）。 */
+  function quotaParts(t) {
+    var qo = t.quota || {};
+    var qUsd = Number(qo.quotaUsd) || 0;
+    var qTok = Number(qo.quotaTokens) || 0;
+    var qReq = Number(qo.quotaRequests) || 0;
+    var qTpm = Number(qo.quotaTpm) || 0;
+    var uUsd = Number(qo.usedUsd) || 0;
+    var uTok = Number(qo.usedTokens) || 0;
+    var uReq = Number(qo.usedRequests) || 0;
+    var uTpm = Number(qo.usedTpm) || 0;
+    var inf = '<span class="w">∞</span>';
+    return {
+      parts: [
+        qUsd > 0 ? '$' + uUsd.toFixed(2) + '/' + '$' + qUsd.toFixed(2) : inf,
+        qTok > 0 ? fmt(uTok) + '/' + fmt(qTok) + ' tok' : inf,
+        qReq > 0 ? fmt(uReq) + '/' + fmt(qReq) + ' req' : inf,
+        qTpm > 0 ? fmt(uTpm) + '/' + fmt(qTpm) + ' tpm' : inf
+      ],
+      // 状态判定直接读服务端算好的 exhausted/expired（与 quotaCheck 校验口径一致，
+      // 跨周期窗口按 used=0 算，前端推导会误报）；remainingUsd 供徽章 tooltip。
+      exhausted: !!qo.exhausted,
+      expired: !!qo.expired,
+      remainingUsd: qo.remainingUsd == null ? null : Number(qo.remainingUsd),
+      any: qUsd > 0 || qTok > 0 || qReq > 0 || qTpm > 0
+    };
+  }
+  /** 配额状态徽章：正常（绿）/ 已耗尽（amber st-limit）/ 已过期（红 st-invalid）。
+   *  过期优先于耗尽；状态直接读服务端算好的 t.quota.expired/exhausted（tokens.ts
+   *  computeQuotaStatus，B1 复发面——不再前端从 expiresAt + used≥limit 推导）。
+   *  未设配额不显示徽章。 */
+  function quotaBadge(t, q) {
+    if (q.expired) return '<span class="oc-chip st-invalid">' + T('quotaBadgeExpired') + '</span>';
+    if (q.any && q.exhausted) {
+      var rem = q.remainingUsd == null ? '' : ' · ' + T('quotaRemaining') + q.remainingUsd.toFixed(2);
+      return '<span class="oc-chip st-limit" title="' + T('quotaBadgeExhausted') + rem + '">' + T('quotaBadgeExhausted') + '</span>';
+    }
+    // 正常（绿）：设了配额，或设了过期日但还没到（expired=false 已排除过期）。
+    // 有过期日的 token 即使没配额也显示 ok（保持旧行为），否则过期前无任何徽章。
+    if (q.any || (Number((t.quota || {}).expiresAt) || 0) > 0) return '<span class="oc-chip st-ok">' + T('quotaBadgeOk') + '</span>';
+    return '';
   }
   function tokenRow(t) {
     var u = t.usage || {};
@@ -3824,6 +5003,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         ' data-rpm-id="' + t.id + '" placeholder="0" title="' + T('tokenRpmHint') + '" autocomplete="off" aria-label="' + T('tokenRpm') + '">' +
       '<button class="oc-btn oc-btn-ghost oc-btn-sm t-rpm-save" data-action="set-rpm" data-id="' + t.id + '" title="' + T('tokenRpmHint') + '">' + T('save') + '</button>' +
       '</td>';
+    // 配额列：已用/上限（∞ = 不限）+ 状态徽章；未设配额显示中性占位。
+    var q = quotaParts(t);
+    var qb = quotaBadge(t, q);
+    var quota = '<td class="t-quota"><div>' +
+      (q.any ? q.parts.join(' · ') : '<span class="w">' + T('quotaNone') + '</span>') +
+      '</div>' + (qb ? '<div class="t-quota-badge">' + qb + '</div>' : '') + '</td>';
     return '<tr>' +
       '<td class="t-name">' + esc(t.name) + '</td>' +
       '<td>' + stBadge + '</td>' +
@@ -3831,6 +5016,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         ' <button class="oc-btn oc-btn-ghost oc-btn-sm" data-action="copy-token" data-id="' + t.id + '" title="' + T('tokenCopyTitle') + '">' + T('tokenCopy') + '</button>' +
       '</td>' +
       '<td>' + cost + ' · ' + req + ' · ' + tok + '</td>' +
+      quota +
       '<td class="t-hide">' + dateFmt(t.createdAt) + '</td>' +
       rpm +
       '<td>' + toggle +
@@ -3844,6 +5030,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function tokenFingerprint(items) {
     return (items || []).map(function (t) {
       return [t.id, t.name, t.status, t.mask, t.rpmLimit,
+        JSON.stringify(t.quota || null),
         t.usage ? [t.usage.costMicroCents, t.usage.requests, t.usage.inputTokens, t.usage.outputTokens].join(':') : '',
         JSON.stringify((t.keys || []).map(function (k) {
           return [k.fingerprint, k.healthy, k.nickname].join(':');
@@ -3860,6 +5047,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     lastTokenFp = fp;
     empty.hidden = items.length > 0;
     tb.innerHTML = items.map(tokenRow).join('');
+    // RPM 输入的自绘 spinner：重建后重挂（幂等，指纹不变时跳过无副作用）。
+    mountNumSpinners(tb);
     // RPM 列头 tooltip（静态 HTML 里拿不到 T()，渲染时补 title）。
     var th = document.querySelector('.t-rpm-hd');
     if (th) th.title = T('tokenRpmHint');
@@ -3889,11 +5078,11 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       title: T('tokensTitle'),
       okText: T('tokenCreate'),
       body: '<div class="oc-form">' +
-        '<div class="oc-field oc-full"><label>' + T('tokenName') + '</label>' +
+        '<div class="oc-field oc-full"><label for="tok-name">' + T('tokenName') + '</label>' +
           '<input class="oc-input" id="tok-name" autocomplete="off"></div>' +
-        '<div class="oc-field oc-full"><label>' + T('tokenCount') + '</label>' +
+        '<div class="oc-field oc-full"><label for="tok-count">' + T('tokenCount') + '</label>' +
           '<input class="oc-input" id="tok-count" type="number" min="1" max="10" step="1" value="1" autocomplete="off"></div>' +
-        '<div class="oc-field oc-full"><label>' + T('tokenCustomKey') + '</label>' +
+        '<div class="oc-field oc-full"><label for="tok-custom">' + T('tokenCustomKey') + '</label>' +
           '<input class="oc-input" id="tok-custom" placeholder="' + T('tokenCustomKeyPlaceholder') + '" autocomplete="off"></div>' +
         '</div>',
       run: function () {
@@ -3958,21 +5147,65 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function editToken(id) {
     var t = findToken(id);
     if (!t) return;
+    var qo = t.quota || {};
+    var cyc = [['none', 'quotaCycleNone'], ['daily', 'quotaCycleDaily'], ['monthly', 'quotaCycleMonthly']];
+    var cycOpts = cyc.map(function (c) {
+      return '<option value="' + c[0] + '"' + ((qo.cycle || 'none') === c[0] ? ' selected' : '') + '>' +
+        esc(T(c[1])) + '</option>';
+    }).join('');
+    var exp = Number(qo.expiresAt) || 0;
+    var expVal = '';
+    if (exp > 0) {
+      var ed = new Date(exp), ep = function (n) { return (n < 10 ? '0' : '') + n; };
+      expVal = ed.getFullYear() + '-' + ep(ed.getMonth() + 1) + '-' + ep(ed.getDate());
+    }
     openConfirm({
       title: T('tokenEditTitle'),
       okText: T('save'),
       body: '<div class="oc-form">' +
-        '<div class="oc-field oc-full"><label>' + T('tokenName') + '</label>' +
+        '<div class="oc-field oc-full"><label for="tok-edit-name">' + T('tokenName') + '</label>' +
           '<input class="oc-input" id="tok-edit-name" value="' + esc(t.name) + '" autocomplete="off"></div>' +
-        '<div class="oc-field oc-full"><label>' + T('tokenNote') + '</label>' +
+        '<div class="oc-field oc-full"><label for="tok-edit-note">' + T('tokenNote') + '</label>' +
           '<input class="oc-input" id="tok-edit-note" value="' + esc(t.note || '') + '" placeholder="' + T('tokenNotePlaceholder') + '" autocomplete="off"></div>' +
+        '<div class="oc-hint oc-full t-quota-sect" style="margin-top:6px">' + T('quota') + '</div>' +
+        '<div class="oc-field"><label for="tok-edit-qusd">' + T('quotaUsd') + '</label>' +
+          '<input class="oc-input" id="tok-edit-qusd" type="number" min="0" step="0.01" value="' + (Number(qo.quotaUsd) || 0) + '" autocomplete="off"></div>' +
+        '<div class="oc-field"><label for="tok-edit-qtok">' + T('quotaTokens') + '</label>' +
+          '<input class="oc-input" id="tok-edit-qtok" type="number" min="0" step="1" value="' + (Number(qo.quotaTokens) || 0) + '" autocomplete="off"></div>' +
+        '<div class="oc-field"><label for="tok-edit-qreq">' + T('quotaRequests') + '</label>' +
+          '<input class="oc-input" id="tok-edit-qreq" type="number" min="0" step="1" value="' + (Number(qo.quotaRequests) || 0) + '" autocomplete="off"></div>' +
+        '<div class="oc-field"><label for="tok-edit-cycle">' + T('quotaCycle') + '</label>' +
+          '<select class="oc-select" id="tok-edit-cycle">' + cycOpts + '</select></div>' +
+        '<div class="oc-field"><label for="tok-edit-expires">' + T('quotaExpires') + '</label>' +
+          '<input class="oc-input" id="tok-edit-expires" type="date" value="' + expVal + '" autocomplete="off"></div>' +
+        '<div class="oc-field"><label for="tok-edit-qpm">' + T('quotaTpm') + '</label>' +
+          '<input class="oc-input" id="tok-edit-qpm" type="number" min="0" step="1" value="' + (Number(qo.quotaTpm) || 0) + '" autocomplete="off"></div>' +
+        '<div class="oc-field"><label for="tok-edit-ip">' + T('ipWhitelist') + '</label>' +
+          '<input class="oc-input" id="tok-edit-ip" value="' + esc((qo.ipWhitelist || []).join(', ')) + '" placeholder="' + esc(T('ipWhitelistHint')) + '" autocomplete="off"></div>' +
+        '<div class="oc-field oc-full"><div class="oc-hint">' + T('quotaHint') + ' · ' + T('quotaExpiresHint') + ' · ' + T('ipWhitelistHint') + '</div></div>' +
         '</div>',
       run: function () {
         var name = $('tok-edit-name').value.trim();
         var note = $('tok-edit-note').value.trim();
         if (!name) { $('confirm-err').textContent = T('tokenNameRequired'); unlockConfirm(); return; }
-        api('PATCH', '/__admin/api/tokens/' + id, { name: name, note: note || null })
-          .then(function (r) { tokDone(r, T('tokenSaved')); });
+        var qUsdRaw = $('tok-edit-qusd').value.trim();
+        var qTokRaw = $('tok-edit-qtok').value.trim();
+        var qReqRaw = $('tok-edit-qreq').value.trim();
+        var qUsd = Number(qUsdRaw), qTok = Number(qTokRaw), qReq = Number(qReqRaw);
+        // $ 配额允许小数，token/请求/TPM 配额必须是非负整数；空 = 0 = 不限。
+        if (qUsdRaw !== '' && (!isFinite(qUsd) || qUsd < 0)) { $('confirm-err').textContent = T('quotaInvalid'); unlockConfirm(); return; }
+        if (qTokRaw !== '' && (!isFinite(qTok) || qTok < 0 || Math.floor(qTok) !== qTok)) { $('confirm-err').textContent = T('quotaInvalid'); unlockConfirm(); return; }
+        if (qReqRaw !== '' && (!isFinite(qReq) || qReq < 0 || Math.floor(qReq) !== qReq)) { $('confirm-err').textContent = T('quotaInvalid'); unlockConfirm(); return; }
+        var qpmRaw = $('tok-edit-qpm').value.trim();
+        var qpm = Number(qpmRaw);
+        if (qpmRaw !== '' && (!isFinite(qpm) || qpm < 0 || Math.floor(qpm) !== qpm)) { $('confirm-err').textContent = T('quotaInvalid'); unlockConfirm(); return; }
+        // IP 白名单：逗号分隔 → 去空白非空数组（空 = 不限）。
+        var ipList = ($('tok-edit-ip').value || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+        // 过期日期：留空 = 0 = 永久；有值按本地零点转时间戳。
+        var expRaw = $('tok-edit-expires').value;
+        var expTs = expRaw ? new Date(expRaw + 'T00:00:00').getTime() : 0;
+        api('PATCH', '/__admin/api/tokens/' + id, { name: name, note: note || null, quotaUsd: qUsdRaw === '' ? 0 : qUsd, quotaTokens: qTokRaw === '' ? 0 : qTok, quotaRequests: qReqRaw === '' ? 0 : qReq, quotaTpm: qpmRaw === '' ? 0 : qpm, ipWhitelist: ipList, cycle: $('tok-edit-cycle').value, expiresAt: expTs })
+          .then(function (r) { tokDone(r, T('quotaSaved')); });
       }
     });
   }
@@ -4016,6 +5249,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   var maSearch = '';
   var maFilter = '';
   var maEdit = null; // { type, subject, cur:[models] }（编辑 modal 内状态）
+  // 上游定价模型名（console models-pricing 加载时收集）——「添加模型」输入框的
+  // 自动补全候选。没加载过就只用手动输入（全局白名单已可扩展任意合法模型名）。
+  var maPricingModels = [];
   function maHas(list, m) { return list.indexOf(m) >= 0; }
   function maToggleSel(m) {
     if (maGlobalSel == null) maGlobalSel = (maData.global.models || []).slice();
@@ -4049,12 +5285,70 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     var g = maData.global;
     var core = g.core || [];
     var sel = maGlobalSel == null ? (g.models || []) : maGlobalSel;
-    $('ma-global-chips').innerHTML = core.map(function (m) {
-      var on = maHas(sel, m);
-      return '<button type="button" class="ma-chip' + (on ? ' on' : ' off') + '" data-model="' + esc(m) + '">' +
-        esc(m) + (on ? '<span class="ma-x">&times;</span>' : '') + '</button>';
-    }).join('');
+    // 渲染当前选中集（含添加的非默认模型）：chip 带 × 可移除；空集显示提示。
+    $('ma-global-chips').innerHTML = sel.length
+      ? sel.map(function (m) {
+          return '<button type="button" class="ma-chip on" data-model="' + esc(m) + '">' +
+            esc(m) + '<span class="ma-x">&times;</span></button>';
+        }).join('')
+      : '<span class="oc-hint">' + T('maGlobalEmpty') + '</span>';
     $('ma-global-hint').textContent = T('maGlobalFloor') + core.join(', ');
+    renderMaGlobalOptions();
+    renderMaAvail();
+  }
+  /** 「可选模型」网格：上游全部模型（maData.pricing，62 个）——已选高亮，未选点击添加；
+   *  支持搜索过滤。pricing 缺失（无账号/失败）时网格隐藏，回退 datalist 手动添加。 */
+  var maAvailQuery = '';
+  function renderMaAvail() {
+    var grid = $('ma-avail-grid');
+    if (!grid) return;
+    var pricing = (maData && maData.pricing) || [];
+    if (!pricing.length) { grid.innerHTML = ''; return; }
+    var sel = maGlobalSel == null ? (maData.global.models || []) : maGlobalSel;
+    var q = maAvailQuery.toLowerCase();
+    var chips = pricing
+      .filter(function (m) { return !q || m.toLowerCase().indexOf(q) >= 0; })
+      .map(function (m) {
+        var on = sel.indexOf(m) >= 0;
+        return '<button type="button" class="ma-chip' + (on ? ' on' : '') + '" data-model="' + esc(m) + '">' +
+          esc(m) + (on ? '<span class="ma-x">&times;</span>' : '') + '</button>';
+      })
+      .join('');
+    grid.innerHTML = chips || '<span class="oc-hint">' + esc(T('maNoMatch')) + '</span>';
+    var s = $('ma-avail-search');
+    if (s && s.value !== maAvailQuery) s.value = maAvailQuery;
+  }
+  /** 「添加模型」输入框的自动补全候选：pricing 模型（若已加载）+ 服务端可选项 + 当前选中。 */
+  function renderMaGlobalOptions() {
+    var dl = $('ma-global-options');
+    if (!dl) return;
+    var seen = {};
+    var out = [];
+    function push(m) { if (m && !seen[m]) { seen[m] = 1; out.push(m); } }
+    for (var i = 0; i < maPricingModels.length; i++) push(maPricingModels[i]);
+    var base = maData.models || [];
+    for (var j = 0; j < base.length; j++) push(base[j]);
+    var sel = maGlobalSel == null ? (maData.global.models || []) : maGlobalSel;
+    for (var k = 0; k < sel.length; k++) push(sel[k]);
+    dl.innerHTML = out.sort().map(function (m) { return '<option value="' + esc(m) + '"></option>'; }).join('');
+  }
+  /** 添加模型：逗号分隔输入，逐个过与 settings 同款校验（/^[a-z0-9._-]+$/ ≤100），
+   *  合法才进 maGlobalSel（保存时 PUT 全局白名单）。非法项 flash 提示。 */
+  function addMaGlobalModels() {
+    var input = $('ma-global-add');
+    if (!input) return;
+    var raw = (input.value || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    if (!raw.length) return;
+    if (maGlobalSel == null) maGlobalSel = (maData.global.models || []).slice();
+    var bad = [];
+    for (var i = 0; i < raw.length; i++) {
+      var m = raw[i];
+      if (m.length > 100 || !/^[a-z0-9._-]+$/.test(m)) { bad.push(m); continue; }
+      if (!maHas(maGlobalSel, m)) maGlobalSel.push(m);
+    }
+    input.value = '';
+    renderMaGlobal();
+    if (bad.length) flash(T('maAddInvalid') + bad.join(', '), true);
   }
   function maUpstreamLabel(k) {
     return esc(k.fingerprint) + (k.accountName ? ' <span class="w">· ' + esc(k.accountName) + '</span>' : '');
@@ -4120,10 +5414,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function renderMaEditChips() {
     if (!maEdit) return;
     var all = maData.models || [];
-    var core = maData.global.core || [];
+    var glob = maData.global.models || [];
     $('ma-edit-chips').innerHTML = all.map(function (m) {
       var on = maHas(maEdit.cur, m);
-      var grantable = maHas(core, m);
+      var grantable = maHas(glob, m);
       return '<button type="button" class="ma-chip' + (on ? ' on' : ' off') + (grantable ? '' : ' dis') + '"' +
         ' data-ma-opt="' + esc(m) + '"' + (grantable ? '' : ' disabled') + '>' +
         esc(m) + (on ? '<span class="ma-x">&times;</span>' : '') + '</button>';
@@ -4175,7 +5469,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
         e.client ? '<span>' + esc(e.client) + '</span>' : '',
         e.model ? '<span>' + esc(e.model) + '</span>' : '',
         e.endpoint && e.endpoint !== '-' ? '<span>' + esc(e.endpoint) + '</span>' : '',
-        e.fingerprint ? '<span>key ' + esc(e.fingerprint) + '</span>' : '',
+        e.fingerprint ? '<span>' + T('reqKey') + ' ' + esc(e.fingerprint) + '</span>' : '',
         e.ua ? '<span class="cut">' + esc(e.ua) + '</span>' : '',
         e.error ? '<span class="s-bad">' + esc(e.error) + '</span>' : ''
       ].filter(Boolean).join('');
@@ -4375,11 +5669,11 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       title: T('mmEditTitle'),
       okText: T('save'),
       body: '<div class="oc-form">' +
-        '<div class="oc-field oc-full"><label>' + T('modelAlias') + '</label>' +
+        '<div class="oc-field oc-full"><label for="mm-edit-alias">' + T('modelAlias') + '</label>' +
           '<input class="oc-input" id="mm-edit-alias" value="' + esc(alias) + '" disabled></div>' +
-        '<div class="oc-field oc-full"><label>' + T('modelTarget') + '</label>' +
+        '<div class="oc-field oc-full"><label for="mm-edit-target">' + T('modelTarget') + '</label>' +
           '<input class="oc-input" id="mm-edit-target" list="mm-targets" value="' + esc(cur.target) + '" autocomplete="off" spellcheck="false"></div>' +
-        '<div class="oc-field oc-full"><label>' + T('modelNote') + '</label>' +
+        '<div class="oc-field oc-full"><label for="mm-edit-note">' + T('modelNote') + '</label>' +
           '<input class="oc-input" id="mm-edit-note" value="' + esc(cur.note || '') + '" autocomplete="off"></div>' +
         '</div>',
       run: function () {
@@ -4429,7 +5723,9 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // 刷新节奏与 previewCache 同款：60s TTL，进入设置页时拉一次，保存后强制重拉。
   var SETTINGS_TTL = 60 * 1000;
   var settingsCache = null;  // {at, data, def}
-  var SETTINGS_SRC = { env: 'sourceEnv', db: 'sourceDb' };
+  // 来源三元组：db / env / code-default（服务端 SettingsSource，见 server.ts
+  // settingsView）。code-default = 没配，用的代码里写死的默认值——不再吞进 env。
+  var SETTINGS_SRC = { env: 'sourceEnv', db: 'sourceDb', 'code-default': 'codeDefault' };
   function loadSettings(force) {
     if (!force && settingsCache && Date.now() - settingsCache.at < SETTINGS_TTL) {
       renderSettings(settingsCache.data);
@@ -4448,7 +5744,12 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     });
   }
   function renderSettings(s) {
-    var srcOf = function (k) { return T(SETTINGS_SRC[(s[k] && s[k].source === 'db') ? 'db' : 'env']); };
+    // srcOf 读服务端下发的 source 三元组（'db' | 'env' | 'code-default'）；未知/
+    // 缺省回落 env（老响应兼容），不把 code-default 显示成 env。
+    var srcOf = function (k) {
+      var src = s[k] && s[k].source;
+      return T(SETTINGS_SRC[src] || 'sourceEnv');
+    };
     // 账号密码：用户名回填；密码不回显（value 恒 ''），来源标记说明一切。
     var u = $('aa-user');
     if (u && s.adminUser) u.value = s.adminUser.value;
@@ -4484,7 +5785,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       ? Math.round(Number(s.compactTriggerBytes.value) / 1024) + 'KB'
       : '';
     var chars = s.compactMaxMessageChars && Number(s.compactMaxMessageChars.value)
-      ? Number(s.compactMaxMessageChars.value) + ' chars'
+      ? Number(s.compactMaxMessageChars.value) + ' ' + T('chars')
       : '';
     var panel = $('exp-panel');
     if (!panel) return;
@@ -4903,7 +6204,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   // 守卫跳过渲染 + saveLegacyKey 按 detailState.id 会把 A 的值写进 B。
   var detailState = { id: null, range: '7d', billing: null, legacyKeyInputFor: null };
   /** microCents → $（1e8 = $1），两位小数。null/undefined/非法输入 → '—'（未知），
-   *  不把「没拿到数据」伪装成「没钱」——0 是合法值，显示 $0.00。 */
+   *  不把「没拿到数据」伪装成「没钱」——0 是合法值，显示 $0.00。
+   *  **与 src/money.ts 的 microCentsToUsd 同口径（1e8 microCents = $1），勿改系数。**
+   *  内联 JS 是字符串模板（ADMIN_HTML 内 <script>），无法 import TS 模块，
+   *  前端独立实现不可避免；系数收敛到 money.ts（单一权威模块，B1 根因）。 */
   var money = function (mc) {
     if (mc == null || isNaN(Number(mc))) return '—';
     return '$' + (Number(mc) / 1e8).toFixed(2);
@@ -4941,7 +6245,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       el.innerHTML = '<div class="oc-hint">' + esc(msg) + '</div>';
       return;
     }
-    el.innerHTML = '<div class="oc-hint oc-hint-err">' + esc(msg) + '</div>';
+    // 需求 1：额度耗尽类错误包装为友好短文案，原文保留在 title 可展开。
+    el.innerHTML = '<div class="oc-hint oc-hint-err" title="' + esc(msg) + '">' + esc(friendlyQuota(msg) || msg) + '</div>';
   }
   /** 渲染成功前的守卫：自动轮询且该块还挂着 sticky 错误 → 拒绝渲染（保留错误
    *  给用户看）；否则清除 sticky 标记并放行（用户操作触发的成功）。 */
@@ -4958,6 +6263,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     $('detail-name').textContent = a.name;
     $('detail-name').title = a.name;
     switchView('account-detail');
+    detailGroup = 'sub';  // 每次进详情默认「订阅 & Keys」组（tab 只显隐，load 全拉）
     loadAccountDetail();
   }
   function closeAccountDetail() {
@@ -4987,21 +6293,63 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     ['detail-providers', 'providersTitle', 'providersSub'],
     ['detail-pricing', 'pricingTitle', 'pricingSub'],
   ];
-  /** 渲染详情页区块锚点导航（detail-nav）：订阅置顶后，用区块标题做锚点，
-   *  点击平滑滚动到对应区块。顺序与 DETAIL_BLOCK_KEYS 一致。 */
-  function renderDetailNav() {
+  /** 详情页分组 tab（解决 16 个竖排区块一直下滑）：5 组，默认「订阅 & Keys」。
+   *  tab 只显隐不懒加载——loadAccountDetail 仍全拉所有区块（首屏一次，切换零等待）。 */
+  var detailGroup = 'sub';
+  var DETAIL_GROUPS = [
+    ['sub', 'detailTabSub', ['detail-go', 'detail-legacy-key', 'detail-legacy', 'detail-legacy-billing']],
+    ['ws', 'detailTabWs', ['detail-workspace', 'detail-models']],
+    ['finance', 'detailTabFinance', ['detail-billing', 'detail-usage', 'detail-models-usage',
+      'detail-users-usage', 'detail-autorecharge', 'detail-budgets']],
+    ['org', 'detailTabOrg', ['detail-members', 'detail-sa', 'detail-providers']],
+    ['pricing', 'detailTabPricing', ['detail-pricing']]
+  ];
+  /** 渲染详情页分组 tab 条（detail-nav 容器内，复用 .tab 样式 + .sub-tabs 行）。 */
+  function renderDetailTabs() {
     var el = $('detail-nav');
     if (!el) return;
-    var chips = DETAIL_BLOCK_KEYS.map(function (b) {
-      return '<button class="oc-chip" data-scroll-to="' + b[0] + '">' + esc(T(b[1])) + '</button>';
-    }).join('');
-    el.innerHTML = '<div class="detail-nav-row">' + chips + '</div>';
-    el.querySelectorAll('button[data-scroll-to]').forEach(function (btn) {
+    var html = '<div class="sub-tabs">' + DETAIL_GROUPS.map(function (g) {
+      return '<button type="button" class="tab' + (g[0] === detailGroup ? ' active' : '') +
+        '" data-detail-group="' + g[0] + '">' + esc(T(g[1])) + '</button>';
+    }).join('') + '</div>';
+    el.innerHTML = html;
+    el.querySelectorAll('button[data-detail-group]').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        var target = $(btn.getAttribute('data-scroll-to'));
-        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        showDetailGroup(btn.getAttribute('data-detail-group'));
       });
     });
+  }
+  /** 切换详情页分组：显示目标组容器（.detail-group[data-group]），隐藏其余。 */
+  function showDetailGroup(g) {
+    detailGroup = g;
+    var groups = document.querySelectorAll('.detail-group');
+    for (var i = 0; i < groups.length; i++) {
+      groups[i].hidden = groups[i].getAttribute('data-group') !== g;
+    }
+    renderDetailTabs();
+  }
+  // 详情首拉并发闸门（需求 2）：loadAccountDetail 一次排 14 个区块请求，全部
+  // 同时发会打上游洪峰（console/legacy 端点首拉全 miss 服务端缓存）。qDetail
+  // 排队，最多 DETAIL_CONCURRENCY 个同时在飞，其余 FIFO 逐个发。队列按页面
+  // 区块顺序排（头部区块先拉）；切账号时清掉未出发的旧任务。tick 的 2s 轮询
+  // （loadBilling/loadGo/loadLegacyKeys/loadLegacyBilling）不走队列（自带 TTL 门）。
+  var DETAIL_CONCURRENCY = 4;
+  var detailQueue = [];
+  var detailInFlight = 0;
+  function pumpDetailQueue() {
+    while (detailInFlight < DETAIL_CONCURRENCY && detailQueue.length) {
+      var next = detailQueue.shift();
+      if (!next) break;
+      detailInFlight++;
+      Promise.resolve().then(next).finally(function () {
+        detailInFlight--;
+        pumpDetailQueue();
+      });
+    }
+  }
+  function qDetail(fn) {
+    detailQueue.push(fn);
+    pumpDetailQueue();
   }
   function loadAccountDetail() {
     var id = detailState.id;
@@ -5010,28 +6358,36 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       var el = $(b[0]);
       if (el && !el.innerHTML) el.innerHTML = dBlock(b[1], b[2], '<div class="oc-hint">' + T('loading') + '</div>');
     });
-    renderDetailNav();
-    loadBilling(id);
-    loadUsage();
+    showDetailGroup(detailGroup);
+    // 首拉排队（≤DETAIL_CONCURRENCY 并发，FIFO，按页面顺序 = 头部区块先拉）。
+    // task 带 start 守卫：排队期间切账号的旧任务直接放弃。load* 内部仍保留
+    // 响应时的 detailState.id 切换守卫（旧账号慢响应不渲染进新视图）。
+    detailQueue.length = 0;
+    var tasks = [
+      function () { if (detailState.id !== id) return; return loadGo(id); },
+      function () { if (detailState.id !== id) return; return loadLegacyKeys(id); },
+      function () { if (detailState.id !== id) return; return loadLegacyBilling(id); },
+      function () { if (detailState.id !== id) return; return loadWorkspaces(id); },
+      function () { if (detailState.id !== id) return; return loadBilling(id); },
+      function () { if (detailState.id !== id) return; return loadUsage(); },
+      function () { if (detailState.id !== id) return; return loadModelsUsage(id); },
+      function () { if (detailState.id !== id) return; return loadUsersUsage(id); },
+      function () { if (detailState.id !== id) return; return loadBudgets(id); },
+      function () { if (detailState.id !== id) return; return loadMemberBudgets(id); },
+      function () { if (detailState.id !== id) return; return loadMembers(id); },
+      function () { if (detailState.id !== id) return; return loadSa(id); },
+      function () { if (detailState.id !== id) return; return loadProviders(id); },
+      function () { if (detailState.id !== id) return; return loadPricing(id); }
+    ];
+    for (var i = 0; i < tasks.length; i++) qDetail(tasks[i]);
+    // 同步渲染（不发起请求）：模型区块读账号列表/目录快照，legacy key 配置读列表。
     loadModels(id);
-    loadModelsUsage(id);
-    loadUsersUsage(id);
-    loadMembers(id);
-    loadSa(id);
-    loadProviders(id);
-    loadBudgets(id);
-    loadMemberBudgets(id);
-    loadPricing(id);
-    loadLegacyKeys(id);
-    loadLegacyBilling(id);
-    loadGo(id);
-    loadWorkspaces(id);
     renderLegacyKey();
   }
 
   /** 工作区区块：显示当前 workspace（id + 名称）+ 切换入口。 */
   function loadWorkspaces(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/workspaces', null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/workspaces', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
         detailErr('workspace', errMsg(r));
@@ -5090,7 +6446,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       openConfirm({
         title: T('wsSwitchTitle'),
         okText: T('wsSwitch'),
-        body: '<div class="oc-form"><div class="oc-field oc-full"><label>' + T('workspaceId') + '</label>' +
+        body: '<div class="oc-form"><div class="oc-field oc-full"><label for="ws-manual">' + T('workspaceId') + '</label>' +
           '<input class="oc-input" id="ws-manual" autocomplete="off" placeholder="org_..."></div>' +
           '<div class="oc-hint">' + T('wsManualHint') + '</div></div>',
         run: function () {
@@ -5137,7 +6493,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       gm.map(function (m) { return '<div class="key-row"><span class="fp">' + esc(m) + '</span></div>'; }).join('') +
       '</div>';
     var overrideHtml = '<div class="oc-form">' +
-      '<div class="oc-field oc-full"><label>' + T('accountOverride') + '</label>' +
+      '<div class="oc-field oc-full"><label for="models-in-' + id + '">' + T('accountOverride') + '</label>' +
         '<input class="oc-input" id="models-in-' + id + '" value="' + esc((ov || []).join(', ')) + '"' +
           ' placeholder="' + esc(T('modelsPlaceholder')) + '" autocomplete="off" spellcheck="false">' +
         '<div class="oc-hint">' + T('clearToGlobalHint') + '</div>' +
@@ -5248,16 +6604,20 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (input && input.value) return; // 用户正在输入，交给 2s tick 下次再同步
     var has = !!a.hasLegacyKey;
     var masked = a.legacyKeyMasked || '';
+    // 同 key 共用提示：legacyKey 与池 key/其他账号重复（服务端检测，见 buildAccountsSection）。
+    var dupWarn = a.duplicateKey
+      ? '<div class="oc-hint-err">' + T('dupKeyBadge') + (a.duplicateKeyWith ? ' · ' + esc(a.duplicateKeyWith) : '') + ' — ' + T('dupKeyHint') + '</div>'
+      : '';
     var configured = has
       ? '<div class="oc-hint">' + T('legacyKeyConfigured') + ' ' + esc(masked) +
         ' <button class="oc-btn oc-btn-ghost oc-btn-sm" data-action="copy-config-legacy-key" title="' + esc(T('legacyKeyCopyTitle')) + '">' + T('tokenCopy') + '</button></div>'
       : '<div class="oc-hint">' + T('legacyKeyNotConfigured') + '</div>';
     el.innerHTML = dBlock('legacyKeyTitle', 'legacyKeySub',
       '<div class="cookie-import">' +
-        '<input class="oc-input oc-grow oc-min-200" id="detail-legacy-key-paste" type="password" placeholder="' + esc(T('legacyKeyPlaceholder')) + '" autocomplete="off">' +
+        '<input class="oc-input oc-grow oc-min-200" id="detail-legacy-key-paste" type="password" placeholder="' + esc(T('legacyKeyPlaceholder')) + '" autocomplete="off" aria-label="' + esc(T('legacyKeyTitle')) + '">' +
         '<button class="oc-btn oc-btn-primary" data-action="save-legacy-key">' + T('legacyKeySave') + '</button>' +
         (has ? '<button class="oc-btn" data-action="clear-legacy-key">' + T('legacyKeyClear') + '</button>' : '') +
-      '</div>' + configured);
+      '</div>' + configured + dupWarn);
   }
   function saveLegacyKey() {
     var id = detailState.id;
@@ -5297,7 +6657,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function loadGo(id, fromTick) {
     if (!legacyEligible(id)) return;
     if (legacyDetailFresh(id, 'go', !fromTick)) return;
-    api('GET', '/__admin/api/legacy/account/' + id + '/go', null).then(function (r) {
+    return api('GET', '/__admin/api/legacy/account/' + id + '/go', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       var el = $('detail-go');
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data || !r.json.data.go) {
@@ -5352,14 +6712,27 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       '<div class="oc-hint-err" id="go-err"></div>');
   }
 
+  // billing 详情块前端 TTL 门（需求 2）：console 服务端已有 30s 读缓存兜住上游，
+  // 前端再挡一层 2s tick 的 HTTP 往返（balance/ledger/cookie 状态是分钟级变化）。
+  // 与 legacy 详情 TTL 同语义：成功渲染后打点（按账号 id 记，切账号不误命中）；
+  // 失败不打点（保留 2s 自愈）。用户操作（opDone/刷新余额 → loadBilling(id, false)）
+  // 绕过 TTL。
+  var billingDetailAt = {};  // id -> 最近成功渲染时刻
+  function billingFresh(id, fromTick) {
+    var at = billingDetailAt[id];
+    return !!fromTick && !!at && (Date.now() - at) < LEGACY_DETAIL_TTL;
+  }
+
   function loadBilling(id, fromTick) {
-    api('GET', '/__admin/api/console/account/' + id + '/billing', null).then(function (r) {
+    if (billingFresh(id, fromTick)) return;
+    return api('GET', '/__admin/api/console/account/' + id + '/billing', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
         detailErr('billing', errMsg(r));  // detailErr 统一处理 env 中性化/凭据类中性化
         $('detail-autorecharge').innerHTML = '';
         return;
       }
+      billingDetailAt[id] = Date.now();
       renderBilling(r.json.data, fromTick);
     }).catch(function () { if (detailState.id !== id) return; detailErr('billing', T('consoleUnavailable')); });
   }
@@ -5427,7 +6800,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function loadUsage() {
     var id = detailState.id;
     if (id == null) return;
-    api('GET', '/__admin/api/console/account/' + id + '/usage?range=' + detailState.range, null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/usage?range=' + detailState.range, null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态：旧账号慢响应不渲染进新视图
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) {
         detailErr('usage', errMsg(r));
@@ -5486,7 +6859,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
 
   // ── P0：模型消费 / 成员消费 / 成员预算状态 / 模型定价 ──
   function loadModelsUsage(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/usage/models?range=' + detailState.range, null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/usage/models?range=' + detailState.range, null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-models-usage');
       if (!el) return;
@@ -5508,7 +6881,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       rows + '</tbody></table>');
   }
   function loadUsersUsage(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/usage/users?range=' + detailState.range, null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/usage/users?range=' + detailState.range, null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-users-usage');
       if (!el) return;
@@ -5532,7 +6905,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
   /** 成员预算状态：限/已用/超限徽标/重置时刻。无数据静默（区块里只扩表格）。 */
   function loadMemberBudgets(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/budgets/users-status', null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/budgets/users-status', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json || r.json.ok === false || !r.json.data) return;
       renderMemberBudgets((r.json.data.items) || []);
@@ -5562,7 +6935,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
   /** 模型定价：简化展示（模型名 + 输入/输出每百万 token 美元），61 模型限高滚动。 */
   function loadPricing(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/models-pricing', null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/models-pricing', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-pricing');
       if (!el) return;
@@ -5574,12 +6947,15 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     var provs = (data && data.providers) || {};
     var rows = '';
     var count = 0;
+    // 收集上游定价模型名（「添加模型」自动补全候选）。
+    maPricingModels = [];
     for (var pid in provs) {
       if (!Object.prototype.hasOwnProperty.call(provs, pid)) continue;
       var p = provs[pid] || {};
       var models = p.models || {};
       for (var mid in models) {
         if (!Object.prototype.hasOwnProperty.call(models, mid)) continue;
+        maPricingModels.push(mid);
         var m = models[mid] || {};
         var cost = (m.cost && m.cost[0]) || {};
         var inp = cost.input != null ? '$' + Number(cost.input).toFixed(4) + '/M' : '—';
@@ -5601,7 +6977,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function loadLegacyBilling(id, fromTick) {
     if (!legacyEligible(id)) return;
     if (legacyDetailFresh(id, 'billing', !fromTick)) return;
-    api('GET', '/__admin/api/legacy/account/' + id + '/billing', null).then(function (r) {
+    return api('GET', '/__admin/api/legacy/account/' + id + '/billing', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-legacy-billing');
       if (!el) return;
@@ -5646,7 +7022,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       '<div class="keys"><div class="keys-hd">' + T('paymentHistory') + '</div>' + payHtml + '</div>');
   }
 
-  function loadMembers(id) {    api('GET', '/__admin/api/console/account/' + id + '/members', null).then(function (r) {
+  function loadMembers(id) {    return api('GET', '/__admin/api/console/account/' + id + '/members', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('members', errMsg(r)); return; }
       renderMembers(r.json);
@@ -5668,7 +7044,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
 
   function loadSa(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/keys', null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/keys', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('sa', errMsg(r)); return; }
       renderSa(r.json);
@@ -5698,7 +7074,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function loadLegacyKeys(id, fromTick) {
     if (!legacyEligible(id)) return;
     if (legacyDetailFresh(id, 'keys', !fromTick)) return;
-    api('GET', '/__admin/api/legacy/account/' + id + '/keys', null).then(function (r) {
+    return api('GET', '/__admin/api/legacy/account/' + id + '/keys', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       var el = $('detail-legacy');
       if (!el) return;
@@ -5747,11 +7123,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       '<button class="oc-btn" data-action="refresh-legacy-keys">' + T('refreshKeys') + '</button></div>');
   }
   /** legacy key 明文复制：GET /keys/plain（裸 JSON 数组 [{id,name,key}]）→
-   *  按 id 匹配 → navigator.clipboard 写入 → flash 成功；失败显示 oc-hint-err。 */
-  function copyLegacyKey(keyId) {
+   *  按 id 匹配 → navigator.clipboard 写入 → flash 成功；失败显示 oc-hint-err。
+   *  accountId 可空（详情页省略）：为空回落 detailState.id；列表页卡片必须带上。 */
+  function copyLegacyKey(keyId, accountId) {
+    var aid = accountId != null && accountId !== '' ? accountId : detailState.id;
     var errEl = $('legacy-copy-err');
     if (errEl) errEl.textContent = '';
-    api('GET', '/__admin/api/legacy/account/' + detailState.id + '/keys/plain', null).then(function (r) {
+    api('GET', '/__admin/api/legacy/account/' + aid + '/keys/plain', null).then(function (r) {
       var fail = function (msg) {
         stickyErr['legacy'] = true; // 复制失败也 sticky：不被 2s 轮询的 loadLegacyKeys 刷掉（对抗审查 M1）
         if (errEl) { errEl.textContent = msg; return; }
@@ -5790,7 +7168,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     openConfirm({
       title: T('legacyCreateTitle'),
       okText: T('createKey'),
-      body: '<div class="oc-form"><div class="oc-field oc-full"><label>' + T('keyName') + '</label>' +
+      body: '<div class="oc-form"><div class="oc-field oc-full"><label for="legacy-key-name">' + T('keyName') + '</label>' +
         '<input class="oc-input" id="legacy-key-name" autocomplete="off"></div></div>',
       run: function () {
         var name = $('legacy-key-name').value.trim();
@@ -5816,7 +7194,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
 
   function loadProviders(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/providers', null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/providers', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('providers', errMsg(r)); return; }
       renderProviders(r.json);
@@ -5837,7 +7215,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   }
 
   function loadBudgets(id) {
-    api('GET', '/__admin/api/console/account/' + id + '/budgets', null).then(function (r) {
+    return api('GET', '/__admin/api/console/account/' + id + '/budgets', null).then(function (r) {
       if (detailState.id !== id) return;  // 详情切换竞态
       if (!r.ok || !r.json) { detailErr('budgets', errMsg(r)); return; }
       renderBudgets(r.json);
@@ -5867,6 +7245,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   function openConfirm(opts) {
     $('confirm-title').textContent = opts.title;
     $('confirm-body').innerHTML = opts.body || '';
+    // 弹层里的数字输入（token 数量/配额/自动充值/月限额等）挂自绘 spinner。
+    mountNumSpinners($('confirm-body'));
     $('confirm-err').textContent = '';
     var ok = $('confirm-ok');
     ok.textContent = opts.okText || T('confirm');
@@ -5919,14 +7299,14 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       title: T('arModalTitle'),
       okText: T('save'),
       body: '<div class="oc-form">' +
-        '<div class="oc-field oc-full"><label>' + T('arEnabled') + '</label>' +
+        '<div class="oc-field oc-full"><label for="ar-enabled">' + T('arEnabled') + '</label>' +
           '<select class="oc-select" id="ar-enabled">' +
             '<option value="1"' + (ar.enabled ? ' selected' : '') + '>' + T('enabled') + '</option>' +
             '<option value="0"' + (!ar.enabled ? ' selected' : '') + '>' + T('disabled') + '</option>' +
           '</select></div>' +
-        '<div class="oc-field"><label>' + T('thresholdDollars') + '</label>' +
+        '<div class="oc-field"><label for="ar-threshold">' + T('thresholdDollars') + '</label>' +
           '<input class="oc-input" id="ar-threshold" type="number" min="1" step="1" value="' + esc(ar.thresholdDollars == null ? '' : ar.thresholdDollars) + '"></div>' +
-        '<div class="oc-field"><label>' + T('rechargeAmountDollars') + '</label>' +
+        '<div class="oc-field"><label for="ar-amount">' + T('rechargeAmountDollars') + '</label>' +
           '<input class="oc-input" id="ar-amount" type="number" min="1" step="1" value="' + esc(ar.rechargeAmountDollars == null ? '' : ar.rechargeAmountDollars) + '"></div>' +
         '</div>',
       run: function () {
@@ -5953,7 +7333,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     openConfirm({
       title: T('mlModalTitle'),
       okText: T('save'),
-      body: '<div class="oc-form"><div class="oc-field oc-full"><label>' + T(scope === 'org' ? 'orgBudget' : 'userBudget') + '</label>' +
+      body: '<div class="oc-form"><div class="oc-field oc-full"><label for="ml-limit">' + T(scope === 'org' ? 'orgBudget' : 'userBudget') + '</label>' +
         '<input class="oc-input" id="ml-limit" type="number" min="0" step="1" autocomplete="off"></div></div>',
       run: function () {
         var v = parseFloat($('ml-limit').value);
@@ -5969,7 +7349,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     openConfirm({
       title: T('saModalTitle'),
       okText: T('create'),
-      body: '<div class="oc-form"><div class="oc-field oc-full"><label>' + T('saModalName') + '</label>' +
+      body: '<div class="oc-form"><div class="oc-field oc-full"><label for="sa-name">' + T('saModalName') + '</label>' +
         '<input class="oc-input" id="sa-name" autocomplete="off"></div></div>',
       run: function () {
         var name = $('sa-name').value.trim();
@@ -6026,6 +7406,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     var act = btn.getAttribute('data-action');
     if (act === 'menu') { toggleMenu($('ops-menu-' + id)); return; }
     closeMenus();
+    if (act === 'toggle-card') { toggleCard(id, btn.closest('.card')); return; }
     if (act === 'detail') { openAccountDetail(id); return; }
     if (act === 'edit') { toggleEdit(id); return; }
     if (act === 'cancel') { var ed = $('edit-' + id); if (ed) ed.hidden = true; return; }
@@ -6033,9 +7414,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (act === 'billing') { refreshBalance(id); return; }
     if (act === 'addkey') { addKey(id); return; }
     if (act === 'copykey') { copyKey(id, btn.getAttribute('data-fp')); return; }
+    if (act === 'key-usage') { keyUsage(id, btn.getAttribute('data-fp')); return; }
+    if (act === 'disable-key') { toggleKeyState(id, btn.getAttribute('data-fp'), true); return; }
+    if (act === 'reset-key') { toggleKeyState(id, btn.getAttribute('data-fp'), false); return; }
     if (act === 'renamekey') { renameKey(id, btn.getAttribute('data-fp')); return; }
     if (act === 'delkey') { delKey(id, btn.getAttribute('data-fp')); return; }
     if (act === 'delete') { delAccount(id); return; }
+    if (act === 'goto-tokens') { switchView('tokens'); return; }
     // 卡身空白处点击进入详情；编辑表单/菜单/输入框内不算。
     if (e.target.closest('button, input, select, .edit, .dd-menu, .key-add')) return;
     var card = e.target.closest('.card');
@@ -6064,6 +7449,11 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   $('btn-create').addEventListener('click', createAccount);
   $('c-kind-toggle').addEventListener('click', function () { toggleMenu($('c-kind-menu')); });
   $('btn-lang').addEventListener('click', function () { toggleMenu($('lang-menu')); });
+  // 账号卡片全部收起/展开（同步设置所有卡片 + localStorage fc-collapsed）。
+  var btnCollapseAll = $('btn-collapse-all');
+  if (btnCollapseAll) btnCollapseAll.addEventListener('click', function () { setAllCollapsed(true); });
+  var btnExpandAll = $('btn-expand-all');
+  if (btnExpandAll) btnExpandAll.addEventListener('click', function () { setAllCollapsed(false); });
   // 退出：清会话 cookie 回登录页（登录功能闭环）。
   $('btn-logout').addEventListener('click', function () {
     fetch('/__admin/api/logout', { method: 'POST' }).then(function () {
@@ -6167,6 +7557,13 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (c) copyPlain(Number(c.getAttribute('data-copy')), c);
   });
   // model access tab：行/chip 是动态 innerHTML，走视图委托。
+  var maAvailSearchEl = $('ma-avail-search');
+  if (maAvailSearchEl) {
+    maAvailSearchEl.addEventListener('input', function () {
+      maAvailQuery = maAvailSearchEl.value.trim();
+      renderMaAvail();
+    });
+  }
   $('view-access').addEventListener('click', function (e) {
     var gc = e.target.closest('[data-model]');
     if (gc) { maToggleSel(gc.getAttribute('data-model')); return; }
@@ -6191,6 +7588,11 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   });
   $('ma-global-save').addEventListener('click', saveMaGlobal);
   $('ma-global-reset').addEventListener('click', resetMaGlobal);
+  $('ma-global-add-btn').addEventListener('click', addMaGlobalModels);
+  var maGlobalAddEl = $('ma-global-add');
+  if (maGlobalAddEl) maGlobalAddEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); addMaGlobalModels(); }
+  });
   $('ma-refresh').addEventListener('click', function () { loadModelAccess(); });
 
   // m1（对抗审查）：关闭即清空明文（DOM + dataset）——「仅此一次」在页面生命周期内也成立。
@@ -6238,6 +7640,17 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     if (ak) { delApiKey(ak.getAttribute('data-mask')); return; }
   });
 
+  // 性能面板开关（设置页）：localStorage fc-perf 持久化，关了总览隐藏性能区块。
+  var perfToggle = $('perf-toggle');
+  if (perfToggle) {
+    perfToggle.addEventListener('click', function () {
+      perfOn = !perfOn;
+      try { localStorage.setItem('fc-perf', perfOn ? '1' : '0'); } catch (e) {}
+      applyPerfVisibility();
+      if (perfOn) fetchPerf(); // 重新打开立刻拉一帧，不等 2s tick
+    });
+  }
+
   // 语言菜单选择 + 点外部关闭 dropdown（dd-toggle 自身的开关在各自按钮上）。
   document.addEventListener('change', function (e) {
     var t = e.target;
@@ -6245,7 +7658,10 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       var id = t.getAttribute('data-id');
       var toggle = t.getAttribute('data-go-toggle');
       var enabled = t.checked;
-      api('POST', '/__admin/api/legacy/account/' + id + '/go/' + (toggle === 'useBalance' ? 'use-balance' : 'china-models'), { enabled: enabled }).then(function (r) {
+      // 契约（并行服务端 agent）：PUT /legacy/account/:id/go-toggle，body 只带
+      // 被切换的那个键（{useBalance?} 或 {chinaModels?}），其余省略 = 不修改。
+      var body = toggle === 'useBalance' ? { useBalance: enabled } : { chinaModels: enabled };
+      api('PUT', '/__admin/api/legacy/account/' + id + '/go-toggle', body).then(function (r) {
         if (!r.ok) {
           t.checked = !enabled; // 失败回滚
           stickyErr['go'] = true; // 标记 sticky：2s 轮询的 loadGo 成功也不重建，错误留着（对抗审查 M1）
@@ -6271,10 +7687,24 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
     openAccountDetail(Number(card.dataset.id));
   });
   document.addEventListener('click', function (e) {
+    // 自绘 spinner：点击上下箭头 → 最近数字输入 stepUp/stepDown（document 级
+    // 委托，动态 innerHTML 重建后无需重新绑）。
+    var sb = e.target.closest('.num-spin-up, .num-spin-down');
+    if (sb) {
+      var wrap = sb.closest('.num-wrap');
+      var inp = wrap ? wrap.querySelector('input[type="number"]') : null;
+      if (inp && !inp.disabled) {
+        try {
+          if (sb.classList.contains('num-spin-up')) inp.stepUp();
+          else inp.stepDown();
+        } catch (err) {}
+      }
+      return;
+    }
     var item = e.target.closest('.dd-item[data-lang]');
     if (item) {
       var v = item.getAttribute('data-lang');
-      if (v === 'zh' || v === 'en') {
+      if (v === 'zh' || v === 'en' || v === 'ja') {
         if (v !== lang) {
           lang = v;
           try { localStorage.setItem('fc-lang', lang); } catch (e2) {}
@@ -6370,7 +7800,7 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
       if (act === 'del-sa') { delSa(btn.getAttribute('data-said')); return; }
       if (act === 'create-legacy-key') { createLegacyKey(); return; }
       if (act === 'del-legacy-key') { delLegacyKey(btn.getAttribute('data-keyid')); return; }
-      if (act === 'copy-legacy-key') { copyLegacyKey(btn.getAttribute('data-keyid')); return; }
+      if (act === 'copy-legacy-key') { copyLegacyKey(btn.getAttribute('data-keyid'), btn.getAttribute('data-accountid')); return; }
       if (act === 'refresh-legacy-keys') { loadLegacyKeys(detailState.id); return; }
       if (act === 'ws-switch') { switchWorkspace(Number(btn.getAttribute('data-id'))); return; }
       if (act === 'save-legacy-key') { saveLegacyKey(); return; }
@@ -6393,6 +7823,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   });
 
   applyLang();
+  // 性能区块显隐按 localStorage fc-perf 应用到 DOM（开关状态/提示一并同步）。
+  applyPerfVisibility();
   // 恢复上次的 tab + sidebar 子项（非法/详情视图回退 overview，sub 由
   // renderSubnav 校验兜底）。tab 记忆 = 刷新/重进面板不回到初始 tab。
   try {
@@ -6404,6 +7836,8 @@ export const ADMIN_HTML = String.raw`<!DOCTYPE html>
   switchView(curView);
   tick(); fcTickTimer = setInterval(tick, 2000);
   setInterval(tickCountdown, 1000);
+  // 静态数字输入（跳页 req-page）挂自绘 spinner；动态渲染的由各渲染函数重挂。
+  mountNumSpinners();
   // 首拉分发密钥（总览费用/密钥卡 + 密钥 tab 共用这份 60s 缓存）。
   loadTokens(false);
   // OTA 红点：启动拉一次 + 60s 轮询（后台服务端每 6h 检查一次，这里只是
@@ -6439,7 +7873,7 @@ export const LOGIN_HTML = String.raw`<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>fuckopencode — sign in</title>
+<title data-i18n="titleSignIn">fuckopencode — sign in</title>
 <style>
   /* 与 ADMIN_HTML 同设计令牌 + 同 oc-* 模板控件类（oc-btn/oc-input/oc-field/
      oc-hint/oc-hint-err）。静态文本默认英文（服务端 302 兜底 + 密码管理器
@@ -6493,11 +7927,11 @@ export const LOGIN_HTML = String.raw`<!DOCTYPE html>
     <div class="sub" data-i18n="authRequired">admin panel requires authentication</div>
     <form id="login-form" action="/__admin/api/login" method="post">
       <div class="oc-field">
-        <label data-i18n="username">username</label>
+        <label for="lg-user" data-i18n="username">username</label>
         <input class="oc-input" id="lg-user" name="username" autocomplete="username" autofocus>
       </div>
       <div class="oc-field">
-        <label data-i18n="password">password</label>
+        <label for="lg-pass" data-i18n="password">password</label>
         <input class="oc-input" id="lg-pass" name="password" type="password" autocomplete="current-password">
       </div>
       <div class="oc-hint-err" id="lg-err"></div>
@@ -6512,6 +7946,7 @@ export const LOGIN_HTML = String.raw`<!DOCTYPE html>
   var I18N = {
     en: {
       signIn: 'sign in', signInSub: '/ sign in',
+      titleSignIn: 'fuckopencode — sign in',
       authRequired: 'admin panel requires authentication',
       username: 'username', password: 'password',
       loginError: 'invalid username or password',
@@ -6519,18 +7954,27 @@ export const LOGIN_HTML = String.raw`<!DOCTYPE html>
     },
     zh: {
       signIn: '登录', signInSub: '/ 登录',
+      titleSignIn: 'fuckopencode — 登录',
       authRequired: '管理面板需要登录',
       username: '用户名', password: '密码',
       loginError: '用户名或密码错误',
       locked: '已锁定：{n} 秒后重试'
+    },
+    ja: {
+      signIn: 'サインイン', signInSub: '/ サインイン',
+      titleSignIn: 'fuckopencode — サインイン',
+      authRequired: '管理パネルには認証が必要です',
+      username: 'ユーザー名', password: 'パスワード',
+      loginError: 'ユーザー名またはパスワードが正しくありません',
+      locked: 'ロック中：{n} 秒後に再試行'
     }
   };
   var lang = (function () {
-    try { var v = localStorage.getItem('fc-lang'); if (v === 'zh' || v === 'en') return v; } catch (e) {}
-    return /^zh/i.test(navigator.language || '') ? 'zh' : 'en';
+    try { var v = localStorage.getItem('fc-lang'); if (v === 'zh' || v === 'en' || v === 'ja') return v; } catch (e) {}
+    var nl = navigator.language || ''; if (/^zh/i.test(nl)) return 'zh'; if (/^ja/i.test(nl)) return 'ja'; return 'en';
   })();
   var T = function (k) { return (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k; };
-  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : lang === 'ja' ? 'ja' : 'en';
   var nodes = document.querySelectorAll('[data-i18n]');
   for (var i = 0; i < nodes.length; i++) {
     nodes[i].textContent = T(nodes[i].getAttribute('data-i18n'));

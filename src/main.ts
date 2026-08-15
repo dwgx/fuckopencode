@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig } from './config.js';
 import { createApp, keyStateHandler } from './server.js';
-import { KeyPool } from './keypool.js';
+import { KeyPool, type PersistedDisable } from './keypool.js';
 import { PROBE_MODEL, startKeyProbe } from './keyprobe.js';
 import { UsageDb } from './usagedb.js';
 import { loadSecret } from './secrets.js';
@@ -92,12 +92,50 @@ const accountsStatus = !accounts.enabled
 // 池 = env keys + 账户明文 keys。keypool 构造自带 trim/去重（重复 key 取第一个，
 // accountId 由 map 解析）；降级时 map 为空 → 只走 env keys，行为与现状一致。
 const accountIds = accounts.keysForPool();
+
+// 小型 JSON 文件持久化（原子写：tmp + rename）。读失败返回 {}、写失败不阻断——
+// 持久化是尽力而为，绝不能阻断网关主链路。失败都要 console.warn（P2：disk-full/
+// 权限故障给第一道可见性，不然 diskStore 静默吞错，重启后冷却丢失无从排查）。
+function diskStore(p: string): { load(): unknown; save(v: unknown): void } {
+  return {
+    load(): unknown {
+      try {
+        return JSON.parse(fs.readFileSync(p, 'utf8'));
+      } catch (err) {
+        console.warn(`[proxy] diskStore load ${p} failed: ${String(err)}`);
+        return {};
+      }
+    },
+    save(v: unknown): void {
+      try {
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        // P3：tmp 名带 pid + 时间戳，消除模型外双实例互踩 + 崩溃残留无碰撞
+        //（固定 `${p}.tmp` 会多实例同写一个 tmp、崩溃残留互相覆盖）。
+        const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(v));
+        fs.renameSync(tmp, p);
+      } catch (err) {
+        console.warn(`[proxy] diskStore save ${p} failed: ${String(err)}`);
+      }
+    },
+  };
+}
+const disabledStore = diskStore(path.join(projectRoot, 'data', 'pool-disabled.json'));
+
 const pool = new KeyPool(
   [...cfg.upstreamKeys, ...accountIds.keys()],
   {
     cooldownMs: cfg.keyCooldownMs,
     failThreshold: cfg.keyFailThreshold,
     onStateChange: keyStateHandler(usageDb),
+    // 长冷却持久化（quota-exhausted / auth / manual，重启恢复）：否则坏 key 重启
+    // 后回池撞 429/401、操作员停用复活——2026-08-15 实测 0osU（quota 冷失去重启
+    // 又被选号）。load 兼容旧格式（{fp: until} / ****XXXX 指纹键，keypool 侧归一
+    // 迁移到 sha256 键）。
+    persistDisabled: {
+      load: () => disabledStore.load() as Record<string, number | PersistedDisable>,
+      save: (m) => disabledStore.save(m),
+    },
   },
   accountIds,
 );
@@ -176,7 +214,25 @@ const legacyClient = {
 // 分发密钥系统（客户端 key，走共享池）：db 不可用内部降级（enabled=false，
 // verify 恒失败 —— fail-closed），构造不抛，不阻塞代理链路。
 const tokensStore = new TokensStore(usageDb, secret);
-const server = createApp(cfg, pool, usageDb, accounts, undefined, consoleClient, importCookieFromChrome, legacyClient, tokensStore, legacyPlainCache);
+// 登出黑名单持久化目录：与 pool-disabled.json 同目录
+// （<root>/data，路径统一，不随 USAGE_DB_PATH 漂移）。USAGE_DB_PATH=''（关 DB）
+// 时撤销持久化仍生效 —— 持久化文件都独立于 DB。
+const server = createApp(
+  cfg,
+  pool,
+  usageDb,
+  accounts,
+  undefined,
+  consoleClient,
+  importCookieFromChrome,
+  legacyClient,
+  tokensStore,
+  legacyPlainCache,
+  undefined,
+  undefined,
+  undefined,
+  path.join(projectRoot, 'data'),
+);
 
 // 主动探活：面板的「可用」只代表不在冷却期，探活用最小 token 的真实请求
 // 证明它还活着。只探健康且长时间空闲的 key，不浪费额度。

@@ -345,6 +345,56 @@ describe('buildAccountsSection（§6.2 JSON 契约）', () => {
     db.close();
   });
 
+  it('同 key 共用检测：账号 legacyKey 指纹与池 key 相同 → duplicateKey + 归属名', () => {
+    const { db, store } = makeStore();
+    // env 池账号（name='env'）持 7qpF/0osU 两个 key；账号 6/7 的 legacyKey 与之同源。
+    const envId = createOk(store, { name: 'env', kind: 'unknown', workspaceId: null, keys: ['sk-7qpF', 'sk-0osU'], cookie: null }).id;
+    const a6 = createOk(store, { name: 'acc6', kind: 'unknown', workspaceId: null, keys: [], cookie: null }).id;
+    const a7 = createOk(store, { name: 'acc7', kind: 'unknown', workspaceId: null, keys: [], cookie: null }).id;
+    store.setLegacyKey(a6, 'sk-7qpF');
+    store.setLegacyKey(a7, 'sk-0osU');
+    const pool = {
+      snapshot: () => [
+        snapEntry({ fingerprint: keyFingerprint('sk-7qpF'), accountId: envId, healthy: true }),
+        snapEntry({ fingerprint: keyFingerprint('sk-0osU'), accountId: envId, healthy: true }),
+      ],
+    } as unknown as KeyPool;
+    const section = buildAccountsSection(store, pool, Date.now());
+    const v6 = section.list.find((x) => x.id === a6)!;
+    expect(v6.duplicateKey).toBe(true);
+    expect(v6.duplicateKeyWith).toBe('env');
+    const v7 = section.list.find((x) => x.id === a7)!;
+    expect(v7.duplicateKey).toBe(true);
+    expect(v7.duplicateKeyWith).toBe('env');
+    // env 自身 legacyKey 为 null，不被标
+    const venv = section.list.find((x) => x.id === envId)!;
+    expect(venv.duplicateKey).toBe(false);
+    expect(venv.duplicateKeyWith).toBeNull();
+    db.close();
+  });
+
+  it('同 key 共用检测：本账户自己持有 legacyKey 指纹不算重复；他人持有才算', () => {
+    const { db, store } = makeStore();
+    // 账号 A 自己 pool key 就是 legacyKey 同指纹 → 不算重复。
+    const a = createOk(store, { name: 'a', kind: 'unknown', workspaceId: null, keys: ['sk-AAAAAAAAXXXX'], cookie: null }).id;
+    store.setLegacyKey(a, 'sk-AAAAAAAAXXXX');
+    const pool = { snapshot: () => [snapEntry({ fingerprint: keyFingerprint('sk-AAAAAAAAXXXX'), accountId: a, healthy: true })] } as unknown as KeyPool;
+    const va = buildAccountsSection(store, pool, Date.now()).list[0]!;
+    expect(va.duplicateKey).toBe(false);
+    // 账号 B 的 legacyKey 与账号 C 的 legacyKey 同指纹 → B 标 duplicate（C 是池外账号）。
+    const b = createOk(store, { name: 'b', kind: 'unknown', workspaceId: null, keys: [], cookie: null }).id;
+    const c = createOk(store, { name: 'c', kind: 'unknown', workspaceId: null, keys: [], cookie: null }).id;
+    store.setLegacyKey(b, 'sk-BBBBBBBBYYYY');
+    store.setLegacyKey(c, 'sk-BBBBBBBBYYYY');
+    const pool2 = { snapshot: () => [] as PoolKeySnapshot[] } as unknown as KeyPool;
+    const list2 = buildAccountsSection(store, pool2, Date.now()).list;
+    expect(list2.find((x) => x.id === b)!.duplicateKey).toBe(true);
+    expect(list2.find((x) => x.id === b)!.duplicateKeyWith).toBe('c');
+    expect(list2.find((x) => x.id === c)!.duplicateKey).toBe(true);
+    expect(list2.find((x) => x.id === c)!.duplicateKeyWith).toBe('b');
+    db.close();
+  });
+
   it('store 禁用 → degraded + 空 list（secret 不可用 / db 不可用两条路径）', () => {
     const db = new UsageDb(path.join(tmpDir, 'usage.db'), 30, log);
     const noSecret = new AccountsStore(db, null, cfg({ upstreamKeys: [] }), log);

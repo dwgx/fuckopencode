@@ -28,6 +28,7 @@
 
 import type { AppConfig } from './config.js';
 import type { FetchLike } from './billing.js';
+import { MICROCENTS_PER_DOLLAR } from './money.js';
 
 /** 读缓存 TTL：面板 2s 轮询下，30s 内同端点只打一次上游。 */
 export const CACHE_TTL_MS = 30_000;
@@ -69,10 +70,11 @@ export type ConsoleWriteResult =
 /**
  * microCents → 美元（1e8 = $1，保留 2 位）。兼容字符串入参 —— 实测响应里
  * 金额字段是字符串（"0"）。非法输入返回 NaN（调用方自行丢弃）。
+ * 换算系数引用 money.ts（单一权威模块）；两位小数是展示语义，保留在此。
  */
 export function microCentsToDollars(value: number | string): number {
   const n = Number(value);
-  return Number.isFinite(n) ? Number((n / 1e8).toFixed(2)) : NaN;
+  return Number.isFinite(n) ? Number((n / MICROCENTS_PER_DOLLAR).toFixed(2)) : NaN;
 }
 
 /**

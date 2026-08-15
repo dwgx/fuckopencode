@@ -111,25 +111,37 @@ describe('ModelAccessStore（密钥-模型授权数据层）', () => {
 });
 
 describe('settings allowedModels（全局默认白名单）', () => {
-  it('校验：硬底线外模型拒绝、trim 去重、≤50、空数组 → null（回代码默认）', () => {
+  it('校验：任意合法模型名接受（含硬底线外 claude-*/gpt-*）、trim 去重、≤50、空数组 → null', () => {
     const ok = allowedModelsMeta([' deepseek-v4-flash ', 'deepseek-v4-flash-free', 'deepseek-v4-flash']);
     expect(ok).toEqual({ ok: true, value: ['deepseek-v4-flash', 'deepseek-v4-flash-free'] });
-    expect(allowedModelsMeta(['grok-4.5'])).toMatchObject({ ok: false });
+    // 硬底线外模型（claude-*/gpt-* 等上游模型）现在合法 —— 白名单可扩展。
+    expect(allowedModelsMeta(['claude-opus-5', 'gpt-5.5', 'glm-5.2', 'deepseek-v4-pro'])).toEqual({
+      ok: true,
+      value: ['claude-opus-5', 'gpt-5.5', 'glm-5.2', 'deepseek-v4-pro'],
+    });
     expect(allowedModelsMeta([null])).toMatchObject({ ok: false });
     expect(allowedModelsMeta('x')).toMatchObject({ ok: false });
+    // 非法格式：大写/空格/特殊字符 拒绝。
+    expect(allowedModelsMeta(['Claude-Opus-5'])).toMatchObject({ ok: false });
+    expect(allowedModelsMeta(['claude opus'])).toMatchObject({ ok: false });
+    expect(allowedModelsMeta(['claude@opus'])).toMatchObject({ ok: false });
+    expect(allowedModelsMeta(['a'.repeat(101)])).toMatchObject({ ok: false });
     // 审查 MAJOR-1：空数组必须归一为 null（= 清键回代码默认），不能是 []（= 全锁）。
     expect(allowedModelsMeta([])).toEqual({ ok: true, value: null });
     expect(allowedModelsMeta(null)).toEqual({ ok: true, value: null });
   });
 
-  it('applySettingsToConfig：数组应用（收窄）/ null 回硬底线 / 默认 = ALLOWED_MODELS', () => {
+  it('applySettingsToConfig：数组应用（扩展/收窄）/ null 回代码默认 / 默认 = ALLOWED_MODELS', () => {
     const cfg = loadConfig({});
     expect([...effectiveGlobalModels(cfg)].sort()).toEqual([...ALLOWED_MODELS].sort());
     applySettingsToConfig(cfg, { allowedModels: ['deepseek-v4-flash'] });
     expect(effectiveGlobalModels(cfg).has('deepseek-v4-flash')).toBe(true);
     expect(effectiveGlobalModels(cfg).has('deepseek-v4-flash-free')).toBe(false);
     applySettingsToConfig(cfg, { allowedModels: null });
-    expect(effectiveGlobalModels(cfg).has('deepseek-v4-flash-free')).toBe(true); // 回硬底线
+    expect(effectiveGlobalModels(cfg).has('deepseek-v4-flash-free')).toBe(true); // 回代码默认
+    // 扩展：添加硬底线外模型。
+    applySettingsToConfig(cfg, { allowedModels: ['deepseek-v4-flash', 'claude-opus-5'] });
+    expect(effectiveGlobalModels(cfg).has('claude-opus-5')).toBe(true);
     // MAJOR-1 回归链完整：allowedModelsMeta([]) → null（上一测试）→ apply 收到
     // null → 回默认，空数组永远不会变成空集锁死全部模型。
   });

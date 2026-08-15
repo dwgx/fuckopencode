@@ -348,6 +348,31 @@ describe('runProbeRound：账户驱动（MULTI-ACCOUNT.md §4.4）', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('m-1：manual 禁用的 key 跳过探活（操作员显式停用，探活是白打上游调用）', async () => {
+    const accts: FakeAccountDef[] = [
+      { id: 1, name: 'env', kind: 'unknown', retryUntil: 0, keys: ['sk-key-manual', 'sk-key-normal'] },
+    ];
+    const { store, calls } = fakeAccounts(accts);
+    const p = acctPool(accts);
+    p.disable('sk-key-manual'); // 操作员手动停用（365 天，reset() 才恢复）
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const results = await runProbeRound(cfg(), p, null, store, () => {});
+    // manual 的 key 不再被打（只探 normal 一个）；quota-exhausted/auth 冷却的 key
+    // 仍探（「到期前确认恢复」手段）—— 见 probeKey 失败分支测试。
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const authHeaders = fetchMock.mock.calls.map(
+      (c) => ((c[1] as RequestInit).headers as Record<string, string>).authorization ?? '',
+    );
+    expect(authHeaders).toHaveLength(1);
+    expect(authHeaders[0]).toContain('sk-key-normal');
+    expect(authHeaders[0]).not.toContain('sk-key-manual');
+    expect(results).toHaveLength(1); // 被跳过的 manual key 不产生结果
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.result.status).toBe('ok');
+  });
+
   it('kind 分流：subscription/unknown 打订阅端点 + flash；payg 打按量端点 + -free', async () => {
     const accts: FakeAccountDef[] = [
       { id: 1, name: 'env', kind: 'unknown', retryUntil: 0, keys: ['sk-key-aaaa'] },

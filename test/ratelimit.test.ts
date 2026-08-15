@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { RpmLimiter } from '../src/ratelimit.js';
+import { RpmLimiter, TpmLimiter } from '../src/ratelimit.js';
 
 /** 任意基准时刻（秒级对齐，秒索引 = T0/1000）。 */
 const T0 = 1_700_000_000_000;
@@ -92,5 +92,84 @@ describe('RpmLimiter', () => {
     expect(l.size()).toBe(1);
     // 被删的 key 重建后从零计数（窗口不会残留旧计数）
     expect(l.check('stale', 1, T0 + 61_000 + 300).allowed).toBe(true);
+  });
+});
+
+describe('TpmLimiter（每分钟 token 上限，固定自然分钟窗口）', () => {
+  /** 分钟边界对齐的基准时刻（M0 % 60000 === 0，自然分钟起点）。 */
+  const M0 = 1_700_000_040_000;
+
+  it('limit<=0 = 不限流：恒放行，不消耗窗口', () => {
+    const l = new TpmLimiter();
+    expect(l.check('k', 0, M0)).toEqual({ allowed: true, used: 0 });
+    expect(l.check('k', 0, M0 + 1000)).toEqual({ allowed: true, used: 0 });
+    expect(l.size()).toBe(0);
+  });
+
+  it('add 累加；check 已用 >= limit → 拒绝（used 未达则放行）', () => {
+    const l = new TpmLimiter();
+    expect(l.used('k', M0)).toBe(0);
+    l.add('k', 7, M0);
+    expect(l.used('k', M0)).toBe(7);
+    // 已用 7 < limit 10 → 放行（soft budget，不预扣）。
+    expect(l.check('k', 10, M0)).toEqual({ allowed: true, used: 7 });
+    l.add('k', 4, M0 + 1000);
+    // 已用 11 >= limit 10 → 拒绝。
+    expect(l.check('k', 10, M0 + 1000)).toEqual({ allowed: false, used: 11 });
+  });
+
+  it('被拒请求不消耗 TPM（check 只读不改窗口）', () => {
+    const l = new TpmLimiter();
+    l.add('k', 10, M0);
+    expect(l.check('k', 10, M0 + 5000).allowed).toBe(false);
+    // 拒绝不 add：used 仍是 10（若 check 误写窗口会变 11）。
+    expect(l.used('k', M0 + 5000)).toBe(10);
+  });
+
+  it('窗口滚动：跨自然分钟 used 归零，自动恢复配额', () => {
+    const l = new TpmLimiter();
+    l.add('k', 50, M0); // 分钟 0-1
+    expect(l.check('k', 40, M0 + 30_000).allowed).toBe(false); // 同分钟 50>=40
+    expect(l.used('k', M0 + 59_999)).toBe(50); // 边界前仍算该分钟
+    // 下一分钟（M0+60s）：窗口滚动 → used=0 → 放行。
+    expect(l.check('k', 40, M0 + 60_000)).toEqual({ allowed: true, used: 0 });
+    l.add('k', 20, M0 + 60_000);
+    expect(l.used('k', M0 + 60_000)).toBe(20); // 新窗口从新用量起算
+  });
+
+  it('不同 key 独立窗口', () => {
+    const l = new TpmLimiter();
+    l.add('a', 100, M0);
+    expect(l.check('a', 50, M0).allowed).toBe(false);
+    expect(l.check('b', 50, M0).allowed).toBe(true); // b 不受 a 影响
+    expect(l.size()).toBe(1);
+  });
+
+  it('prune：滑出窗口的 key 被删，窗口内的保留', () => {
+    const l = new TpmLimiter();
+    l.add('a', 1, M0);
+    l.add('b', 1, M0 + 10_000);
+    l.prune(M0 + 59_000);
+    expect(l.size()).toBe(2); // 都在当前分钟窗口内
+    l.prune(M0 + 61_000); // a 的窗口(M0)已滑出 → 删；b 窗口(M0)同 → 删
+    expect(l.size()).toBe(0);
+  });
+
+  it('定期自动清理：连续 check 超过阈值后过期 key 被删', () => {
+    const l = new TpmLimiter();
+    l.add('stale', 5, M0);
+    for (let i = 0; i < 300; i++) {
+      l.check('live', 1000, M0 + 61_000 + i);
+    }
+    // check 是只读的（不建窗口），stale 已滑出被 prune → 窗口清空。
+    expect(l.size()).toBe(0);
+    expect(l.used('stale', M0 + 61_000 + 300)).toBe(0);
+  });
+
+  it('add 0/负数无操作（不建窗口）', () => {
+    const l = new TpmLimiter();
+    l.add('k', 0, M0);
+    l.add('k', -3, M0);
+    expect(l.size()).toBe(0);
   });
 });

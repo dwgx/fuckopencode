@@ -1,8 +1,10 @@
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
+import { dirname, join } from 'node:path';
 import { DEFAULT_ADMIN_PASS, type AppConfig } from './config.js';
-import { fetchUpstreamModels, postUpstreamChat, type UpstreamCall } from './upstream.js';
+import { circuitShouldReject, fetchUpstreamModels, postUpstreamChat, type UpstreamCall } from './upstream.js';
 import {
   KeyPool,
   ModelNotAllowedError,
@@ -27,10 +29,13 @@ import { buildSystemGuard, detectInjection, extractAllText, scanMessagesForInjec
 import { isJsonContentType, validateAnthropicRequest, validateChatRequest } from './security/validate.js';
 import { extractDevice, recordEvent, snapshot, type RequestEvent } from './metrics.js';
 import { UsageDb } from './usagedb.js';
-import { applySettingsToConfig, effectiveGlobalModels, SETTINGS_META, SettingsStore, validateSetting } from './settings.js';
+import { applySettingsToConfig, effectiveGlobalModels, parseSettingValue, SETTINGS_META, SettingsStore, validateSetting } from './settings.js';
+import type { ModelPrice } from './settings.js';
 import { MODEL_ACCESS_TYPES, ModelAccessStore, type ModelAccessSubjectType } from './modelaccess.js';
-import { TokensStore, fingerprintOf } from './tokens.js';
-import { RpmLimiter } from './ratelimit.js';
+import { TokensStore, fingerprintOf, ipInList } from './tokens.js';
+import type { QuotaCycle, TokenQuotaInput } from './tokens.js';
+import { RpmLimiter, TpmLimiter } from './ratelimit.js';
+import { microCentsToUsd } from './money.js';
 import { buildAccountsSection, type AccountsStore } from './accounts.js';
 import { handleAdminRoutes, LOGIN_HTML, parseAccountId } from './admin.js';
 import { loadModelAliases, updateModelAlias } from './modelmap.js';
@@ -61,6 +66,7 @@ import { parseOpenAISSE } from './sse.js';
 import {
   ALLOWED_MODELS,
   DEEPSEEK_MIN_MAX_TOKENS,
+  DEEPSEEK_MAX_MAX_TOKENS,
   filterThinkingFromStream,
   normalizeAnthropicRequest,
   resolveModel,
@@ -194,6 +200,9 @@ async function* tapStreamCost<T extends { cost?: string }>(
 // 日志/转发清洗复用 errors.ts 的 stripControl（剥控制符防日志伪造）。
 
 const BODY_READ_TIMEOUT_MS = 30_000;
+
+/** count_tokens 是本地估算，body 上限比数据面（maxBodyBytes 默认 64MB）更小。 */
+const COUNT_TOKENS_MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 function readBody(req: IncomingMessage, maxBytes: number): Promise<{ ok: true; text: string } | { ok: false; status: number }> {
   return new Promise((resolve) => {
@@ -350,6 +359,7 @@ function isAdminRequest(req: IncomingMessage, cfg: AppConfig): boolean {
 // 浏览器自动请求的静态资源（favicon/图标等）：无鉴权直接 404，不进 metrics。
 const STATIC_ASSET_PATHS = new Set([
   '/favicon.ico',
+  '/favicon.svg',
   '/robots.txt',
   '/apple-touch-icon.png',
   '/apple-touch-icon-precomposed.png',
@@ -361,14 +371,77 @@ const STATIC_ASSET_PATHS = new Set([
   '/favicon-32x32.png',
 ]);
 
+// opencode 官方 logo（favicon.svg，深底 #131010 + 白色回形）——面板/数据面的
+// 站点图标。favicon.ico 也返回 svg 内容（现代浏览器接受 svg 作为 favicon）。
+const FAVICON_SVG =
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">` +
+  `<rect width="512" height="512" fill="#131010"/>` +
+  `<path d="M320 224V352H192V224H320Z" fill="#5A5858"/>` +
+  `<path fill-rule="evenodd" clip-rule="evenodd" d="M384 416H128V96H384V416ZM320 160H192V352H320V160Z" fill="white"/>` +
+  `</svg>`;
+
 const ADMIN_SESSION_COOKIE = 'fc_admin_session';
 // 无状态签名会话：HMAC-SHA256(secret, expiry + 密码版本)。**不存内存** ——
 // 服务重启会话不失效（用户不用每次部署后重新输入密码）。
 // 登出用内存黑名单（签名 → 过期时刻）。密码版本进 HMAC ⇒ 改密码后旧签名
 // 立即失效（见 passwordVersion）；黑名单按 expiry 过期清理 + 上限钳制，
 // 不会无界增长（见 MAX_REVOKED_SESSIONS）。
+//
+// **持久化（审计 P0 安全）**：会话本身是无状态 HMAC（secret 稳定时重启后仍可
+// 验签），若登出只记内存，重启后已登出的 token 会「复活」。所以增删同步落盘到
+// `data/revoked-sessions.json`（原子写，仿 pool-disabled.json），启动时读回 ——
+// 登出撤销在重启后依然生效。路径由 createApp 决定：生产走 main.ts 注入的
+// persistDir=<root>/data（与 pool-disabled.json / model-blocks.json 同目录），
+// 不传时回落 usageDbPath 的目录；两者都没有（内存态）时行为与旧版一致。
 const revokedSessions = new Map<string, number>(); // 签名 → 过期时刻
 const loginFails = new Map<string, { fails: number; lockedUntil: number }>(); // ip → 状态
+
+/** revoked-sessions.json 的绝对/相对路径；null = 不持久化（纯内存态）。 */
+let revokedSessionsFilePath: string | null = null;
+
+/**
+ * 配置登出黑名单持久化路径并加载存量。null = 关闭持久化（内存态）。
+ * 由 createApp 每次构造时调用（生产按 usageDbPath 派生；测试可显式注入）。
+ * 加载只吞入「未过期」条目（过期条目本就会被 adminSessionValid 的 prune 清掉，
+ * 不提前写入可避免启动即触发一次写盘）。
+ */
+export function configureRevokedSessions(filePath: string | null): void {
+  revokedSessionsFilePath = filePath;
+  if (filePath == null) return;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, number>;
+    const now = Date.now();
+    // 只吞入「未过期」条目（过期条目本就会被 adminSessionValid 的 prune 清掉）。
+    // M-2：加载期间跳过逐条持久化（否则 1 万条 = 1 万次全量写盘 tmp+rename），
+    // 全部吞完后统一写一次 —— 与上方「不提前写入可避免启动即触发一次写盘」一致。
+    let loaded = 0;
+    for (const [sig, expiry] of Object.entries(parsed)) {
+      if (typeof expiry === 'number' && Number.isFinite(expiry) && expiry > now) {
+        addRevokedSession(sig, expiry, true);
+        loaded++;
+      }
+    }
+    if (loaded > 0) persistRevokedSessions();
+  } catch {
+    // 文件不存在 / 坏数据：从空开始（写回时重建）。
+  }
+}
+
+/** 把当前黑名单原子写到持久化文件（失败不阻断登出 —— 内存态仍工作）。 */
+function persistRevokedSessions(): void {
+  if (revokedSessionsFilePath == null) return;
+  try {
+    const p = revokedSessionsFilePath;
+    fs.mkdirSync(dirname(p), { recursive: true });
+    const tmp = `${p}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(revokedSessions)));
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    // 持久化失败不阻断：内存黑名单仍然生效，只是重启后可能复活。但登出撤销
+    // 丢失是安全纵深失效（P2：重启后已登出会话复活），必须可见 —— warn 含原因。
+    console.warn(`[admin] revoked-sessions 写盘失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 /** 兜底会话密钥：进程启动随机（randomBytes 32，模块级存一份，重启失效）。
  *  与旧的内存 token 会话同一生命周期语义 —— 签名密钥不可用时宁可重启失效，
@@ -448,11 +521,17 @@ export function revokedSessionCount(): number {
 }
 
 /** 按过期时刻清理黑名单：过期条目（expiry <= now）删掉。登出只会发生在
- *  会话有效期内，所以清理后黑名单尺寸恒 ≤ 一个 TTL 窗口内的登出数。 */
+ *  会话有效期内，所以清理后黑名单尺寸恒 ≤ 一个 TTL 窗口内的登出数。
+ *  有变动时同步落盘（否则重启会把这些本已过期的条目重新加载）。 */
 export function pruneRevokedSessions(now: number): void {
+  let changed = false;
   for (const [sig, expiry] of revokedSessions) {
-    if (expiry <= now) revokedSessions.delete(sig);
+    if (expiry <= now) {
+      revokedSessions.delete(sig);
+      changed = true;
+    }
   }
+  if (changed) persistRevokedSessions();
 }
 
 /** 测试专用：直接向黑名单注入一条（防 24h TTL 让过期清理/上限不可测）。
@@ -461,12 +540,21 @@ export function revokeSessionForTest(sig: string, expiry: number): void {
   addRevokedSession(sig, expiry);
 }
 
-function addRevokedSession(sig: string, expiry: number): void {
+/** 测试专用：清空内存黑名单（模拟进程重启 —— 只清内存，不动持久化文件，
+ *  供「登出持久化」用例验证重启后靠文件恢复）。 */
+export function resetRevokedSessionsForTest(): void {
+  revokedSessions.clear();
+}
+
+function addRevokedSession(sig: string, expiry: number, skipPersist = false): void {
   if (revokedSessions.size >= MAX_REVOKED_SESSIONS) {
     const oldest = revokedSessions.keys().next().value;
     if (oldest != null) revokedSessions.delete(oldest);
   }
   revokedSessions.set(sig, expiry);
+  // skipPersist 只给 configureRevokedSessions 的加载路径用：加载完统一写一次，
+  // 避免每条全量写盘（M-2，O(N²) 写放大）。
+  if (!skipPersist) persistRevokedSessions();
 }
 
 /** 登录失败限速：返回剩余锁定时长（ms，0 = 未锁定）。
@@ -848,6 +936,193 @@ async function handleOverviewTrend(req: IncomingMessage, res: ServerResponse, db
 }
 
 // ---------------------------------------------------------------------------
+// 性能仪表盘端点（GET /__admin/api/performance）
+// ---------------------------------------------------------------------------
+//
+// 契约：`{ok:true, data:{now, process:{rss, heapUsed, heapTotal, uptime,
+// cpuPercent}, os:{loadAvg:[1,5,15], totalMem, freeMem, cpuCount},
+// gateway:{concurrentInFlight, maxConcurrent, pool:{healthy, total}},
+// latency:{p50Ms, p95Ms, p99Ms, maxMs, count, sampled, windowMs, available},
+// oom:null}}`。rss/heap/totalMem/freeMem 单位字节，uptime 秒。
+//
+// - cpuPercent：process.cpuUsage() 两次采样差 / 墙钟间隔，归一到整机
+//   （÷ cpuCount，满核单进程在 2 核 VPS 上显示 50%）。采样状态（上次时刻 +
+//   usage）由调用方持有；间隔不足 1s 复用上次值。10s TTL 下实际采样间隔恒
+//   ≥10s，比强采样 1s 更稳（无 1s 阻塞）。
+// - latency：requests 表最近 5 分钟 duration_ms 分位。主查询带 LIMIT 1000 +
+//   idx_requests_at 范围扫描，扫描行数有界（不随窗口内流量无上限增长）；
+//   再跑一次同范围 COUNT(*) 得窗口内真实请求数。面板 2s tick → 服务端 10s
+//   TTL 缓存，DB 查询降到 6 次/分钟。
+// - oom：**省略**（读 cgroup/journalctl 才有真值，开销大且不可移植；RSS 条
+//   相对 PERF_RSS_CAP_BYTES 已给出内存压力近似）。固定返回 null。
+// 鉴权：路由处先过 isAdminRequest，再过 adminOriginAllowed（读也防跨站，与
+// requests/audit 同口径）。
+const PERF_TTL_MS = 10_000;
+const PERF_WINDOW_MS = 5 * 60_000;
+/** 延迟分位查询的扫描上限：百分位从最多这么多条里算，够了（再多只涨精度不涨意义）。 */
+const PERF_LATENCY_SAMPLE_CAP = 1000;
+/** RSS 条的服务端口径上限（前端渲染也用 256M 基准）。 */
+const PERF_RSS_CAP_BYTES = 256 * 1024 * 1024;
+/** 进程 CPU 采样的最小间隔（ms）。小于它就复用上次计算值。 */
+const CPU_SAMPLE_MIN_MS = 1000;
+
+/** 性能快照（CPU 采样）持有者：createApp 每实例一个，避免多实例共享状态。 */
+interface CpuSampleHolder {
+  at: number;
+  usage: { user: number; system: number };
+}
+
+/** 性能响应缓存持有者（10s TTL）。 */
+interface PerfCacheHolder {
+  at: number;
+  data: PerfData | null;
+}
+
+interface PerfDeps {
+  cfg: AppConfig;
+  db: UsageDb | null;
+  pool: KeyPool;
+  /** 当前并发门占用（createApp 闭包内的 concurrentInFlight）。 */
+  inFlight: () => number;
+  cache: PerfCacheHolder;
+  cpuSample: CpuSampleHolder;
+  now?: () => number;
+}
+
+export interface PerfData {
+  now: number;
+  process: { rss: number; heapUsed: number; heapTotal: number; uptime: number; cpuPercent: number };
+  os: { loadAvg: number[]; totalMem: number; freeMem: number; cpuCount: number };
+  gateway: { concurrentInFlight: number; maxConcurrent: number; pool: { healthy: number; total: number } };
+  latency: {
+    p50Ms: number;
+    p95Ms: number;
+    p99Ms: number;
+    maxMs: number;
+    /** 窗口内真实请求数（COUNT(*) 口径，不受采样 LIMIT 截断）。 */
+    count: number;
+    /** 实际参与分位计算的样本数（≤ PERF_LATENCY_SAMPLE_CAP）。 */
+    sampled: number;
+    windowMs: number;
+    /** false = db 未接线/查询失败（进程/OS/网关数据照常返回，不 503）。 */
+    available: boolean;
+  };
+  oom: null;
+}
+
+/** 排好序的数组取 q 分位（0-1）；空数组返回 0。 */
+function percentile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * q));
+  return sorted[idx]!;
+}
+
+/** 查询最近 PERF_WINDOW_MS 的延迟分位。db 不可用/查询失败 → available:false 空窗口。 */
+function queryLatency(db: UsageDb | null, now: number): PerfData['latency'] {
+  const empty: PerfData['latency'] = {
+    p50Ms: 0, p95Ms: 0, p99Ms: 0, maxMs: 0, count: 0, sampled: 0, windowMs: PERF_WINDOW_MS, available: false,
+  };
+  const sqlite = db == null ? null : db.sqlite();
+  if (sqlite == null || !db!.enabled) return empty;
+  try {
+    // 与 listRequests 同口径排除观测流量（probe/count_tokens）。
+    const since = now - PERF_WINDOW_MS;
+    const rows = sqlite
+      .prepare(
+        `SELECT duration_ms FROM requests
+         WHERE at >= ? AND endpoint NOT IN ('probe','count_tokens')
+         ORDER BY at DESC LIMIT ?`,
+      )
+      .all(since, PERF_LATENCY_SAMPLE_CAP) as Array<{ duration_ms: number | null }>;
+    const durations: number[] = [];
+    for (const r of rows) {
+      const d = Number(r.duration_ms);
+      if (Number.isFinite(d) && d >= 0) durations.push(d);
+    }
+    durations.sort((a, b) => a - b);
+    // 真实窗口请求数：独立 COUNT，同范围扫描 idx_requests_at，不被采样 LIMIT 截断。
+    const cnt = sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM requests
+         WHERE at >= ? AND endpoint NOT IN ('probe','count_tokens')`,
+      )
+      .get(since) as { n: number };
+    return {
+      p50Ms: percentile(durations, 0.5),
+      p95Ms: percentile(durations, 0.95),
+      p99Ms: percentile(durations, 0.99),
+      maxMs: durations.length ? durations[durations.length - 1]! : 0,
+      count: Number(cnt.n) || 0,
+      sampled: durations.length,
+      windowMs: PERF_WINDOW_MS,
+      available: true,
+    };
+  } catch {
+    // 降级为空窗口不 503：性能面板不该因观测数据失败整块不可用（进程/OS/网关在）。
+    return empty;
+  }
+}
+
+/** 采集一帧性能快照（进程/OS/网关/延迟）。调用方负责 10s TTL 缓存。 */
+function collectPerfData(deps: PerfDeps, now: number): PerfData {
+  const mem = process.memoryUsage();
+  const load = os.loadavg();
+  const cpuCount = os.cpus().length;
+
+  // 进程 CPU：绝对耗时差 / 墙钟间隔，归一到整机（÷cpuCount）。首次调用无样本 → 0。
+  const usage = process.cpuUsage();
+  const prev = deps.cpuSample;
+  let cpuPercent = 0;
+  if (prev && now - prev.at >= CPU_SAMPLE_MIN_MS) {
+    const du = (usage.user - prev.usage.user) + (usage.system - prev.usage.system);
+    const frac = du / (Math.max(1, now - prev.at) * 1000) / cpuCount;
+    cpuPercent = Math.round(frac * 1000) / 10;
+  }
+  deps.cpuSample.at = now;
+  deps.cpuSample.usage = usage;
+
+  const snap = deps.pool.snapshot();
+  let healthy = 0;
+  for (const k of snap) if (k.healthy) healthy++;
+
+  return {
+    now,
+    process: {
+      rss: mem.rss,
+      heapUsed: mem.heapUsed,
+      heapTotal: mem.heapTotal,
+      uptime: Math.floor(process.uptime()),
+      cpuPercent,
+    },
+    os: {
+      loadAvg: [load[0] ?? 0, load[1] ?? 0, load[2] ?? 0],
+      totalMem: os.totalmem(),
+      freeMem: os.freemem(),
+      cpuCount,
+    },
+    gateway: {
+      concurrentInFlight: deps.inFlight(),
+      maxConcurrent: deps.cfg.maxConcurrentRequests ?? 400,
+      pool: { healthy, total: snap.length },
+    },
+    latency: queryLatency(deps.db, now),
+    oom: null,
+  };
+}
+
+/** GET /__admin/api/performance：10s TTL 缓存的性能快照。 */
+export async function handlePerformanceRoute(req: IncomingMessage, res: ServerResponse, deps: PerfDeps): Promise<void> {
+  const now = deps.now?.() ?? Date.now();
+  let data = deps.cache.data;
+  if (data == null || now - deps.cache.at >= PERF_TTL_MS) {
+    data = collectPerfData(deps, now);
+    deps.cache.at = now;
+    deps.cache.data = data;
+  }
+  sendJson(res, 200, { ok: true, data });
+}
+
+// ---------------------------------------------------------------------------
 // 设置页热配置端点（GET/PATCH /__admin/api/settings）
 // ---------------------------------------------------------------------------
 //
@@ -855,9 +1130,10 @@ async function handleOverviewTrend(req: IncomingMessage, res: ServerResponse, db
 // - 都已过 isAdminRequest；**GET/PATCH 都过 adminOriginAllowed**（读也防跨站，
 //   与 tokens 读端点同口径 —— 账号状态/密钥掩码是管理面信息）。
 // - GET：`{ok:true, data:{settings: {<key>: {value, default, source}}}}`。
-//   value = 当前生效值（cfg，PATCH/启动应用后即真值）；default = env 默认
-//   （SETTINGS_META，与 config.ts 对齐）；source = 'env' | 'db'（settings 表
-//   里有该键即 'db'）。
+//   value = 当前生效值（cfg，PATCH/启动应用后即真值）；default = 代码默认
+//   （SETTINGS_META，与 config.ts 对齐）；source = 'db' | 'env' | 'code-default'
+//   （settings 表里有该键即 'db'；否则 cfg 当前值非默认即 'env'（env 显式配置）；
+//   再否则 'code-default'——真实来源，不再把所有非 db 一律标成 env）。
 //   **隐私口径**：adminPass 的 value/default 恒为 ''（活密码与默认密码都不
 //   回显）；顶层 `adminPassIsDefault` 精确给出「当前生效密码是否等于默认值」
 //   （面板据此显示「建议修改默认密码」的强提示，比按 source 推断准确 ——
@@ -899,6 +1175,8 @@ function currentSettingValue(cfg: AppConfig, key: string): unknown {
       return cfg.compactTriggerBytes;
     case 'compactMaxMessageChars':
       return cfg.compactMaxMessageChars;
+    case 'globalRpmLimit':
+      return cfg.globalRpmLimit ?? 0;
     case 'allowedModels':
       // MODEL-ACCESS 全局白名单（审查 MINOR-4）：settings GET 的 value 字段
       // 缺了会让 API 表面出现半截字段（default/source 有、value 无）。
@@ -908,12 +1186,36 @@ function currentSettingValue(cfg: AppConfig, key: string): unknown {
   }
 }
 
+/** settings 生效值的真实来源（审计 P0：source 标记不许撒谎）。
+ *  - settings 表有该键 → 'db'（热配置覆盖一切）；
+ *  - 否则 cfg 当前值 ≠ 代码默认 → 'env'（env 显式配置生效）；
+ *  - 否则 → 'code-default'（什么都没配，用的代码里写死的默认值）。
+ * 与「非默认值即 env 显式」口径一致：env 显式设成默认值（等价于没配）归
+ * code-default，语义上不影响排查「哪个生效」。 */
+export type SettingsSource = 'db' | 'env' | 'code-default';
+
+/** 数组按值比较（apiKeys/allowedModels 是数组，`!==` 对引用恒真）。 */
+function settingsValueEquals(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => v === b[i]);
+  }
+  return a === b;
+}
+
+function settingSource(cfg: AppConfig, key: string, stored: Record<string, string>): SettingsSource {
+  if (stored[key] != null) return 'db';
+  const meta = SETTINGS_META[key]!;
+  const current = currentSettingValue(cfg, key);
+  return settingsValueEquals(current, meta.default) ? 'code-default' : 'env';
+}
+
 /**
  * 组装 settings 全量视图（GET/PATCH 响应共用；stored 决定 source 标记）。
  *
  * **隐私口径（与「key 星号挡住」同级别）**：
  * - adminPass 的 value 与 default 都恒为 '' —— 活密码与默认密码都不回显，
- *   source 才有意义（'env' = 用默认密码，面板提示「建议修改」；'db' = 已热改）。
+ *   source 才有意义（'db' = 已热改；'env' = env 显式配了非默认密码；否则
+ *   'code-default' = 用的默认密码，面板提示「建议修改」）。
  * - apiKeys 的 value 是掩码数组（`****XXXX` 末 4 位，keyFingerprint 同款）——
  *   面板能看出「生效了几个、长什么样」，但拿不到明文。明文只在 PATCH 请求体
  *   里由管理端自己提供。
@@ -921,19 +1223,30 @@ function currentSettingValue(cfg: AppConfig, key: string): unknown {
 function settingsView(
   cfg: AppConfig,
   stored: Record<string, string>,
-): Record<string, { value: unknown; default: unknown; source: 'env' | 'db' }> {
-  const out: Record<string, { value: unknown; default: unknown; source: 'env' | 'db' }> = {};
+): Record<string, { value: unknown; default: unknown; source: SettingsSource }> {
+  const out: Record<string, { value: unknown; default: unknown; source: SettingsSource }> = {};
   for (const key of Object.keys(SETTINGS_META)) {
     const meta = SETTINGS_META[key]!;
     if (key === 'adminPass') {
-      out[key] = { value: '', default: '', source: stored[key] != null ? 'db' : 'env' };
+      out[key] = {
+        value: '',
+        default: '',
+        source: stored[key] != null ? 'db' : cfg.adminPass !== DEFAULT_ADMIN_PASS ? 'env' : 'code-default',
+      };
+      continue;
+    }
+    // modelPrices 只存 settings 表（不走 AppConfig，settle 时按需读），env 无法
+    // 显式配置 → 未存即 code-default（不是 env）。
+    if (key === 'modelPrices') {
+      const parsed = parseSettingValue('modelPrices', stored[key] ?? '{}');
+      out[key] = { value: parsed.ok ? parsed.value : {}, default: meta.default, source: stored[key] != null ? 'db' : 'code-default' };
       continue;
     }
     const current = currentSettingValue(cfg, key);
     out[key] = {
       value: key === 'apiKeys' ? (current as string[]).map((k) => keyFingerprint(k)) : current,
       default: meta.default,
-      source: stored[key] != null ? 'db' : 'env',
+      source: settingSource(cfg, key, stored),
     };
   }
   return out;
@@ -1235,6 +1548,8 @@ type ModelAccessDeps = {
   tokens: TokensStore | null;
   pool: KeyPool;
   store: AccountsStore | null;
+  /** 可选：上游定价源（全局白名单「可选模型」网格用 v2/config 62 模型）。 */
+  consoleClient?: ConsoleClientLike | null;
 };
 
 /** 授权端点请求体上限（模型名很短，64KB 纯防御，与 settings 端点同量级）。 */
@@ -1302,6 +1617,34 @@ async function handleGetModelAccess(
   for (const row of deps.modelAccess.listByType('token')) tokenCustom.set(row.subjectId, row.models);
   const apiKeyCustom = new Map<string, string[]>();
   for (const row of deps.modelAccess.listByType('api-key')) apiKeyCustom.set(row.subjectId, row.models);
+  // 上游全量模型名（v2/config pricing，62 个）——「全局白名单可选模型」网格的数据源。
+  // 从第一个有 console 凭据的账号拉（上游模型全集各账号一致）；失败/无账号 → 空数组
+  // （前端回退 datalist：详情页缓存 + 服务端可选项）。
+  let pricing: string[] = [];
+  if (deps.consoleClient != null && deps.store != null && deps.store.enabled) {
+    try {
+      const accs = deps.store.list();
+      const target = accs.find(
+        (a) => deps.store!.getOauthRefresh(a.id) != null || deps.store!.cookieOf(a.id) != null,
+      );
+      if (target != null) {
+        const p = await deps.consoleClient.modelPricing(target.id);
+        if (p && typeof p === 'object' && (p as Record<string, unknown>).providers != null) {
+          const provs = (p as Record<string, unknown>).providers as Record<string, unknown>;
+          const set = new Set<string>();
+          for (const pid of Object.keys(provs)) {
+            const models = (provs[pid] as Record<string, unknown> | undefined)?.models as
+              | Record<string, unknown>
+              | undefined;
+            if (models != null) for (const mid of Object.keys(models)) set.add(mid);
+          }
+          pricing = [...set].sort();
+        }
+      }
+    } catch {
+      pricing = [];
+    }
+  }
   sendJson(res, 200, {
     ok: true,
     data: {
@@ -1310,7 +1653,8 @@ async function handleGetModelAccess(
         source: stored != null ? 'settings' : 'code',
         core: [...ALLOWED_MODELS],
       },
-      models: [...new Set([...Object.keys(deps.cfg.modelMap), ...ALLOWED_MODELS])],
+      models: [...new Set([...Object.keys(deps.cfg.modelMap), ...ALLOWED_MODELS, ...effectiveGlobalModels(deps.cfg)])],
+      pricing,
       keys: {
         tokens: (deps.tokens != null ? deps.tokens.list() : []).map((t) => ({
           id: t.id,
@@ -1333,8 +1677,9 @@ async function handleGetModelAccess(
 
 /**
  * PUT /__admin/api/model-access/global：写全局白名单（settings 热配置）。
- * models null/空 = 删 settings 键回代码默认（硬底线）；否则校验（≤50、trim
- * 去重、必须在 ALLOWED_MODELS 内 —— 硬底线不可放宽）后写 settings + apply 内存。
+ * models null/空 = 删 settings 键回代码默认（ALLOWED_MODELS，deepseek 两个）；
+ * 否则校验（≤50、trim 去重、任意合法模型名，可含 claude-* 系 / gpt-* 系）后写
+ * settings + apply 内存。模型是否被上游支持由上游裁决（网关透传上游错误）。
  */
 async function handlePutModelAccessGlobal(
   req: IncomingMessage,
@@ -1412,7 +1757,8 @@ async function handlePutModelAccessGlobal(
  * PUT /__admin/api/model-access/keys/:type/:subject：单 key 自定义授权。
  * 校验 subject 真实存在（token 查 tokens 表指纹 / api-key 对 cfg.apiKeys 逐
  * sha256 比对 / upstream-key 经 pool.hasKeyWithHash），不存在 404。models 校验
- * 与全局同规则（硬底线内）；null = 删行清除自定义、回退全局/账号。
+ * 与全局同规则（任意合法模型名，可含 claude-* 系 / gpt-* 系）；null = 删行清除
+ * 自定义、回退全局/账号。
  */
 async function handlePutModelAccessKey(
   req: IncomingMessage,
@@ -1522,6 +1868,8 @@ const TOKEN_NAME_MAX = 100;
 const TOKEN_NOTE_MAX = 200;
 /** rpmLimit 上限：1,000,000/min 是现实流量到不了的量级，纯防御。 */
 const TOKEN_RPM_MAX = 1_000_000;
+/** $ 配额定价表缓存 TTL：settle 每请求调用，settings 点查不该每请求打（5s 滞后无影响）。 */
+const MODEL_PRICES_CACHE_TTL_MS = 5_000;
 
 /** tokens 写操作请求体上限。 */
 const TOKENS_BODY_MAX_BYTES = 64 * 1024;
@@ -1533,6 +1881,13 @@ type TokenPatchInput = {
   note?: string | null;
   rpmLimit?: number;
   tokenPlain?: string | null;
+  quotaUsd?: number;
+  quotaTokens?: number;
+  quotaRequests?: number;
+  cycle?: QuotaCycle;
+  expiresAt?: number;
+  quotaTpm?: number;
+  ipWhitelist?: string[];
 };
 
 /** tokens 数据面不可用（未接线 / db 挂）的统一 503。 */
@@ -1591,7 +1946,115 @@ function validateTokenPatch(body: Record<string, unknown>): { ok: true; patch: T
       patch.tokenPlain = null;
     }
   }
+  const q = parseTokenQuota(body);
+  if (!q.ok) return q;
+  if (q.quota.quotaUsd !== undefined) patch.quotaUsd = q.quota.quotaUsd;
+  if (q.quota.quotaTokens !== undefined) patch.quotaTokens = q.quota.quotaTokens;
+  if (q.quota.quotaRequests !== undefined) patch.quotaRequests = q.quota.quotaRequests;
+  if (q.quota.cycle !== undefined) patch.cycle = q.quota.cycle;
+  if (q.quota.expiresAt !== undefined) patch.expiresAt = q.quota.expiresAt;
+  if (q.quota.quotaTpm !== undefined) patch.quotaTpm = q.quota.quotaTpm;
+  if (q.quota.ipWhitelist !== undefined) patch.ipWhitelist = q.quota.ipWhitelist;
   return { ok: true, patch };
+}
+
+/**
+ * token 配额字段校验（POST / PATCH 共用，QUOTA.md §1）：非负数、cycle 枚举、
+ * expiresAt 整数、quotaTpm 非负整数、ipWhitelist 逗号分隔字符串。undefined =
+ * 未提供（不设置）。0 = 无限（$ 用 quotaUsd，tokens 用 quotaTokens，请求数用
+ * quotaRequests，TPM 用 quotaTpm）。
+ */
+function parseTokenQuota(body: Record<string, unknown>): { ok: true; quota: TokenQuotaInput } | { ok: false; error: string } {
+  const quota: TokenQuotaInput = {};
+  if (body.quotaUsd !== undefined) {
+    if (typeof body.quotaUsd !== 'number' || !Number.isFinite(body.quotaUsd) || body.quotaUsd < 0) {
+      return { ok: false, error: 'quotaUsd must be a non-negative number' };
+    }
+    quota.quotaUsd = body.quotaUsd;
+  }
+  if (body.quotaTokens !== undefined) {
+    if (typeof body.quotaTokens !== 'number' || !Number.isInteger(body.quotaTokens) || body.quotaTokens < 0) {
+      return { ok: false, error: 'quotaTokens must be a non-negative integer' };
+    }
+    quota.quotaTokens = body.quotaTokens;
+  }
+  if (body.quotaRequests !== undefined) {
+    if (typeof body.quotaRequests !== 'number' || !Number.isInteger(body.quotaRequests) || body.quotaRequests < 0) {
+      return { ok: false, error: 'quotaRequests must be a non-negative integer' };
+    }
+    quota.quotaRequests = body.quotaRequests;
+  }
+  if (body.quotaCycle !== undefined) {
+    if (body.quotaCycle !== 'none' && body.quotaCycle !== 'daily' && body.quotaCycle !== 'monthly') {
+      return { ok: false, error: 'quotaCycle must be none, daily or monthly' };
+    }
+    quota.cycle = body.quotaCycle;
+  }
+  if (body.expiresAt !== undefined) {
+    if (typeof body.expiresAt !== 'number' || !Number.isInteger(body.expiresAt) || body.expiresAt < 0) {
+      return { ok: false, error: 'expiresAt must be a non-negative integer (epoch ms, 0 = never)' };
+    }
+    quota.expiresAt = body.expiresAt;
+  }
+  if (body.quotaTpm !== undefined) {
+    if (typeof body.quotaTpm !== 'number' || !Number.isInteger(body.quotaTpm) || body.quotaTpm < 0) {
+      return { ok: false, error: 'quotaTpm must be a non-negative integer (0 = unlimited)' };
+    }
+    quota.quotaTpm = body.quotaTpm;
+  }
+  if (body.ipWhitelist !== undefined) {
+    // 逗号分隔字符串（空串/null = 清空 = 不限 IP）；数组按原样 join 落库。
+    if (body.ipWhitelist === null || body.ipWhitelist === '') {
+      quota.ipWhitelist = [];
+    } else if (typeof body.ipWhitelist === 'string') {
+      if (body.ipWhitelist.length > 400) {
+        return { ok: false, error: 'ipWhitelist must be at most 400 characters' };
+      }
+      quota.ipWhitelist = body.ipWhitelist
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else {
+      return { ok: false, error: 'ipWhitelist must be a comma-separated string or null' };
+    }
+  }
+  return { ok: true, quota };
+}
+
+/**
+ * 本地限流的统一 429 出口（token RPM / 全局 RPM / TPM 共用）。
+ *
+ * body 按协议分形：Anthropic messages 回 `{type:'error',error:{type:'rate_limit_error'}}`
+ * （Claude Code 期望的原生错误格式），OpenAI chat 回 `{error:{type:'rate_limit_error'}}`
+ * （与 errors.ts anthropicErrorToOpenAI 的出口同形）。两个都带 retry-after 头。
+ *
+ * 观测：写进 ctx.error（调用方传 ctxError 文案），这条 429 会在 finally 落库
+ * （requests.error 列），面板能看出在撞哪种限流。不进 console（客户端死循环
+ * 重试会刷屏）。
+ *
+ * sendJson 的 writeHead 会与已 setHeader 的头合并，先设 retry-after 再写。
+ * 429 在 readBody 之前触发，请求体可能还在路上：resume 把残余 body 排空，
+ * 否则未消费的 body 残留在 socket 上，被当成下一个请求解析（keep-alive 假 400）。
+ * connection: close 双保险——限流响应不值得保连接。
+ */
+function sendRateLimit429(
+  req: IncomingMessage,
+  res: ServerResponse,
+  path: string,
+  message: string,
+  retryAfterSec: number,
+  ctx: MetricsCtx,
+  ctxError: string,
+): void {
+  ctx.error = ctxError;
+  const body =
+    path === '/v1/messages'
+      ? { type: 'error', error: { type: 'rate_limit_error', message } }
+      : { error: { message, type: 'rate_limit_error' } };
+  res.setHeader('retry-after', String(retryAfterSec));
+  res.setHeader('connection', 'close');
+  req.resume();
+  sendJson(res, 429, body);
 }
 
 /**
@@ -1604,14 +2067,9 @@ function validateTokenPatch(body: Record<string, unknown>): { ok: true; patch: T
  * 热路径优化：rpmLimit 是 verifyAuth 里 tokens.verify 同一次点查带回来的
  * （tokens 行同一列），这里直接用，不再为同一指纹做第二次同步点查。
  *
- * 拒绝时写 429：Anthropic messages 回 `{type:'error',error:{type:'rate_limit_error'}}`
- * （Claude Code 期望的原生错误格式），OpenAI chat 回 `{error:{type:'rate_limit_error'}}`
- * （与 errors.ts anthropicErrorToOpenAI 的出口同形）。两个都带 retry-after 头。
- * 被拒的请求不计入实际转发（不消耗上游额度）。
- *
  * 调用方在检查失败时直接 return（响应已写完）。
  */
-function checkTokenRpmLimit(
+export function checkTokenRpmLimit(
   req: IncomingMessage,
   res: ServerResponse,
   path: string,
@@ -1624,30 +2082,215 @@ function checkTokenRpmLimit(
   const verdict = limiter.check(tokenFp, rpmLimit);
   if (verdict.allowed) return true;
   const retryAfterSec = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
-  // 观测：写进 ctx.error，这条 429 会在 finally 落库（requests.error 列），
-  // 面板能看出这个 token 在撞限流。不进 console（客户端死循环重试会刷屏）。
-  ctx.error = `rate-limited:${path} rpm=${rpmLimit}`;
-  const message = `rate limit exceeded (${rpmLimit}/min), retry in ${retryAfterSec}s`;
-  const body =
-    path === '/v1/messages'
-      ? { type: 'error', error: { type: 'rate_limit_error', message } }
-      : { error: { message, type: 'rate_limit_error' } };
-  // sendJson 的 writeHead 会与已 setHeader 的头合并，先设 retry-after 再写。
-  res.setHeader('retry-after', String(retryAfterSec));
-  res.setHeader('connection', 'close');
-  // 429 在 readBody 之前触发，请求体可能还在路上：resume 把残余 body 排空，
-  // 否则未消费的 body 残留在 socket 上，被当成下一个请求解析（keep-alive 假 400）。
-  // connection: close 双保险——限流响应不值得保连接。
-  req.resume();
-  sendJson(res, 429, body);
+  sendRateLimit429(
+    req,
+    res,
+    path,
+    `rate limit exceeded (${rpmLimit}/min), retry in ${retryAfterSec}s`,
+    retryAfterSec,
+    ctx,
+    `rate-limited:${path} rpm=${rpmLimit}`,
+  );
   return false;
 }
 
-/** GET /__admin/api/tokens：列表（每个 token 附用量统计）。 */
+/** 全局 RPM 的滑窗键（ratelimit.ts RpmLimiter 共享实例内的固定 key）。 */
+export const GLOBAL_RPM_KEY = '__global__';
+
+/**
+ * 全局 RPM 上限（数据面整体保护）：所有数据面真实请求共享同一个滑窗
+ * （ratelimit.ts RpmLimiter，key='__global__'），超限 429。
+ *
+ * 与 per-token RPM 互补：per-token 限单个分发 key 的滥用，全局限「N 个
+ * key/API key 一起打满」的洪峰（并发门 400 只防同时堆积，不防单位时间
+ * 洪峰）。`limit <= 0` = 关闭（默认，不改变现状行为）。只对数据面真实
+ * 请求生效（调用点只在 /v1/chat/completions + /v1/messages），count_tokens
+ * / healthz / 静态路径不计入。
+ */
+export function checkGlobalRpmLimit(
+  req: IncomingMessage,
+  res: ServerResponse,
+  path: string,
+  limit: number,
+  limiter: RpmLimiter,
+  ctx: MetricsCtx,
+): boolean {
+  if (limit <= 0) return true;
+  const verdict = limiter.check(GLOBAL_RPM_KEY, limit);
+  if (verdict.allowed) return true;
+  const retryAfterSec = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
+  sendRateLimit429(
+    req,
+    res,
+    path,
+    `global rate limit exceeded (${limit}/min), retry in ${retryAfterSec}s`,
+    retryAfterSec,
+    ctx,
+    `rate-limited:${path} global-rpm=${limit}`,
+  );
+  return false;
+}
+
+/**
+ * 分发 token 的 TPM（每分钟 token 上限）检查（鉴权后、转发前）。
+ *
+ * 语义（TPM 预估取舍，见 ratelimit.ts TpmLimiter）：**请求前检查当前分钟
+ * 已用**，`used >= limit` → 429；不预估本次请求会消耗多少（不做
+ * max_tokens + input 粗估预扣 —— 完成时累加真实用量零误差）。放行后 settle
+ * 累加，过量就过量，窗口滚动即恢复。被 429 拒的请求不消耗 TPM。
+ * 429 retry-after = 距下一分钟边界秒数（窗口滚动即恢复）。
+ *
+ * 只对分发 token 生效（tokenFp 非空）；quota_tpm<=0 = 不限流。复用
+ * quotaCheck 的缓存快照（tpmLimit 与配额同一次点查带回来）。
+ */
+export function checkTokenTpmLimit(
+  req: IncomingMessage,
+  res: ServerResponse,
+  path: string,
+  ctx: MetricsCtx,
+  tokens: TokensStore | null,
+  limiter: TpmLimiter,
+): boolean {
+  if (ctx.tokenFp == null || tokens == null) return true;
+  let q: { tpmLimit: number } | null = null;
+  try {
+    q = tokens.quotaCheck(ctx.tokenFp);
+  } catch {
+    // 查询异常按放行处理（观测设施降级哲学，同 checkTokenQuota）。
+    return true;
+  }
+  if (q == null || q.tpmLimit <= 0) return true;
+  if (limiter.check(ctx.tokenFp, q.tpmLimit).allowed) return true;
+  const now = Date.now();
+  const retryAt = (Math.floor(now / 60_000) + 1) * 60_000;
+  const retryAfterSec = Math.max(1, Math.ceil((retryAt - now) / 1000));
+  sendRateLimit429(
+    req,
+    res,
+    path,
+    `TPM limit exceeded (${q.tpmLimit}/min), retry in ${retryAfterSec}s`,
+    retryAfterSec,
+    ctx,
+    `rate-limited:${path} tpm=${q.tpmLimit}`,
+  );
+  return false;
+}
+
+/**
+ * 分发 token 的 IP 白名单检查（鉴权后、转发前）。
+ *
+ * ip_whitelist 非空且客户端 IP 不在白名单 → 403（`ip not allowed`）——
+ * 白名单是 fail-closed：无 IP（remoteAddress 缺失/非法）也拒。
+ *
+ * **IP 来源 = 网关直连对端（req.socket.remoteAddress）**，不是转发头里的
+ * cf-connecting-ip/x-forwarded-for。为什么不用转发头：白名单是安全控制，
+ * 转发头可被客户端伪造（直连网关时伪造 xff 即绕过）。FurCDN 场景的语义：
+ * remoteAddress 是 FurCDN 边缘 IP，不是终端用户 IP —— 白名单应填网关看到
+ * 的 IP/CIDR（FurCDN 边缘段），或绕过 CDN 直连时的真实客户端 IP。IPv4 映射
+ * （::ffff:x.x.x.x）在 ipInList 里自动归一。
+ */
+export function checkTokenIpWhitelist(
+  req: IncomingMessage,
+  res: ServerResponse,
+  path: string,
+  ctx: MetricsCtx,
+  tokens: TokensStore | null,
+): boolean {
+  if (ctx.tokenFp == null || tokens == null) return true;
+  let q: { ipWhitelist: string[] } | null = null;
+  try {
+    q = tokens.quotaCheck(ctx.tokenFp);
+  } catch {
+    // 查询异常按放行处理（观测设施降级哲学，同 checkTokenQuota）。
+    return true;
+  }
+  if (q == null) return true;
+  const list = q.ipWhitelist;
+  if (list.length === 0) return true;
+  const ip = (req.socket?.remoteAddress ?? '').slice(0, 64);
+  if (ipInList(ip, list)) return true;
+  ctx.error = 'token-ip-not-allowed';
+  res.setHeader('connection', 'close');
+  req.resume();
+  sendJson(
+    res,
+    403,
+    path === '/v1/messages'
+      ? { type: 'error', error: { type: 'authentication_error', message: 'ip not allowed' } }
+      : { error: { message: 'ip not allowed', type: 'invalid_request_error' } },
+  );
+  return false;
+}
+
+/**
+ * 分发 token 的配额检查（鉴权后、转发前，QUOTA.md §3）。只对分发 token
+ * 生效（tokenFp 非空）。顺序：expires_at 过期 → 403；任一口径 used ≥ 上限 →
+ * 429（type：OpenAI `insufficient_quota` / Anthropic `rate_limit_error`）。
+ * 429 带 retry-after（复用 RPM 429 路径的客户端兼容语义；具体取值见下方 M-3）。
+ *
+ * **不进 keypool 冷却**：quota-exhausted 是客户端分发配额，不是上游 key 故障
+ * （与 keypool 的 quota 冷却无关，分发 key 配额独立）。
+ *
+ * 拒绝时写 ctx.error → 请求落 requests 表（status=403/429），面板可见拒绝计数。
+ * model_limits 在模型门（clientKeyGate → checkModelGate）处理，不在这里。
+ */
+export function checkTokenQuota(
+  req: IncomingMessage,
+  res: ServerResponse,
+  path: string,
+  ctx: MetricsCtx,
+  tokens: TokensStore | null,
+): boolean {
+  if (ctx.tokenFp == null || tokens == null) return true;
+  let q: { expired: boolean; exhausted: boolean; resetAt: number } | null = null;
+  try {
+    q = tokens.quotaCheck(ctx.tokenFp);
+  } catch {
+    // 查询异常按放行处理（观测设施降级哲学：配额校验失败不阻断请求）。
+    return true;
+  }
+  if (q == null) return true;
+  if (q.expired) {
+    ctx.error = 'token-expired';
+    res.setHeader('connection', 'close');
+    req.resume();
+    sendJson(
+      res,
+      403,
+      path === '/v1/messages'
+        ? { type: 'error', error: { type: 'authentication_error', message: 'token expired' } }
+        : { error: { message: 'token expired', type: 'invalid_request_error' } },
+    );
+    return false;
+  }
+  if (q.exhausted) {
+    ctx.error = 'quota-exhausted';
+    // M-3：retry-after 不再硬编码 1s。有周期（daily/monthly，下一重置时刻在将来）
+    // → 给到距下次重置的秒数（下限 1s），naive 客户端按它等窗口翻过去再重试；
+    // 无周期（none，配额不会自动重置）→ 不带 retry-after —— 否则 naive 客户端
+    // 1s 重试死循环刷屏（等再久也不会恢复，重试没有意义）。
+    if (q.resetAt > Date.now()) {
+      res.setHeader('retry-after', String(Math.max(1, Math.ceil((q.resetAt - Date.now()) / 1000))));
+    }
+    res.setHeader('connection', 'close');
+    req.resume();
+    sendJson(
+      res,
+      429,
+      path === '/v1/messages'
+        ? { type: 'error', error: { type: 'rate_limit_error', message: 'insufficient quota' } }
+        : { error: { message: 'insufficient quota', type: 'insufficient_quota' } },
+    );
+    return false;
+  }
+  return true;
+}
+
+/** GET /__admin/api/tokens：列表（每个 token 附用量统计 + 实时 TPM 已用）。 */
 async function handleListTokens(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { db: UsageDb | null; tokens: TokensStore | null },
+  deps: { db: UsageDb | null; tokens: TokensStore | null; usedTpmOf: (fingerprint: string) => number },
 ): Promise<void> {
   if (deps.tokens == null || deps.db == null || !deps.db.enabled) {
     sendJson(res, 503, { error: { message: tokensUnavailable(deps), type: 'server_error' } });
@@ -1655,7 +2298,10 @@ async function handleListTokens(
   }
   const usage = new Map(deps.tokens.usage().map((r) => [r.fingerprint, r.usage]));
   const zero = { requests: 0, inputTokens: 0, outputTokens: 0, costMicroCents: 0 };
-  const items = deps.tokens.list().map((t) => ({ ...t, usage: usage.get(t.fingerprint) ?? zero }));
+  // usedTpm 是内存窗口（TpmLimiter），tokens.ts 视图恒 0，这里填真实值。
+  const items = deps.tokens
+    .list()
+    .map((t) => ({ ...t, quota: { ...t.quota, usedTpm: deps.usedTpmOf(t.fingerprint) }, usage: usage.get(t.fingerprint) ?? zero }));
   sendJson(res, 200, { ok: true, data: { items } });
 }
 
@@ -1742,7 +2388,12 @@ async function handleCreateToken(
     }
     note = t === '' ? null : t;
   }
-  const r = deps.tokens.create(name, note, customKey);
+  const q = parseTokenQuota(b);
+  if (!q.ok) {
+    sendJson(res, 400, { error: { message: q.error, type: 'invalid_request_error' } });
+    return;
+  }
+  const r = deps.tokens.create(name, note, customKey, q.quota);
   if (!r.ok) {
     deps.db.insertAdminAudit({ at: Date.now(), op: 'token.create', accountId: null, ok: false, note: name, ip: clientIpOf(req) });
     sendJson(res, 500, { error: { message: 'failed to create token', type: 'server_error' } });
@@ -1756,7 +2407,7 @@ async function handleCreateToken(
 async function handlePatchToken(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: { db: UsageDb | null; tokens: TokensStore | null },
+  deps: { db: UsageDb | null; tokens: TokensStore | null; usedTpmOf: (fingerprint: string) => number },
   id: number,
 ): Promise<void> {
   if (deps.tokens == null || deps.db == null || !deps.db.enabled) {
@@ -1822,7 +2473,12 @@ async function handlePatchToken(
     note: `id=${id} ${fields.join(',')}`,
     ip: clientIpOf(req),
   });
-  sendJson(res, 200, { ok: true, data: deps.tokens.get(id) });
+  // usedTpm 是内存窗口（TpmLimiter），tokens.ts 视图恒 0，PATCH 回读填真实值。
+  const updated = deps.tokens.get(id);
+  sendJson(res, 200, {
+    ok: true,
+    data: updated ? { ...updated, quota: { ...updated.quota, usedTpm: deps.usedTpmOf(updated.fingerprint) } } : null,
+  });
 }
 
 /** DELETE /__admin/api/tokens/:id：删除（幂等）。 */
@@ -1917,8 +2573,15 @@ async function handleGatewayUsageRoute(
   sendJson(res, 200, { ok: true, data: { ...usage, scope: 'legacy' } });
 }
 
-/** 池总用量：requests 表所有真实 key_fp（非 '-' 未归属）的请求统计。 */
-async function gatewayPoolUsage(db: UsageDb | null, rangeDays: number): Promise<{ requests: number; inputTokens: number; outputTokens: number; costMicroCents: number }> {
+/**
+ * 池总用量：requests 表所有真实 key_fp（非 '-' 未归属）的请求统计。
+ *
+ * 口径与 usageTrend/usageByKey 的聚合一致：排除 probe（探活）与 count_tokens
+ * （Claude Code 每条消息前的记账请求）——否则 count_tokens 会把「网关总用量」
+ * 的请求数虚增一倍（审计 P0 口径漂移）。注意 count_tokens 记账请求仍落库，
+ * 只是不计入「真实请求」聚合。
+ */
+export async function gatewayPoolUsage(db: UsageDb | null, rangeDays: number): Promise<{ requests: number; inputTokens: number; outputTokens: number; costMicroCents: number }> {
   const zero = { requests: 0, inputTokens: 0, outputTokens: 0, costMicroCents: 0 };
   if (db == null || !db.enabled) return zero;
   try {
@@ -1927,7 +2590,7 @@ async function gatewayPoolUsage(db: UsageDb | null, rangeDays: number): Promise<
       .sqlite()
       .prepare(
         `SELECT COUNT(*) AS n, COALESCE(SUM(input_tokens),0) AS it, COALESCE(SUM(output_tokens),0) AS ot, COALESCE(SUM(cost_micro_cents),0) AS cm
-         FROM requests WHERE at >= ? AND endpoint != 'probe' AND key_fp != '-' AND key_fp != ''`,
+         FROM requests WHERE at >= ? AND endpoint NOT IN ('probe', 'count_tokens') AND key_fp != '-' AND key_fp != ''`,
       )
       .get(since) as { n: number; it: number; ot: number; cm: number };
     return { requests: Number(rows.n), inputTokens: Number(rows.it), outputTokens: Number(rows.ot), costMicroCents: Number(rows.cm) };
@@ -1939,6 +2602,128 @@ async function gatewayPoolUsage(db: UsageDb | null, rangeDays: number): Promise<
 /** db 可用的简写（UsageDb 构造永不抛，enabled 才是真相）。 */
 function dbAvailable(db: UsageDb | null): db is UsageDb {
   return db != null && db.enabled;
+}
+
+/**
+ * GET /__admin/api/keys/usage：全部 key（池 key + 账号 legacy key）的窗口用量
+ * 聚合 + 元数据合并。前端 key 详情页的数据源。
+ *
+ * 契约（字段给前端）：`{ ok, data: { rangeDays, sinceMs, keys: [...] } }`。
+ * 每条 key：`fingerprint`（****XXXX）、`accountId`、`accountName`、
+ * `nickname`（null=未命名）、`healthy`（true/false；**null = 池外 legacy key**，
+ * 无 pool 健康态，前端不渲染健康徽章/启停按钮）、`disabledReason`（仅
+ * healthy=false 时出现）、`recoverInMs`、以及用量 `requests/ok/failed/
+ * inputTokens/outputTokens/tokens/costMicroCents/lastAt`（窗口内无请求全 0，
+ * lastAt=0）。池外 legacy key 与池 key 指纹相同时合并（只出现一次）。
+ * db 不可用时用量补零（keys 仍全量返回，观测设施降级哲学）。
+ */
+async function handleKeysUsageRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { store: AccountsStore | null; pool: KeyPool; db: UsageDb | null },
+): Promise<void> {
+  let rangeDays = 7;
+  const qs = (req.url ?? '').split('?')[1];
+  if (qs) {
+    try {
+      const params = new URLSearchParams(qs);
+      const raw = Number.parseInt(params.get('rangeDays') ?? '', 10);
+      if (Number.isFinite(raw) && raw >= 1) rangeDays = Math.min(90, Math.floor(raw));
+    } catch {
+      // 畸形 query 用默认 7 天。
+    }
+  }
+  const now = Date.now();
+  const sinceMs = now - rangeDays * 86_400_000;
+  const agg = dbAvailable(deps.db) ? deps.db.keyUsageAll(rangeDays, now) : null;
+  const byFp = new Map((agg ?? []).map((r) => [r.fingerprint, r]));
+  const zero = { requests: 0, ok: 0, failed: 0, inputTokens: 0, outputTokens: 0, tokens: 0, costMicroCents: 0, lastAt: 0 };
+  const usageOf = (fp: string) => byFp.get(fp) ?? zero;
+  // 元数据：账号名 + fingerprint→nickname 映射 + 池外 legacy key 指纹。
+  const accountName = new Map<number, string>();
+  const nicknames = new Map<string, string | null>();
+  const legacyFps = new Map<string, number>();
+  const storeOk = deps.store != null && deps.store.enabled;
+  if (storeOk) {
+    for (const acc of deps.store!.list()) {
+      accountName.set(acc.id, acc.name);
+      for (const [fp, nick] of deps.store!.keyNicknameMap(acc.id)) {
+        if (!nicknames.has(fp)) nicknames.set(fp, nick);
+      }
+      const lk = deps.store!.legacyKeyOf(acc.id);
+      if (lk) {
+        const fp = keyFingerprint(lk);
+        if (!legacyFps.has(fp)) legacyFps.set(fp, acc.id);
+      }
+    }
+  }
+  const accountNameOf = (id: number): string => accountName.get(id) ?? (id === 0 ? 'env' : `account #${id}`);
+  const keys: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  for (const k of deps.pool.snapshot()) {
+    seen.add(k.fingerprint);
+    const u = usageOf(k.fingerprint);
+    keys.push({
+      fingerprint: k.fingerprint,
+      accountId: k.accountId,
+      accountName: accountNameOf(k.accountId),
+      nickname: nicknames.get(k.fingerprint) ?? null,
+      healthy: k.healthy,
+      ...(k.healthy ? {} : { disabledReason: k.disabledReason }),
+      recoverInMs: k.recoverInMs,
+      requests: u.requests, ok: u.ok, failed: u.failed,
+      inputTokens: u.inputTokens, outputTokens: u.outputTokens, tokens: u.tokens,
+      costMicroCents: u.costMicroCents, lastAt: u.lastAt,
+    });
+  }
+  // 池外 legacy key（旧版 Default API Key 未入池）：无 pool 健康态 → healthy=null。
+  for (const [fp, accId] of legacyFps) {
+    if (seen.has(fp)) continue; // 与池 key 同指纹 → 已在池行里，不重复。
+    const u = usageOf(fp);
+    keys.push({
+      fingerprint: fp,
+      accountId: accId,
+      accountName: accountNameOf(accId),
+      nickname: null,
+      healthy: null,
+      recoverInMs: 0,
+      requests: u.requests, ok: u.ok, failed: u.failed,
+      inputTokens: u.inputTokens, outputTokens: u.outputTokens, tokens: u.tokens,
+      costMicroCents: u.costMicroCents, lastAt: u.lastAt,
+    });
+  }
+  sendJson(res, 200, { ok: true, data: { rangeDays, sinceMs, keys } });
+}
+
+/**
+ * POST /__admin/api/keys/:fp/disable 与 /:fp/reset（手动启停，共用）。
+ * disable → pool.disable（reason='manual'，停用到手动恢复）；reset → pool.reset
+ * （恢复 + 清一切自动冷却）。指纹 → 明文只在进程内解析（keyByFingerprint），
+ * 明文不进响应/日志/审计。成功 200 `{ok:true}`；指纹不在池里 → 404。
+ * 写 admin_audit（op=key.disable / key.reset，accountId=key 归属账号）。
+ */
+async function handleKeyEnableToggle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { pool: KeyPool; db: UsageDb | null },
+  fingerprint: string,
+  action: 'disable' | 'reset',
+): Promise<void> {
+  const plain = deps.pool.keyByFingerprint(fingerprint);
+  if (plain == null) {
+    sendJson(res, 404, { error: { message: 'key not found in pool', type: 'not_found_error' } });
+    return;
+  }
+  const accountId = deps.pool.accountIdOf(plain);
+  if (action === 'disable') {
+    deps.pool.disable(plain);
+  } else {
+    deps.pool.reset(plain);
+  }
+  const op = action === 'disable' ? 'key.disable' : 'key.reset';
+  console.log(`[admin] op=${op} account=${accountId} by=local`);
+  deps.db?.insertAdminAudit({ at: Date.now(), op, accountId, ok: true, note: fingerprint, ip: clientIpOf(req) });
+  sendJson(res, 200, { ok: true });
 }
 
 /**
@@ -2044,6 +2829,14 @@ type MetricsCtx = Pick<
   /** 上游记账的 cost（microCents；订阅端点恒 0，按量端点真实）。仅落库用。 */
   costMicroCents: number;
   /**
+   * 缓存读 token 数（M2，QUOTA.md §4）：Anthropic 路径的上游
+   * `cache_read_input_tokens`（prompt 中命中缓存的部分）。chat 路径为 0
+   * （其 prompt_tokens 已含缓存，input 侧不重复计）。$ 定价补
+   * `cacheRead × read`（read 价从 model_prices 读）；tokens 口径补回
+   * cacheRead，保证两条路径「总输入」一致。
+   */
+  cacheReadTokens: number;
+  /**
    * 鉴权用的分发 token 指纹（完整 sha256 前 24 hex，tokens.ts 口径）。
    * API key / 免鉴权请求为 null —— 只落库（requests.token_fp）供按 token
    * 聚合用量，不进内存指标（与 keyFingerprint 同级别，面板另有展示）。
@@ -2145,7 +2938,7 @@ function logPoolEmpty(pool: KeyPool): void {
 /**
  * 池空时的统一出口。整池都是额度耗尽 → 把上游的 GoUsageLimitError 原样透传
  * （保留 type + "Resets in ..."，让 kirostudio 这类下游知道是额度问题、何时
- * 恢复）；否则回通用 503（auth/transient 禁用、或从未记录过额度错误）。
+ * 恢复）；否则回通用 503（auth/rate-limit 等禁用、或从未记录过额度错误）。
  */
 function sendPoolEmpty(res: ServerResponse, pool: KeyPool): void {
   const quota = pool.quotaEmptyError;
@@ -2163,7 +2956,12 @@ function sendPoolEmpty(res: ServerResponse, pool: KeyPool): void {
  * 拒绝（MODEL-ACCESS 入口 A）：message 列出该密钥的生效白名单，并带
  * "for this key" 区分审计；否则是全局门/账号级拒绝，message 列全局白名单。
  */
-function sendModelNotAllowed(res: ServerResponse, model: string, keyAllowed?: ReadonlySet<string>): void {
+function sendModelNotAllowed(
+  res: ServerResponse,
+  model: string,
+  keyAllowed?: ReadonlySet<string>,
+  supported?: ReadonlySet<string>,
+): void {
   if (keyAllowed != null) {
     const allowed = [...keyAllowed].sort().join(', ');
     sendJson(res, 400, {
@@ -2174,10 +2972,10 @@ function sendModelNotAllowed(res: ServerResponse, model: string, keyAllowed?: Re
     });
     return;
   }
-  const supported = [...ALLOWED_MODELS].sort().join(', ');
+  const list = [...(supported ?? ALLOWED_MODELS)].sort().join(', ');
   sendJson(res, 400, {
     error: {
-      message: `model "${model}" is not allowed (supported models: ${supported})`,
+      message: `model "${model}" is not allowed (supported models: ${list})`,
       type: 'invalid_request_error',
     },
   });
@@ -2208,7 +3006,7 @@ function checkModelGate(
   // 抛 PoolEmptyError（503 / 额度耗尽透传 429），客户端按 5xx 重试；模型拒绝是
   // 配置问题（400），等池恢复后再暴露。
   if (pool.size === 0 || pool.healthyCount === 0) return false;
-  const d = resolveModel(model, cfg.modelMap, cfg.fallbackModel, upstreamModels);
+  const d = resolveModel(model, cfg.modelMap, cfg.fallbackModel, upstreamModels, effectiveGlobalModels(cfg));
   if (d.ok) {
     // 缺省模型（body 无 model，resolveModel 已回落 fallback）不做密钥级门：
     // 与入口 B 的 eligible `if (!model) return true` 一致（审查 MINOR-2），
@@ -2224,7 +3022,7 @@ function checkModelGate(
   }
   // 观测：拒绝原因记进 ctx.error（落库/面板可见）。
   ctx.error = `model ${JSON.stringify(model ?? '')} ${d.reason}`;
-  sendModelNotAllowed(res, model ?? '');
+  sendModelNotAllowed(res, model ?? '', undefined, effectiveGlobalModels(cfg));
   return true;
 }
 
@@ -2290,13 +3088,70 @@ export function createApp(
   modelAccessStore?: ModelAccessStore | null,
   /** OTA 项目根注入（测试指向临时目录；生产用 otaProjectRoot() = dist/ 上一级）。 */
   otaRootOverride?: string,
+  /**
+   * 登出黑名单持久化目录（生产 main.ts 传 <root>/data，与 pool-disabled.json /
+   * model-blocks.json 同目录 —— 路径统一，不随 USAGE_DB_PATH 漂移）。不传时
+   * 回落 usageDbPath 的目录（旧行为）；两者都没有 → 内存态。
+   */
+  persistDir?: string,
 ) {
   // 用量库：未显式传时按配置建。构造永不抛，不可用就退化成 no-op（面板无累计列）。
   const db = usageDb ?? new UsageDb(cfg.usageDbPath, cfg.usageDbRetentionDays);
+  // 登出黑名单持久化（P0 安全）：生产 main.ts 传 persistDir=<root>/data，与
+  // pool-disabled.json / model-blocks.json 同目录（路径统一，不随 USAGE_DB_PATH
+  // 漂移）。不传时回落 usageDbPath 所在目录（旧行为）；两者都没有 → 内存态。
+  // **行为变化**：USAGE_DB_PATH=''（关 DB）时旧实现静默关闭撤销持久化；传
+  // persistDir 后三个持久化文件都独立于 DB，登出撤销仍落盘。
+  configureRevokedSessions(
+    persistDir != null
+      ? join(persistDir, 'revoked-sessions.json')
+      : cfg.usageDbPath && cfg.usageDbPath.trim() !== ''
+        ? join(dirname(cfg.usageDbPath), 'revoked-sessions.json')
+        : null,
+  );
   // 设置页热配置层：未接线（null）时 settings 端点 503、PATCH 不生效。
   // 启动合并（settings 覆盖 env 默认）由调用方（main.ts）在 createApp 之前做；
   // 这里只持有 store 供 GET/PATCH 端点读 db（source 判定 + 写入）。
   const settingsStore = new SettingsStore(db);
+  // $ 配额定价表（QUOTA.md §4）：settings model_prices（可选）→ 无则 0（只记
+  // token/requests 配额）。5s TTL 缓存：settle 是每请求调用，settings 点查不
+  // 该每请求打。v2/config 上游同源定价 fallback 本轮未接（需改 console.ts 且
+  // settle 路径无账户上下文），见 QUOTA.md 偏离记录。
+  let modelPricesCache: Record<string, ModelPrice> | null = null;
+  let modelPricesCacheAt = 0;
+  const resolveModelPrice = (model: string): ModelPrice => {
+    const now = Date.now();
+    if (modelPricesCache == null || now - modelPricesCacheAt >= MODEL_PRICES_CACHE_TTL_MS) {
+      let parsed: Record<string, ModelPrice> = {};
+      const raw = settingsStore.get('modelPrices');
+      if (raw != null) {
+        try {
+          const v = JSON.parse(raw);
+          if (v && typeof v === 'object' && !Array.isArray(v)) parsed = v as Record<string, ModelPrice>;
+        } catch {
+          // 坏数据按空表（0 兜底），下次 TTL 过期重读。
+        }
+      }
+      modelPricesCache = parsed;
+      modelPricesCacheAt = now;
+    }
+    const hit = modelPricesCache[model] ?? modelPricesCache['*'];
+    return hit ?? { input: 0, output: 0, read: 0, write: 0 };
+  };
+  /** 结算口径的 costMicroCents：上游真实成本 > 0 用上游；否则定价表兜底。 */
+  const settleCostMicroCentsFor = (ctx: MetricsCtx): number => {
+    if (ctx.costMicroCents > 0) return ctx.costMicroCents;
+    const model = ctx.upstreamModel || ctx.model;
+    if (!model) return 0;
+    const p = resolveModelPrice(model);
+    // $/1M tokens → microCents（1e8 microCents = $1）：
+    // microCents = (input×inPrice + output×outPrice + cacheRead×readPrice) × 100。
+    // M2：cacheRead（Anthropic 路径 cache_read_input_tokens）按 read 价计入 ——
+    // chat 路径 cacheRead=0（input 已含缓存，不双算），定价表 read 字段从此生效。
+    return Math.round(
+      (ctx.inputTokens * p.input + ctx.outputTokens * p.output + (ctx.cacheReadTokens || 0) * p.read) * 100,
+    );
+  };
   // 密钥-模型授权层（MODEL-ACCESS 数据面）：未注入时按 db 自建（db 不可用则
   // 内部降级 enabled=false，getCustom 恒返回 null —— 无自定义授权 = 回退全局，
   // 行为与无此功能时一致）。管理面写操作（admin 端点）走同一实例，改动即对
@@ -2308,6 +3163,11 @@ export function createApp(
   // per-key RPM 限流器（内存滑动窗口）。每 app 一个实例：测试用例独立 app
   // 即独立窗口，不跨用例串计数。数据面入口 check，见 checkTokenRpmLimit。
   const rpmLimiter = new RpmLimiter();
+  // 全局 RPM 与 per-key RPM 共用同一 limiter（key='__global__' 是整体窗口）。
+  // per-key TPM 限流器（内存自然分钟窗口）。每 app 一个实例。
+  const tpmLimiter = new TpmLimiter();
+  // 面板 token 视图的「当前分钟已用 TPM」取数（tokens.ts 视图恒 0，端点层填）。
+  const usedTpmOf = (fingerprint: string): number => tpmLimiter.used(fingerprint);
   // 后台设置页维护的模型映射（存 usage db）：启动时合并进 cfg.modelMap。
   // resolveModelName 每次读的都是这个 cfg.modelMap 对象引用，运行时新增/删除
   // 映射时 API 侧原地改它即全局生效，无需重启。db 不可用时返回空，不动 cfg。
@@ -2366,6 +3226,15 @@ export function createApp(
   const legacyTtlCacheImpl = legacyTtlCache ?? new LegacyTtlCache(LEGACY_TTL_MS);
   // 数据面代理路径并发在飞计数（cfg.maxConcurrentRequests > 0 时生效）。
   let concurrentInFlight = 0;
+  // count_tokens 轻量并发门（F3）：与数据面 400 槽分离。count_tokens 读满 body
+  // + 递归全对象扫描，Claude Code 每条消息前都调 —— 认证客户端可洪泛。单独在飞
+  // 计数，超限 429（不占数据面槽位、不影响正常请求）。
+  let countTokensInFlight = 0;
+  const COUNT_TOKENS_MAX_INFLIGHT = 10;
+  // 性能端点状态：10s TTL 缓存（面板 2s tick 下避免每 tick 打 DB）+ 进程 CPU
+  // 采样基线（下次调用算差值）。每 app 实例独立，多实例不共享。
+  const perfCache: PerfCacheHolder = { at: 0, data: null };
+  const perfCpuSample: CpuSampleHolder = { at: 0, usage: { user: 0, system: 0 } };
   // OAuth device flow 会话（内存 Map，每 app 一个；start 存、poll 取、过期清理）。
   const oauthManager = new OauthManager();
   // 未显式传 pool 时，用 cfg.upstreamKeys 建默认池（兼容测试直连场景）。
@@ -2435,6 +3304,15 @@ export function createApp(
     // favicon 等 401/404 把面板的「最近请求」刷屏、浏览器 console 报错
     // （实测 /__metrics events 被 favicon 占满 + 页面 console 有 favicon 404 error）。
     if (STATIC_ASSET_PATHS.has(path)) {
+      // favicon：返回 opencode logo（svg），浏览器不再报 404/204 空白。
+      if (path === '/favicon.svg' || path === '/favicon.ico') {
+        req.resume();
+        res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400', connection: 'close' });
+        res.end(FAVICON_SVG);
+        return;
+      }
+      // 其他静态资源（apple-touch-icon 等）：204 静默（无内容），不鉴权不记录——
+      // 否则 favicon 等 401/404 把面板的「最近请求」刷屏、浏览器 console 报错。
       // 任意方法（含带 body 的 POST）命中静态路径都可能有残余 body：resume 消费
       // 防 keep-alive 污染下一条请求（与限流路径同款问题）。connection: close
       // 双保险——favicon 响应不值得保连接，排空后再关连接彻底杜绝假 400。
@@ -2458,6 +3336,7 @@ export function createApp(
       keyFingerprint: '',
       error: null,
       costMicroCents: 0,
+      cacheReadTokens: 0,
       tokenFp: null,
       apiKeyFp: null,
       rewritten: 0,
@@ -2473,6 +3352,25 @@ export function createApp(
     // count_tokens / models 是本地轻量处理不限。
     const isProxyPath = path === '/v1/chat/completions' || path === '/v1/messages';
     const maxInFlight = cfg.maxConcurrentRequests ?? 400;
+    // 上游级熔断（B1）：open 期数据面请求直接 502 + Retry-After —— 不占并发槽、
+    // 不发上游（否则 400 槽被 120s 挂起占满，新请求全撞 503 墙）。半开态放行的
+    // 探测请求继续走完整链路，结论由 postUpstreamChat 的 circuitRecordSuccess/
+    // Failure 转移（这里只做入口判定，不改变任何请求内容）。
+    if (isProxyPath && circuitShouldReject(cfg)) {
+      ctx.error = 'circuit_open';
+      const body = JSON.stringify({
+        error: { message: 'upstream temporarily unavailable, retry shortly', type: 'server_error' },
+      });
+      res.writeHead(502, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': Buffer.byteLength(body),
+        'retry-after': '30',
+        connection: 'close',
+      });
+      res.end(body);
+      req.resume();
+      return;
+    }
     if (isProxyPath && maxInFlight > 0) {
       if (concurrentInFlight >= maxInFlight) {
         ctx.error = 'overloaded_error';
@@ -2722,7 +3620,7 @@ export function createApp(
               return;
             }
             if (req.method === 'GET') {
-              await handleListTokens(req, res, { db, tokens });
+              await handleListTokens(req, res, { db, tokens, usedTpmOf });
             } else {
               await handleCreateToken(req, res, { db, tokens });
             }
@@ -2767,7 +3665,7 @@ export function createApp(
                 return;
               }
               if (req.method === 'PATCH') {
-                await handlePatchToken(req, res, { db, tokens }, tokenId);
+                await handlePatchToken(req, res, { db, tokens, usedTpmOf }, tokenId);
               } else {
                 await handleDeleteToken(req, res, { db, tokens }, tokenId);
               }
@@ -2809,7 +3707,7 @@ export function createApp(
             sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
             return;
           }
-          await handleGetModelAccess(req, res, { cfg, db, settingsStore, modelAccess, tokens, pool: keyPool, store });
+          await handleGetModelAccess(req, res, { cfg, db, settingsStore, modelAccess, tokens, pool: keyPool, store, consoleClient });
           return;
         }
         if (path === '/__admin/api/model-access/global') {
@@ -2907,6 +3805,52 @@ export function createApp(
             return;
           }
         }
+        // key 详情服务端（本任务）：全 key 用量聚合（读）+ 手动启停（写）。
+        // 用量是财务级信息，读也过 Origin 校验（与 requests/tokens 同口径）；
+        // 手动启停改池状态，写操作过 Origin（与其余写端点同口径）。
+        if (path === '/__admin/api/keys/usage') {
+          if (req.method !== 'GET') {
+            sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+            return;
+          }
+          if (!adminOriginAllowed(req)) {
+            sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+            return;
+          }
+          await handleKeysUsageRoute(req, res, { store, pool: keyPool, db });
+          return;
+        }
+        {
+          const kRest = path.startsWith('/__admin/api/keys/')
+            ? path.slice('/__admin/api/keys/'.length)
+            : null;
+          if (kRest != null) {
+            const slash = kRest.lastIndexOf('/');
+            if (slash > 0) {
+              const action = kRest.slice(slash + 1);
+              if (req.method === 'POST' && (action === 'disable' || action === 'reset')) {
+                if (!adminOriginAllowed(req)) {
+                  sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+                  return;
+                }
+                let fingerprint: string;
+                try {
+                  fingerprint = decodeURIComponent(kRest.slice(0, slash));
+                } catch {
+                  sendJson(res, 400, { error: { message: 'invalid key fingerprint encoding', type: 'invalid_request_error' } });
+                  return;
+                }
+                // 指纹是 `****XXXX` 形态（pool 快照 / key 用量列表的同款）。
+                if (!/^\*{4}[A-Za-z0-9]{4}$/.test(fingerprint)) {
+                  sendJson(res, 400, { error: { message: 'invalid key fingerprint', type: 'invalid_request_error' } });
+                  return;
+                }
+                await handleKeyEnableToggle(req, res, { pool: keyPool, db }, fingerprint, action);
+                return;
+              }
+            }
+          }
+        }
         // 模型映射 PUT（更新已存在映射）：与 POST/DELETE 同款 Origin 校验，
         // 独立于 admin.ts 分派（admin.ts 只认 POST/DELETE）。
         {
@@ -2942,6 +3886,28 @@ export function createApp(
             return;
           }
           await handleAuditRoute(req, res, db);
+          return;
+        }
+        // 性能仪表盘（总览性能区块）：只读，同 requests/audit 门槛（读也防跨站）。
+        // 数据在 handler 内 10s TTL 缓存 —— 面板 2s tick 时延迟分位查询最多
+        // 6 次/分钟，不把 DB 查询放大到 30 次/分钟。
+        if (path === '/__admin/api/performance') {
+          if (req.method !== 'GET') {
+            sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+            return;
+          }
+          if (!adminOriginAllowed(req)) {
+            sendJson(res, 403, { error: { message: 'cross-origin requests are not allowed', type: 'authentication_error' } });
+            return;
+          }
+          await handlePerformanceRoute(req, res, {
+            cfg,
+            db,
+            pool: keyPool,
+            inFlight: () => concurrentInFlight,
+            cache: perfCache,
+            cpuSample: perfCpuSample,
+          });
           return;
         }
         // 手动刷新上游模型目录（/zen/go 订阅模型清单）。失败保留旧目录
@@ -3034,6 +4000,11 @@ export function createApp(
       // 分发 token（管理面 isAdminRequest 的 verifyAuth 调用点不传，刻意收紧）。
       const auth = verifyAuth(cfg, req.headers as Record<string, string | undefined>, tokens);
       if (!auth.ok) {
+        // I-14：鉴权拒绝发生在 readBody 之前，请求体可能还在路上。resume 排空
+        // 残余 body 防 keep-alive 污染下一条请求；connection: close 双保险（与
+        // 限流/CSRF 早退同款 —— 401 响应不值得保连接）。
+        res.setHeader('connection', 'close');
+        req.resume();
         sendJson(res, 401, { error: { message: 'unauthorized', type: 'authentication_error' } });
         return;
       }
@@ -3042,22 +4013,44 @@ export function createApp(
 
       if (req.method === 'POST' && path === '/v1/chat/completions') {
         if (!isJsonContentType(req.headers['content-type'])) {
+          // I-14：415 早退在 readBody 前，resume + close 防 keep-alive 污染。
+          res.setHeader('connection', 'close');
+          req.resume();
           sendJson(res, 415, { error: { message: 'content-type must be application/json', type: 'invalid_request_error' } });
           return;
         }
+        // 鉴权后、转发前：per-key 配额检查（expires → 403 / 超限 → 429）。
+        if (!checkTokenQuota(req, res, path, ctx, tokens)) return;
+        // 鉴权后、转发前：per-key TPM（当前分钟已用 ≥ quota_tpm → 429）。
+        if (!checkTokenTpmLimit(req, res, path, ctx, tokens, tpmLimiter)) return;
+        // 鉴权后、转发前：per-key IP 白名单（命中 → 403；空 = 不限）。
+        if (!checkTokenIpWhitelist(req, res, path, ctx, tokens)) return;
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
         if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
+        // 鉴权后、转发前：全局 RPM（数据面整体保护，limit 0 = 关闭）。
+        if (!checkGlobalRpmLimit(req, res, path, cfg.globalRpmLimit ?? 0, rpmLimiter, ctx)) return;
         await handleChatCompletion(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf, clientKeyGate, upstreamKeyModelAccess);
         return;
       }
 
       if (req.method === 'POST' && path === '/v1/messages') {
         if (!isJsonContentType(req.headers['content-type'])) {
+          // I-14：同 chat 路径，415 早退 resume + close。
+          res.setHeader('connection', 'close');
+          req.resume();
           sendJson(res, 415, { error: { message: 'content-type must be application/json', type: 'invalid_request_error' } });
           return;
         }
+        // 鉴权后、转发前：per-key 配额检查（expires → 403 / 超限 → 429）。
+        if (!checkTokenQuota(req, res, path, ctx, tokens)) return;
+        // 鉴权后、转发前：per-key TPM（当前分钟已用 ≥ quota_tpm → 429）。
+        if (!checkTokenTpmLimit(req, res, path, ctx, tokens, tpmLimiter)) return;
+        // 鉴权后、转发前：per-key IP 白名单（命中 → 403；空 = 不限）。
+        if (!checkTokenIpWhitelist(req, res, path, ctx, tokens)) return;
         // 鉴权后、转发前：per-key RPM 限流（只对分发 token 生效）。
         if (!checkTokenRpmLimit(req, res, path, auth.tokenFp, auth.rpmLimit, rpmLimiter, ctx)) return;
+        // 鉴权后、转发前：全局 RPM（数据面整体保护，limit 0 = 关闭）。
+        if (!checkGlobalRpmLimit(req, res, path, cfg.globalRpmLimit ?? 0, rpmLimiter, ctx)) return;
         await handleMessagesPassThrough(req, res, cfg, keyPool, auth.keyId, ctx, allowedModelsOf, clientKeyGate, upstreamKeyModelAccess);
         return;
       }
@@ -3065,10 +4058,36 @@ export function createApp(
       // Claude Code 记账端点：本地估算（上游无此端点）。
       if (req.method === 'POST' && path === '/v1/messages/count_tokens') {
         if (!isJsonContentType(req.headers['content-type'])) {
+          // I-14：同数据面，415 早退 resume + close。
+          res.setHeader('connection', 'close');
+          req.resume();
           sendJson(res, 415, { error: { message: 'content-type must be application/json', type: 'invalid_request_error' } });
           return;
         }
-        await handleCountTokens(req, res, cfg, ctx);
+        // F3：count_tokens 轻量并发门（10 在飞）。超限 429 + Retry-After，resume
+        // + close（同限流路径）—— 认证客户端洪泛 count_tokens 也占不住资源。
+        if (countTokensInFlight >= COUNT_TOKENS_MAX_INFLIGHT) {
+          ctx.error = 'count_tokens overloaded';
+          const ctBody = JSON.stringify({
+            type: 'error',
+            error: { type: 'rate_limit_error', message: 'too many concurrent count_tokens requests' },
+          });
+          res.writeHead(429, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': Buffer.byteLength(ctBody),
+            'retry-after': '1',
+            connection: 'close',
+          });
+          res.end(ctBody);
+          req.resume();
+          return;
+        }
+        countTokensInFlight++;
+        try {
+          await handleCountTokens(req, res, cfg, ctx);
+        } finally {
+          countTokensInFlight--;
+        }
         return;
       }
 
@@ -3083,6 +4102,9 @@ export function createApp(
         return;
       }
 
+      // I-14：兜底 404 早退同样 resume + close（未知路径可能带 body）。
+      res.setHeader('connection', 'close');
+      req.resume();
       sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
     } catch (err) {
       // 内部异常只进日志，回给调用方的统一固定文案（防配置/堆栈细节泄露）。
@@ -3106,6 +4128,13 @@ export function createApp(
       // /healthz 与面板自身的轮询不记账，否则面板会把自己刷满。
       if (path !== '/healthz' && !path.startsWith('/__')) {
         const device = extractDevice(req);
+        // FurCDN-OriginRecovery 回源探针（UA 特征，每 ~12s 一次、无鉴权 401）：
+        // 归入观测噪音（像 probe 一样记录但排除出失败率聚合）—— 否则 requests
+        // 表 24h 失败率被它虚高污染（线上实测占 32%）。endpoint 标 'probe' 后
+        // 所有聚合口径（EXCLUDE_OBSERVED）自动排除，详细请求页仍可见。
+        if (device.ua.toLowerCase().includes('furcdn-originrecovery')) {
+          ctx.endpoint = 'probe';
+        }
         // 记账请求（count_tokens）只落库、不进内存指标（reviewer m7：不混进
         // 「请求数」统计 —— Claude Code 每条消息前都调一次 count_tokens，进
         // events 会把面板「最近请求」与 summary.ok 刷满）。落库的详细请求页
@@ -3163,6 +4192,22 @@ export function createApp(
           tokenFp: ctx.tokenFp,
           apiKeyFp: ctx.apiKeyFp,
         });
+        // 分发 token 配额结算（QUOTA.md §2）：**已受理**（真实转发到上游，
+        // ctx.keyFingerprint 非空 = 选到 key）的请求照实累计三口径。
+        // count_tokens 不消耗配额（探活不走这条 finally，endpoint 非 probe）；
+        // verify 拒绝（未转发）的请求不结算（keyFingerprint 为空）。
+        // settle 失败静默，不阻断请求链路。
+        if (ctx.tokenFp != null && ctx.keyFingerprint !== '' && ctx.endpoint !== 'count_tokens') {
+          tokens?.settleQuota(ctx.tokenFp, {
+            costMicroCents: settleCostMicroCentsFor(ctx),
+            inputTokens: ctx.inputTokens,
+            outputTokens: ctx.outputTokens,
+            cacheReadTokens: ctx.cacheReadTokens,
+          });
+          // TPM 结算：真实用量（input+output+cacheRead，与配额 tokens 口径一致）
+          // 累进当前分钟窗口（checkTokenTpmLimit 请求前读它）。
+          tpmLimiter.add(ctx.tokenFp, ctx.inputTokens + ctx.outputTokens + (ctx.cacheReadTokens || 0));
+        }
       }
     }
   });
@@ -3203,6 +4248,25 @@ export function createApp(
  */
 function isClientAbort(controller: AbortController, res: ServerResponse): boolean {
   return controller.signal.aborted && res.destroyed;
+}
+
+/**
+ * M1：流式客户端断开 → usage 尾 chunk 未读 → ctx.outputTokens 停在 0/旧值，
+ * settle 少收（绕过面）。按**已回显给客户端的文本长度**估算 output 兜底
+ * （textChars/4，约 4 字符/token，复用 stream.ts `Math.ceil(textChars/4)` 机制）。
+ * 只在「已记 outputTokens 更低」时覆盖 —— 已收到的真实 usage 优先。这是估算
+ * 下限（客户端实际消费的比文本更少不可能），QUOTA.md §8 有记录。
+ */
+function applyStreamedOutputEstimate(ctx: MetricsCtx, textChars: number): void {
+  const est = Math.ceil(textChars / 4);
+  if (est > (ctx.outputTokens || 0)) {
+    ctx.outputTokens = est;
+  }
+}
+
+/** 累计一个已回显文本片段的字符数（chat/messages 两路径断开估算共用）。 */
+function countStreamedText(ctx: { n: number }, text: string | null | undefined): void {
+  if (typeof text === 'string') ctx.n += text.length;
 }
 
 /**
@@ -3427,6 +4491,9 @@ async function handleChatCompletion(
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     });
+    // M1：累计已回显文本字符数，客户端断开时估算 output_tokens 兜底
+    // （try 外声明，catch 的 isClientAbort 分支也要用）。
+    const streamedText = { n: 0 };
     try {
       // 上游已是 OpenAI 流，逐 chunk 回显（只改写 model 名回显客户端请求的名字），
       // 收尾补 [DONE]。上游的 `{"choices":[],"cost":...}` 记账 chunk 不转发给客户端。
@@ -3436,7 +4503,11 @@ async function handleChatCompletion(
       for await (const chunk of parseOpenAISSE(upstream.response.body, (d) => {
         if (dirtySample === null) dirtySample = d.sample;
       })) {
-        if (res.writableEnded || res.destroyed) break;
+        if (res.writableEnded || res.destroyed) {
+          // 客户端中途断开：usage 尾 chunk 拿不到 → 按已回显文本估算 output。
+          applyStreamedOutputEstimate(ctx, streamedText.n);
+          break;
+        }
         // 重置上游 body 空闲 watchdog：每收到一个 chunk 视为上游还活着。
         upstream.touch();
         if (requestedModel) chunk.model = requestedModel;
@@ -3464,6 +4535,12 @@ async function handleChatCompletion(
           break;
         }
         if (!chunk.choices?.length && !chunk.usage) continue;
+        // M1：记下将要回显的文本长度（content + reasoning），断开时估算用。
+        const delta = chunk.choices?.[0]?.delta;
+        if (delta) {
+          countStreamedText(streamedText, delta.content);
+          countStreamedText(streamedText, delta.reasoning_content);
+        }
         await writeChunk(res, sseStringify(chunk));
       }
       if (dirtySample === null && !res.writableEnded && !res.destroyed) {
@@ -3477,6 +4554,9 @@ async function handleChatCompletion(
       // 上报 keypool，否则 Claude Code 停生成 5 次就把健康 key 禁 5 分钟。
       if (!isClientAbort(controller, res)) {
         upstream.markFailure('transient');
+      } else {
+        // M1：断开路径 usage 尾 chunk 未读到，按已回显文本估算 output 兜底。
+        applyStreamedOutputEstimate(ctx, streamedText.n);
       }
       if (!res.writableEnded && !res.destroyed) {
         // 网关主动掐断（idle watchdog 超时）时给客户端明确「上游响应超时」；
@@ -3536,7 +4616,7 @@ function prepareOpenAIUpstreamRequest(
   // 全局门已在 handleChatCompletion 里检查过（checkModelGate，400 已在未通过时
   // 返回），这里 resolveModel 必然 ok；留一个安全回落防「目录在两次调用间变化」
   // 这种理论分叉 —— 白名单/目录门是防御设施，落到 fallback 总比透传坏名安全。
-  const decision = resolveModel(req.model, cfg.modelMap, cfg.fallbackModel, upstreamModels);
+  const decision = resolveModel(req.model, cfg.modelMap, cfg.fallbackModel, upstreamModels, effectiveGlobalModels(cfg));
   out.model = decision.ok
     ? decision.model
     : (ALLOWED_MODELS.has(cfg.fallbackModel) ? cfg.fallbackModel : 'deepseek-v4-flash');
@@ -3582,6 +4662,14 @@ function prepareOpenAIUpstreamRequest(
         out.max_completion_tokens = DEEPSEEK_MIN_MAX_TOKENS;
       } else {
         out.max_tokens = DEEPSEEK_MIN_MAX_TOKENS;
+      }
+    } else if (current > DEEPSEEK_MAX_MAX_TOKENS) {
+      // 上限钳制（对齐直通路径 quirk 6 上限）：客户端发超上限值（如 500000）
+      // 上游直接 400 "Invalid max_tokens value"，白撞一次——钳到 390000。
+      if (maxCompletion != null && maxTokens == null) {
+        out.max_completion_tokens = DEEPSEEK_MAX_MAX_TOKENS;
+      } else {
+        out.max_tokens = DEEPSEEK_MAX_MAX_TOKENS;
       }
     }
   }
@@ -3736,6 +4824,7 @@ async function handleMessagesPassThrough(
             }
           : {}),
       },
+      effectiveGlobalModels(cfg),
     );
   } catch {
     sendJson(res, 400, { error: { message: 'invalid request body', type: 'invalid_request_error' } });
@@ -3887,9 +4976,16 @@ async function handleMessagesPassThrough(
         );
       }
     };
+    // M1：累计已回显文本字符数，客户端断开时估算 output_tokens 兜底
+    // （try 外声明，catch 的 isClientAbort 分支也要用）。
+    const streamedText = { n: 0 };
     try {
       for await (const ev of events) {
-        if (res.writableEnded || res.destroyed) break;
+        if (res.writableEnded || res.destroyed) {
+          // 客户端中途断开：message_delta 的 usage 拿不到 → 按已回显文本估算。
+          applyStreamedOutputEstimate(ctx, streamedText.n);
+          break;
+        }
         // 重置上游 body 空闲 watchdog：每收到一个事件视为上游还活着。
         upstream.touch();
         // 脏行检测放在写出**之前**：收到脏行时不再写给客户端后续事件。
@@ -3901,6 +4997,11 @@ async function handleMessagesPassThrough(
           // server 侧取用记账 —— 否则主流量（messages + stream）的 input 侧
           // 用量账本失真，SCALE_CLIENT_TOKENS 缩放也永远作用不到 input 侧。
           if (ev.usage.input_tokens != null) ctx.inputTokens = ev.usage.input_tokens;
+          // M2：缓存读随 message_delta 一并传出（toAnthropic 折算的
+          // cache_read_input_tokens），settle 侧 $/tokens 口径补计。
+          if (ev.usage.cache_read_input_tokens != null) {
+            ctx.cacheReadTokens = ev.usage.cache_read_input_tokens;
+          }
           // 流式 thinking 记账（F1）：reasoning_tokens 由 toAnthropic 折进
           // message_delta.usage.output_tokens_details.thinking_tokens（chat 路径
           // 从 completion_tokens_details.reasoning_tokens 取同值，:3421）。不放
@@ -3908,6 +5009,12 @@ async function handleMessagesPassThrough(
           if (ev.usage.output_tokens_details?.thinking_tokens != null) {
             ctx.thinkingTokens = ev.usage.output_tokens_details.thinking_tokens;
           }
+        } else if (ev.type === 'content_block_delta') {
+          // M1：记下将要回显的文本/thinking/工具参数长度，断开时估算用。
+          const d = ev.delta as { type: string; text?: string; thinking?: string; partial_json?: string };
+          if (d.type === 'text_delta') countStreamedText(streamedText, d.text);
+          else if (d.type === 'thinking_delta') countStreamedText(streamedText, d.thinking);
+          else if (d.type === 'input_json_delta') countStreamedText(streamedText, d.partial_json);
         }
         await writeChunk(res, anthropicEventToSSE(ev));
       }
@@ -3936,6 +5043,9 @@ async function handleMessagesPassThrough(
             })}\n\n`,
           );
         }
+      } else {
+        // M1：断开路径 message_delta usage 未读到，按已回显文本估算 output 兜底。
+        applyStreamedOutputEstimate(ctx, streamedText.n);
       }
     } finally {
       upstream.release();
@@ -3972,6 +5082,9 @@ async function handleMessagesPassThrough(
   });
   ctx.inputTokens = anthropicRes.usage.input_tokens;
   ctx.outputTokens = anthropicRes.usage.output_tokens;
+  // M2：Anthropic 路径 input 是「prompt − 缓存」（toAnthropic 折算），缓存读单独
+  // 记入 cacheReadTokens —— settle 侧 $ 按 read 价补、tokens 口径补回（总输入一致）。
+  ctx.cacheReadTokens = anthropicRes.usage.cache_read_input_tokens ?? 0;
   ctx.thinkingTokens = anthropicRes.usage.output_tokens_details?.thinking_tokens ?? 0;
   if (data.cost != null) ctx.costMicroCents = parseCostMicroCents(data.cost);
 
@@ -4002,7 +5115,9 @@ async function handleMessagesPassThrough(
  */
 async function handleCountTokens(req: IncomingMessage, res: ServerResponse, cfg: AppConfig, ctx: MetricsCtx): Promise<void> {
   ctx.endpoint = 'count_tokens';
-  const read = await readBody(req, cfg.maxBodyBytes);
+  // F3：count_tokens 是本地估算，不需要数据面的 body 上限（默认 64MB）。用更小
+  // 的上限（8MB），超大 body 直接 413 —— 认证客户端洪泛时读 body 的代价有界。
+  const read = await readBody(req, Math.min(cfg.maxBodyBytes, COUNT_TOKENS_MAX_BODY_BYTES));
   if (!read.ok) {
     ctx.error = `request body read failed (${read.status})`;
     sendJson(res, read.status, {
@@ -4519,14 +5634,16 @@ function consoleCookieState(
 }
 
 /**
- * microCents → 美元（1e8 = $1，与 billing.ts 的 UNITS_PER_DOLLAR 同口径）。
- * fixture 证实上游金额字段是字符串（如 "0"）。非法输入返回 null。
+ * microCents → 美元（换算系数引用 money.ts 的 microCentsToUsd —— 单一权威模块，
+ * 禁止内联 1e8；与 console.ts microCentsToDollars 同源，这里多了 unknown 输入
+ * 守卫：非法输入返回 null 而不是 NaN）。fixture 证实上游金额字段是字符串
+ * （如 "0"）。非法输入返回 null。
  */
 function microCentsToDollars(v: unknown): number | null {
   if (typeof v !== 'number' && typeof v !== 'string') return null;
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
-  return Number((n / 1e8).toFixed(2));
+  return Number(microCentsToUsd(n).toFixed(2));
 }
 
 /** unknown 值 → Record（读端点的 data 都是 JSON 对象或 null）。 */
@@ -5370,6 +6487,13 @@ async function handleLegacyRoutes(req: IncomingMessage, res: ServerResponse, dep
     await handleLegacyBilling(res, deps, accountId);
     return;
   }
+  // 前端契约（admin.ts:7365）：PUT .../account/:id/go-toggle（无 go 段），
+  // body 只带被切换键 {useBalance?: bool} 或 {chinaModels?: bool}。toggle 由
+  // runLegacyGoToggle 从 body 键选（不传固定值）；body 由 runLegacyWrite 读取。
+  if (sub === 'go-toggle' && req.method === 'PUT') {
+    await runLegacyGoToggle(req, res, deps, accountId, 'legacy.go-toggle', undefined);
+    return;
+  }
   if (sub === 'go' && segs[2] === 'use-balance' && req.method === 'POST') {
     await runLegacyGoToggle(req, res, deps, accountId, 'legacy.go.use-balance', 'useBalance');
     return;
@@ -5685,14 +6809,28 @@ async function runLegacyGoToggle(
   deps: LegacyDeps,
   accountId: number,
   op: string,
-  toggle: 'useBalance' | 'chinaModels',
+  toggle?: 'useBalance' | 'chinaModels',
 ): Promise<void> {
   await runLegacyWrite(req, res, deps, accountId, op, async (cookie, ws, body) => {
-    if (typeof body.enabled !== 'boolean') {
+    // 两种契约：
+    // 旧：POST .../go/use-balance|china-models，toggle 固定 + body.enabled: bool
+    // 新：PUT .../go-toggle，toggle 不传 → 从 body 键选（只允许恰一个）。
+    let t = toggle;
+    if (t == null) {
+      const hasUb = typeof body.useBalance === 'boolean';
+      const hasCm = typeof body.chinaModels === 'boolean';
+      if (hasUb === hasCm) {
+        sendJson(res, 400, { error: { message: 'send exactly one of useBalance / chinaModels (boolean)', type: 'invalid_request_error' } });
+        return null;
+      }
+      t = hasUb ? 'useBalance' : 'chinaModels';
+    }
+    const enabled = body.enabled ?? body[t];
+    if (typeof enabled !== 'boolean') {
       sendJson(res, 400, { error: { message: 'enabled must be a boolean', type: 'invalid_request_error' } });
       return null;
     }
-    return deps.client!.setGoToggle(accountId, cookie, ws, toggle, body.enabled);
+    return deps.client!.setGoToggle(accountId, cookie, ws, t, enabled);
   });
 }
 

@@ -43,9 +43,10 @@ export interface RequestEvent {
   upstreamModel: string;
   /**
    * 命中订阅端点还是按量付费；`count_tokens` 是纯本地估算的记账请求
-   * （reviewer m7：记账请求不进「请求数」统计，面板聚合与趋势都排除它）。
+   * （reviewer m7：记账请求不进「请求数」统计，面板聚合与趋势都排除它）；
+   * `probe` 是观测流量（key 探活 / FurCDN 回源探针），同样排除出聚合。
    */
-  endpoint: 'subscription' | 'payg' | 'count_tokens' | '-';
+  endpoint: 'subscription' | 'payg' | 'count_tokens' | 'probe' | '-';
   stream: boolean;
   inputTokens: number;
   outputTokens: number;

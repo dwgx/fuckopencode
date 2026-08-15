@@ -384,7 +384,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   var paused = false, topId = 0;
 
   /**
-   * 中英文词条。默认跟随浏览器语言（zh 开头用中文），可手动切换并存 localStorage。
+   * 中英日词条。默认跟随浏览器语言（zh 开头用中文，ja 开头用日语），可手动切换并存 localStorage。
    * 只译界面文案；模型名、路径、协议名这类标识符不译。
    */
   var I18N = {
@@ -395,7 +395,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       keypool: 'Key pool', recentFirst: 'most recent first',
       kInflight: 'in flight', kState: 'state', kPicked: 'picked', kLastUse: 'last use',
       kFails: 'fails', kRecover: 'recovers in', kTotal: 'lifetime', kReason: 'reason',
-      kHealthy: 'healthy', kDisabled: 'disabled', kNever: 'never',
+      kHealthy: 'healthy', kDisabled: 'disabled', kNever: 'never', kPermanent: 'permanently',
       carrying: 'carrying load', ofKeys: 'of', poolIdle: 'no in-flight requests',
       histSince: 'lifetime since', noHist: 'no persisted history',
       unattributed: 'rejected before reaching a key',
@@ -403,6 +403,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       evDisabled: 'disabled', evRecovered: 'recovered', reqShort: 'req',
       authErr: 'invalid credential', rateErr: 'rate limited',
       quotaErr: 'quota exhausted', transientErr: 'repeated transient errors',
+      manualErr: 'disabled manually',
       polHd: 'cooldown policy · why a key recovers when it does',
       polUpstream: 'from upstream',
       polFallback: 'fallback when unparsable',
@@ -427,7 +428,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       sse: 'sse stream', single: 'single body',
       fallback: 'fallback', upModels: 'upstream models', injection: 'injection',
       poll: 'poll 2s · in-memory', pollSql: 'poll 2s · window in-memory, totals in sqlite',
-      mobile: 'mobile', langBtn: '中文'
+      mobile: 'mobile', langBtn: '日本語'
     },
     zh: {
       tagline: 'OpenAI 与 Anthropic 协议转换网关 · 经 opencode zen 使用 DeepSeek',
@@ -436,7 +437,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       keypool: 'Key 池', recentFirst: '最新在前',
       kInflight: '在飞请求', kState: '状态', kPicked: '本次启动', kLastUse: '最近使用',
       kFails: '连续失败', kRecover: '剩余冷却', kTotal: '累计', kReason: '原因',
-      kHealthy: '可用', kDisabled: '已禁用', kNever: '未用过',
+      kHealthy: '可用', kDisabled: '已禁用', kNever: '未用过', kPermanent: '永久',
       carrying: '个号在扛并发', ofKeys: '/', poolIdle: '当前无在飞请求',
       histSince: '累计自', noHist: '未启用历史持久化',
       unattributed: '条未到达上游（格式/鉴权错误）',
@@ -444,6 +445,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       evDisabled: '禁用', evRecovered: '恢复', reqShort: '请求',
       authErr: '凭据无效', rateErr: '限流',
       quotaErr: '额度耗尽', transientErr: '连续瞬时错误',
+      manualErr: '手动停用',
       polHd: '冷却策略 · 恢复时刻是怎么算出来的',
       polUpstream: '按上游给的时间',
       polFallback: '解析不出时兜底',
@@ -470,17 +472,61 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       poll: '每 2 秒轮询 · 内存存储', pollSql: '每 2 秒轮询 · 窗口在内存，累计在 SQLite',
       mobile: '移动端',
       langBtn: 'EN'
+    },
+    ja: {
+      tagline: 'OpenAI と Anthropic のプロトコル変換ゲートウェイ · opencode zen 経由で DeepSeek を使用',
+      overview: '概要', pipeline: 'データフロー', models: 'モデル分布',
+      clients: 'クライアント', devices: 'デバイス', requests: 'リクエスト詳細',
+      keypool: 'Key プール', recentFirst: '最新が先頭',
+      kInflight: '実行中リクエスト', kState: '状態', kPicked: '今回の起動', kLastUse: '最終使用',
+      kFails: '連続失敗', kRecover: '残りクールダウン', kTotal: '累計', kReason: '原因',
+      kHealthy: '利用可能', kDisabled: '無効', kNever: '未使用', kPermanent: '永続',
+      carrying: '個のキーが同時実行を処理中', ofKeys: '/', poolIdle: '実行中のリクエストはありません',
+      histSince: '累計開始', noHist: '履歴の永続化が無効',
+      unattributed: '件がキー到達前に拒否（形式/認証エラー）',
+      recentEvents: '最近の状態変更', noKeyEvents: '状態変更の記録はありません',
+      evDisabled: '無効化', evRecovered: '回復', reqShort: 'リクエスト',
+      authErr: '認証情報が無効', rateErr: 'レート制限',
+      quotaErr: 'クォータ枯渇', transientErr: '連続する一時エラー',
+      manualErr: '手動停止',
+      polHd: 'クールダウンポリシー · 回復時刻の算出方法',
+      polUpstream: 'アップストリーム指定の時間',
+      polFallback: '解析できない場合のフォールバック',
+      polFirstHit: '初回発生で無効化',
+      polAfterN: '連続 {n} 回で無効化',
+      polBackoff: '以降毎回倍増、最大 16 倍、±20% のジッター',
+      polQuotaNote: 'アップストリームのリセット時刻 + 60 秒の余裕',
+      polAuthNote: '基本クールダウンの 12 倍',
+      polRateNote: '意図的に短く設定：429 はアカウント単位の状態なので、キーを変えても解決しない',
+      polCfg: '基本クールダウン {base} · 失敗閾値 {n} · ルーティング：実行中が最少のキーを優先',
+      kRequests: 'リクエスト総数', kLatency: '応答時間', kTokens: 'トークン使用量', kDevices: 'アクティブデバイス',
+      hTime: '時刻', hStatus: '状態', hRequest: 'リクエスト', hMs: 'ミリ秒', hTokens: 'トークン', hClient: 'クライアント',
+      noReq: 'リクエストはありません', noData: 'データがありません', noDev: 'デバイスがありません',
+      ok: '成功', fail: '失敗', stream: 'ストリーミング', last: '最新',
+      inTok: '入力', outTok: '出力', thinkTok: '思考',
+      nClients: '種のクライアント', nModels: '個のモデル',
+      pause: '一時停止', resume: '再開', live: 'ライブ',
+      pool: 'Key プール', up: '稼働', inWindow: 'ウィンドウ内',
+      idle: 'アイドル', active: '実行中',
+      pClient: 'クライアント', pIngress: '入口プロトコル', pConvert: 'プロトコル変換', pUpstream: 'アップストリーム', pEgress: '返信',
+      passthrough: 'パススルー', sub: 'サブスクリプション', payg: '従量課金',
+      sse: 'SSE ストリーム', single: '一括レスポンス',
+      fallback: 'フォールバックモデル', upModels: '個の利用可能モデル', injection: 'インジェクション検出',
+      poll: '2 秒ごとにポーリング · メモリ内', pollSql: '2 秒ごとにポーリング · ウィンドウはメモリ、累計は SQLite',
+      mobile: 'モバイル',
+      langBtn: '中文'
     }
   };
   var lang = (function () {
-    try { var v = localStorage.getItem('fc-lang'); if (v === 'zh' || v === 'en') return v; } catch (e) {}
-    return /^zh/i.test(navigator.language || '') ? 'zh' : 'en';
+    try { var v = localStorage.getItem('fc-lang'); if (v === 'zh' || v === 'en' || v === 'ja') return v; } catch (e) {}
+    var l = (navigator.language || '').toLowerCase();
+    return /^zh/.test(l) ? 'zh' : /^ja/.test(l) ? 'ja' : 'en';
   })();
   var T = function (k) { return (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k; };
 
   /** 把所有 data-i18n 节点刷成当前语言。 */
   function applyLang() {
-    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : lang === 'ja' ? 'ja' : 'en';
     var nodes = document.querySelectorAll('[data-i18n]');
     for (var i = 0; i < nodes.length; i++) {
       nodes[i].textContent = T(nodes[i].getAttribute('data-i18n'));
@@ -610,7 +656,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   /** 失败类型 -> 词条。原始值是 keypool 的 UpstreamFailureKind。 */
   var KIND_KEY = {
     'auth': 'authErr', 'rate-limit': 'rateErr',
-    'quota-exhausted': 'quotaErr', 'transient': 'transientErr'
+    'quota-exhausted': 'quotaErr', 'transient': 'transientErr', 'manual': 'manualErr'
   };
   var kindText = function (k) { return k ? T(KIND_KEY[k] || k) + ' (' + k + ')' : '—'; };
 
@@ -687,7 +733,10 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       ];
       if (!k.healthy) {
         rows.push(['kReason', '<span class="s-warn">' + esc(kindText(k.disabledReason)) + '</span>']);
-        rows.push(['kRecover', '<b data-rc="' + (now + k.recoverInMs) + '">' + hms(k.recoverInMs) + '</b>']);
+        // manual 是哨兵 until（永不过期，仅 reset 恢复）——显示「永久」而不是 9e15 ms 的地狱数字。
+        rows.push(['kRecover', k.disabledReason === 'manual'
+          ? '<b>' + T('kPermanent') + '</b>'
+          : '<b data-rc="' + (now + k.recoverInMs) + '">' + hms(k.recoverInMs) + '</b>']);
       }
       rows.push(['kFails', String(k.failCount)]);
       rows.push(['kPicked', '<b>' + fmt(k.totalAcquired) + '</b>']);
@@ -921,7 +970,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   });
 
   $('btn-lang').addEventListener('click', function () {
-    lang = lang === 'zh' ? 'en' : 'zh';
+    lang = lang === 'zh' ? 'en' : lang === 'en' ? 'ja' : 'zh';
     try { localStorage.setItem('fc-lang', lang); } catch (e) {}
     applyLang();
     // 立刻拉一次，让动态区（流水线/空态/明细）也跟着换语言。
