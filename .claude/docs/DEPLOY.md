@@ -22,17 +22,42 @@
 |---|---|
 | 代码目录 | `/root/fuckopencode`（**不是 git 仓库**，只有 `dist/`） |
 | 服务 | `fuckopencode.service`（systemd，`Restart=always`） |
-| 监听 | `127.0.0.1:8788` —— **注意不再是 8787**，8787 已被盾接管（见 SHIELD.md） |
-| 盾 | `fuckopencode-shield.service`，监听 `127.0.0.1:8787`，上游指 8788 |
-| 公网链路 | `cloudflared -> 127.0.0.1:8787（盾）-> 127.0.0.1:8788（网关）` |
+| 监听 | `0.0.0.0:8787` —— **去盾后**（2026-08-15）FurCDN 直连网关 |
+| 盾 | **已退役（2026-08-15）**：`fuckopencode-shield.service` 已停，不再占端口 |
+| 公网链路 | `FurCDN -> 0.0.0.0:8787（网关，直连，无盾）` |
 | 对外域名 | `fuckopencode.dwgx.top`（路由由 Cloudflare 云端管理，本地 ingress 不生效） |
-| 监控面板 | 网关 `/__dash` + `/__metrics`（要求 API key）；盾 `/_shield/*`（仅回环） |
+| 监控面板 | 网关 `/__dash` + `/__metrics`（要求 API key）；盾面板 `/_shield/*` 随盾退役 |
 | env | `/root/fuckopencode/fuckopencode.env`，权限 600 |
 | node | v22.20.0（`/usr/local/bin/node`） |
 | 依赖 | 无 `node_modules` —— 零运行时依赖，只需 `dist/` |
 
 服务器上没有源码，也没有 git remote，**所以不能 `git pull` 更新**，
 只能从本地构建后推 `dist/`。
+
+## 第三方一键部署（install.sh）
+
+上面全是 nbus 专属现状。**通用安装路径是 [scripts/install.sh](../../scripts/install.sh)**，
+第三方/新机器部署直接走它，不需要手动搭 systemd + 推 dist：
+
+```bash
+git clone <仓库地址>   # 上游 dwgx/fuckopencode 或你自己的 fork
+cd fuckopencode
+./scripts/install.sh
+```
+
+- 两种模式：`release`（默认，从 GitHub release 下载预构建 dist tarball，
+  服务器不需要 npm/tsc）与 `source`（本机构建）。需要 **Node >= 22**。
+- 装完 `cp .env.example .env`，必填项三件：`API_KEYS`（客户端 key）、
+  `OPENSEA_KEYS` 或 `ANTHROPIC_API_KEY`（上游 key，至少一个）、`HOST`/`PORT`。
+- OTA 配置：`OTA_REPO` 改指向你自己的仓库，且仓库要配
+  `.github/workflows/release.yml`（tag `vX.Y.Z` 触发构建 dist tarball + sha256 +
+  上传 release 资产）。开 `OTA_ENABLED=1` 前先确认有 supervisor 托管
+  （systemd/launchd），裸跑前台进程时 perform 会拒绝自重启。
+
+与 nbus 的关系：install.sh 是通用路径，nbus 是实际生产——nbus 维护仍走本页的
+[deploy.sh](../../scripts/deploy.sh)（本地构建 → 推 dist → 原子替换 → 重启 →
+健康检查），不走 install.sh。OTA 自更新到货后，nbus 的日常小版本也可靠 OTA
+免登录更新，deploy.sh 保留为手动回滚点。
 
 ## 更新流程
 
@@ -87,7 +112,7 @@ PR 触发，node 22/24 × typecheck + test + build）。发版走 tag：
 | `DASHBOARD_OPEN` | `0` —— 隧道整体暴露 8787，面板含调用方 IP/UA，必须鉴权 |
 | `KEY_FAIL_THRESHOLD` | 5 |
 | `KEY_COOLDOWN_MS` | 300000 |
-| `HOST` / `PORT` | `127.0.0.1` / `8788`（8787 已被盾接管，见 SHIELD.md） |
+| `HOST` / `PORT` | `0.0.0.0` / `8787`（去盾后：FurCDN 直连网关，见 SHIELD.md 退役标注） |
 | `INJECTION_MODE` | `block` |
 | `USAGE_DB_PATH` | 不设 = `data/usage.db`（相对 `WorkingDirectory`）。设为空串关闭持久化 |
 | `USAGE_DB_RETENTION_DAYS` | 不设 = 30。`0` = 不清理 |
@@ -203,7 +228,7 @@ ssh nbus 'journalctl -u fuckopencode --since "3 minutes ago" --no-pager | grep "
 
 ```bash
 ssh nbus 'ls -la /root/fuckopencode/data/'
-ssh nbus 'K=$(grep ^API_KEYS= /root/fuckopencode/fuckopencode.env | sed s/^API_KEYS=//| cut -d, -f1); curl -s http://127.0.0.1:8788/__metrics -H "x-api-key: $K" | grep -c "sk-"'
+ssh nbus 'K=$(grep ^API_KEYS= /root/fuckopencode/fuckopencode.env | sed s/^API_KEYS=//| cut -d, -f1); curl -s http://127.0.0.1:8787/__metrics -H "x-api-key: $K" | grep -c "sk-"'
 ```
 
 `data/` 里应有 `usage.db` + WAL 两个副本文件；`grep -c "sk-"` 必须是 0。

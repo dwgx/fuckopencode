@@ -3,8 +3,7 @@
 状态：`确认` 有复现路径 / `可疑` 只是读代码推断 / `已修` 本轮修掉 / `设计取舍` 不是 bug
 / `已证伪` 曾被记为缺陷，但查证后不存在
 
-最后核对：2026-08-14（审计轮，`npm test` 1297 全绿、`tsc --noEmit` 干净），
-行号已按当前 main 重新定位。
+最后核对：2026-08-15（深度挖掘轮，`tsc --noEmit` 干净；行号随版本漂移，以源码为准）。
 
 ## 已证伪（2026-08-09 第二轮核查）
 
@@ -110,6 +109,47 @@ buffer 无限增长。修复后 `SSE_BUFFER_MAX_CHARS=1MB`（[sse.ts:24](../../s
 
 - 回归测试：`test/stream.test.ts:330-333`（超长单行断流）、`:335-340`（合法短行不触发）
 
+## 已修（2026-08-15 深度挖掘轮）
+
+无 commit 编号 —— 均标注轮次。本轮的缺陷审计编号见 `.opencode/state.md` 与源码注释。
+
+### S-P1-1 writeChunk 半死连接 drain 永不触发挂死流式循环 — 已修（深度挖掘轮）
+
+[server.ts](../../src/server.ts) writeChunk：半死连接（TCP 存活但不读）永不触发
+drain，drain 等待会挂死流式循环，连带 upstream.touch 停、并发在飞计数与 keypool
+inFlight 不释放。修复给等待加超时（默认 60s `WRITE_CHUNK_TIMEOUT_MS`），超时即
+`res.destroy()` —— 'close' 触发并发门释放，调用循环下次迭代检查 `res.destroyed`
+退出。监听器用具名函数 + 收尾移除（顺带修 I-7 累积）。
+
+### O-P1-1 OTA boot_attempts 不能在 bind 成功就清 — 已修（深度挖掘轮）
+
+原实现 bind 成功即清计数，导致「能 bind 但运行期崩」的坏版计数永远攒不到阈值、
+守卫无法回滚。改为：计数完全由守卫管理（启动前自增，仅在守卫裁决无关失败、
+触发回滚或手动部署时清零）；进程侧稳定运行 30s 后**只写 health 标记**
+（version + confirmed_at），confirmHealth 不清计数——守卫拿 health 做版本/
+新鲜度裁决。见 [ota-guard.ts](../../src/ota-guard.ts) 与 [OTA.md](OTA.md) §5。
+
+### O-P2-3 OTA 回滚判定加 health 版本裁决 — 已修（深度挖掘轮）
+
+rollback-guard.sh 判定 crashloop 时比对 `health 文件记录版本` 与
+`dist/version.txt`：一致 = 该版本至少稳定跑过 30s，起不来多半是 env/端口/磁盘等
+无关原因，不静默降级回 dist.prev。见 [rollback-guard.sh](../../scripts/rollback-guard.sh)。
+
+### 清理轮（2026-08-15，死代码/注释漂移/文档漂移）
+
+- deepseek.ts `injectMissingThinkingBlocks` 死代码 `hasToolUse`（计算后 void）删除
+- deepseek.ts `completeStreamEvents` 合成 message_start 的 `model:''` 补注释说明
+  （函数拿不到模型上下文；客户端兼容性待考，不无依据填值）
+- keypool.ts rate-limit 冷却注释与实际不符（原写 cooldownMs/6≈50s，实际
+  `cooldownMs/100` 钳 [500ms,3s]，默认 3s）—— 注释改为与实现一致
+- tokens.ts `getRpmLimit` 生产无调用方（verify 已同一次点查取回 rpm_limit）；
+  保留给测试/库消费者，JSDoc 注明已并入 verify 语义
+- request.ts/response.ts 死代码残余（网关内未接线，仅 index.ts 导出）——
+  文件头标注「库消费者/历史参考」
+- response.ts `json_mode` 名称冲突已知缺陷（响应里恰有一个同名用户工具会被误转）——
+  注释标注「死代码 + 已知缺陷，勿在网关内启用」，不改行为
+- I-15 history/usageTrend/statsByIp 缓存返回内部引用 —— 本轮补修（见上）
+
 ## 确认（未修）
 
 ### I-3 chat 路径与直通路径的 deepseek 适配是两套实现
@@ -156,15 +196,15 @@ thinking 非 disabled 时，`max_tokens` 会被静默抬到 4096
   system prompt 里插入中文安全约束可能干扰它的正常工作
 - 需要你定：是补上护栏（安全一致），还是明确写进文档说直通端点不做 L4（保持直通语义）
 
-### I-7 writeChunk 的监听器可能累积 — 确认（仍在）
+### I-7 writeChunk 的监听器可能累积 — 已修（2026-08-15，随 S-P1-1）
 
-[server.ts:96-106](../../src/server.ts) 每次背压都 `res.once('drain'|'close'|'error')`。
-resolve 后另外两个监听器不会被摘掉。长流 + 频繁背压下监听器会累积，
-可能触发 MaxListenersExceededWarning。
+`writeChunk` 每次背压都 `res.once('drain'|'close'|'error')`，resolve 后另外两个
+监听器不会被摘掉。长流 + 频繁背压下监听器会累积，可能触发
+MaxListenersExceededWarning。
 
-- 2026-08-14 审计确认仍在（state.md P2 F5）
-- 修法：用具名函数 + `removeListener` 收尾
-- 未构造复现（需要慢客户端 + 长流）
+- 修法（深度挖掘轮 S-P1-1 一并做）：监听器用具名函数 + `cleanup()` 收尾
+  `removeListener`（server.ts writeChunk，行号随版本漂移，以源码为准）
+- 未构造复现（需要慢客户端 + 长流）；修复本身不改变数据面行为
 
 ### I-11 面板用量 tab 三请求非 usage 视图每 2s 空转 — 确认（未修）
 
@@ -195,37 +235,42 @@ transient 失败（如 SQLite busy/lock）都连坐丢掉整个批（最多 50 �
 ### I-14 早期错误（401/415）不消费 body 不关连接 → keep-alive 污染 — 确认（未修）
 
 `server.ts` 数据面鉴权失败/类型校验失败路径直接 `sendJson` 后 `return`，
-不读请求体也不关连接：[server.ts:2343](../../src/server.ts)（401）、
-`:2350-2352`/`:2361-2363`/`:2373-2375`（415，三条路径）。
+不读请求体也不关连接（401 与 415 三条路径，行号随版本漂移，以源码为准）。
 
-对比同文件已修的先例：限流响应（[server.ts:1149-1153](../../src/server.ts)）
-有 `connection: close` + `req.resume()` 双保险，注释明说「未消费的 body 残留在
-socket 上，被当成下一个请求解析（keep-alive 假 400）」；并发超限 503 也做了
-`req.resume()`（`:1907`）。401/415 路径漏了同样的处理 —— 带 body 的失败请求
-（客户端重试/脚本）会污染 keep-alive 连接，下一条请求可能被残留字节打挂。
+对比同文件已修的先例：限流响应有 `connection: close` + `req.resume()` 双保险，
+注释明说「未消费的 body 残留在 socket 上，被当成下一个请求解析（keep-alive 假
+400）」；并发超限 503 也做了 `req.resume()`。401/415 路径漏了同样的处理 ——
+带 body 的失败请求（客户端重试/脚本）会污染 keep-alive 连接，下一条请求可能被
+残留字节打挂。
 
 - 审计 F7 确认；修法与限流路径对齐：`req.resume()` + `connection: close`
+- 行号以源码为准（server.ts 频繁改动，此处不再钉死）
 
-### I-15 history/trend/ipStats 缓存返回内部引用 — 确认（未修）
+### I-15 history/trend/ipStats 缓存返回内部引用 — 已修（2026-08-15 深度挖掘轮）
 
-`usagedb.ts` 三个带缓存的读方法直接把内部缓存对象返回给调用方：
-- `history()` [usagedb.ts:1382-1383](../../src/usagedb.ts) 直接 `return this.historyCache`
-- `usageTrend()` [usagedb.ts:1207-1208](../../src/usagedb.ts) 直接 `return cached.data`
-- `statsByIp()` [usagedb.ts:1056-1061](../../src/usagedb.ts) 返回 `all.slice()` 切片
-  （数组是新引用，但元素是缓存内同一对象）
+`usagedb.ts` 三个带缓存的读方法曾直接把内部缓存对象返回给调用方：
+- `history()` 直接 `return this.historyCache`
+- `usageTrend()` 直接 `return cached.data`
+- `statsByIp()` 返回 `all.slice()` 切片（数组是新引用，但元素是缓存内同一对象）
 
-任何调用方改动返回结构会污染缓存，后续 15s 内所有请求读到脏数据。当前调用方
-都是只读渲染，所以是隐患不是故障；修法：返回前浅拷贝（或 `structuredClone`）。
+任何调用方改动返回结构会污染缓存，后续缓存窗口内所有请求读到脏数据。
 
-### I-16 Origin 校验数组头放行 — 确认（未修，语义错误当前不可利用）
+- 修法（本轮）：三个方法命中与未命中路径都返回副本（`cloneHistory`/`cloneTrend`，
+  statsByIp 元素逐个复制含 clients 数组），与已修的 `tokenUsageAll` 同款；
+  回归测试断言「改返回值缓存不变」（test/usagedb.test.ts）
+- 状态：已修（tokenUsageAll 先修 + history/usageTrend/statsByIp 本轮补齐）
 
-`adminOriginAllowed`（[server.ts:3258-3275](../../src/server.ts)）读
-`req.headers.origin`，`:3260` 处 `typeof origin !== 'string'` 直接 `return true`。
+### I-16 Origin 校验数组头放行 — 已修（fail-closed：数组头按拒绝处理）
+
+`adminOriginAllowed`（server.ts，行号随版本漂移，以源码为准）与 `originAllowed`
+（admin.ts）读 `req.headers.origin`，`typeof origin !== 'string'` 直接 `return false`。
 攻击者发 `Origin: <valid>, <evil>` 逗号分隔数组头时，Node 会把多值头解析成数组，
-校验直接放行 —— 语义上「多 Origin 任一匹配即放行」未被实现，而是全放行。
+校验按拒绝处理（fail-closed）—— 语义「多 Origin 任一匹配即放行」不可信。
 
-- 审计 P2 确认；浏览器发不出多值 Origin（fetch 只允许单值），所以当前不可利用
-- 修法：origin 非 string 时按拒绝处理（fail-closed），与 host 缺失时 `return false` 对齐
+- 浏览器发不出多值 Origin（fetch 只允许单值），出现数组头只可能是代理/恶意客户端
+- 修法（已落地）：origin 非 string 时按拒绝处理，与 host 缺失时 `return false` 对齐；
+  回归测试 test/admin.test.ts「A-P2-1：多值 Origin 数组头 fail-closed」断言数组头拒绝
+- 状态：已修（admin.ts `originAllowed` 与 server.ts `adminOriginAllowed` 两处都是 fail-closed）
 
 ### I-17 生产 MAX_BODY_BYTES=0（无上限）— 确认（部署配置问题，代码已安全）
 
@@ -249,13 +294,18 @@ socket 上，被当成下一个请求解析（keep-alive 假 400）」；并发�
   全部重新定位（deepseek.ts 现 533 行），并补 3 条新 quirk（0/13/14）。
 - 账号级模型白名单（commit d1083b8）零文档——本轮已补进 MULTI-ACCOUNT.md。
 
-### I-20 OTA 自更新未实现 — 确认（只有研究记录）
+### I-20 OTA 自更新未实现 — 已实现（2026-08-15 深度挖掘轮补守卫修复）
 
-只有研究没有实现：CURRENT.md 记录「OTA 研究：cursorapi/windsurf/kirostudio 三项目
-OTA 对比 + 改进提示词」，代码里没有任何自更新机制（无版本检查、无自动拉取发布、
-无更新通道）。当前部署靠手动 scp + systemctl。
-需要明确：不做（手动部署够用，但每次部署要人工介入）或做（轮询 GitHub release，
-tag 门禁 + SHA256 校验 + 原子替换 + 崩溃回滚，参考对比项目的四段式 UX）。
+原条目：只有研究没有实现（无版本检查、无自动拉取发布、无更新通道），部署靠
+手动 scp + systemctl。
+
+- 已实现（见 [OTA.md](OTA.md)）：release.yml 资产管线 + ota.ts（版本检查/镜像链
+  流式下载/sha256 独立信道/tar 三重校验/原子替换）+ ota-guard.ts + rollback-guard.sh
+  （systemd ExecStartPre 崩溃回滚）+ 面板 sec-update UI。OTA_ENABLED 默认 0。
+- 深度挖掘轮守卫修复：O-P1-1（boot_attempts 不在 bind 成功就清，计数改由守卫
+  管理、进程只写 health 标记，否则运行期崩的坏版计数永远攒不到回滚阈值）、
+  O-P2-3（回滚判定加 health 版本裁决——被健康确认过的版本不因 env/端口等无关
+  原因静默回滚）。
 
 ## 设计取舍（不是 bug）
 

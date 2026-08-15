@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Verify version matches tag
+        # 审查 M-3：package.json version != tag 时 OTA 侧 version.txt==tag 校验
+        # 恒 422，发版者要排查半天。tag v0.3.0 必须对应 version 0.3.0。
+        run: |
+          PKG="$(node -p "require('./package.json').version")"
+          [ "$PKG" = "${GITHUB_REF_NAME#v}" ] || { echo "package.json version $PKG != tag ${GITHUB_REF_NAME}"; exit 1; }
+      - name: Package dist tarball + sha256
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ASSET="fuckopencode-${TAG}-dist.tar.gz"
+          tar czf "${ASSET}" dist
+          shasum -a 256 "${ASSET}" > "${ASSET}.sha256"
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "${ASSET}" "${ASSET}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" || \
+          gh release upload "${GITHUB_REF_NAME}" "${ASSET}" "${ASSET}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
