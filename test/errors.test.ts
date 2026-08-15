@@ -57,13 +57,14 @@ describe('classifyAccountError（MULTI-ACCOUNT.md §4.2 全表）', () => {
     }
   });
 
-  it('GoUsageLimitError → cooldown，重置 + 60s；解析不出 1h 兜底', () => {
+  it('GoUsageLimitError → cooldown，重置 + 60s；解析不出 24h 兜底', () => {
     const withReset = classifyAccountError(429, { error: { type: 'GoUsageLimitError', message: RESET_MSG } }, COOLDOWN);
     expect(withReset.status).toBe('cooldown');
     expect(withReset.retryMs).toBe(19 * ONE_HOUR + 22 * 60_000 + 60_000);
-    // 解析不出（无 "Resets in"）→ 1h + 60s。
+    // 解析不出（无 "Resets in"）→ 24h + 60s（2026-08-14 从 1h 提升：
+    // Go 周额度真实恢复 2 天，1h 兜底是假冷却，探针每小时撞一次 429）。
     const noReset = classifyAccountError(429, { error: { type: 'GoUsageLimitError', message: 'limit reached' } }, COOLDOWN);
-    expect(noReset.retryMs).toBe(ONE_HOUR + 60_000);
+    expect(noReset.retryMs).toBe(TWENTY_FOUR_H + 60_000);
   });
 
   it('BlackUsageLimitError → cooldown，重置 + 60s；解析不出 24h 兜底', () => {
@@ -120,6 +121,7 @@ describe('两张分类表一致性（§4.2：同 error.type 不能结论相反�
     { name: 'MonthlyLimitError', status: 429, body: { error: { type: 'MonthlyLimitError', message: RESET_MSG } }, pool: 'quota-exhausted', account: 'limit' },
     { name: 'UserLimitError', status: 429, body: { error: { type: 'UserLimitError', message: RESET_MSG } }, pool: 'quota-exhausted', account: 'limit' },
     { name: 'GoUsageLimitError', status: 429, body: { error: { type: 'GoUsageLimitError', message: RESET_MSG } }, pool: 'quota-exhausted', account: 'cooldown' },
+    { name: 'FreeUsageLimitError', status: 429, body: { error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded. Please try again later.' } }, pool: 'rate-limit', account: 'cooldown' },
     { name: 'BlackUsageLimitError', status: 429, body: { error: { type: 'BlackUsageLimitError', message: RESET_MSG } }, pool: 'quota-exhausted', account: 'cooldown' },
     { name: 'RateLimitError 429', status: 429, body: { error: { type: 'RateLimitError' } }, pool: 'rate-limit', account: 'cooldown' },
     { name: '裸 429', status: 429, body: null, pool: 'rate-limit', account: 'cooldown' },
@@ -138,6 +140,8 @@ describe('两张分类表一致性（§4.2：同 error.type 不能结论相反�
     // 这是本次改造的核心动因：MonthlyLimitError 等真实流量错误此前落
     // classifyUpstreamFailure 的 429 → rate-limit（3s），限流期内每请求都撞一次
     // 已耗尽的 key。现在必须与账户表一致走 quota-exhausted 长冷却。
+    // FreeUsageLimitError（free IP 日窗，2026-08-14 补钉）：此前只靠 type 正则
+    // 侥幸命中，错误体为空/非 JSON 时漏网归 rate-limit（3 秒假冷却）。
     for (const type of ['MonthlyLimitError', 'UserLimitError', 'BlackUsageLimitError']) {
       const pool = classifyUpstreamFailure(429, { error: { type, message: RESET_MSG } });
       expect(pool).toBe('quota-exhausted');
@@ -145,6 +149,13 @@ describe('两张分类表一致性（§4.2：同 error.type 不能结论相反�
         type === 'MonthlyLimitError' || type === 'UserLimitError' ? 'limit' : 'cooldown',
       );
     }
+    // FreeUsageLimitError 是瞬时限流（不是额度窗口）—— 2026-08-14 实测：key 被
+    // 标 24h 冷却后直接请求上游返回 200。pool 级归 rate-limit（短），账户级 15min。
+    const fr = classifyUpstreamFailure(429, { error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded.' } });
+    expect(fr).toBe('rate-limit');
+    expect(classifyAccountError(429, { error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded.' } }, COOLDOWN).retryMs).toBe(
+      FIFTEEN_MIN,
+    );
   });
 
   it('刻意的偏差：RegionError 不进 pool 分类（§8 取舍，账户徽标承担展示）', () => {

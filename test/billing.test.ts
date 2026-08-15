@@ -160,6 +160,25 @@ describe('parseBillingPage：合理性校验（§5.3）', () => {
   });
 });
 
+describe('parseBillingPage：上下文约束（C-I1）', () => {
+  it('字符串值里的 balance:0 文本（如错误信息）不再被当余额字段覆写真实值', () => {
+    // 旧正则无上下文约束：`"insufficient balance:0"` 的字符串值会被正则当
+    // balance=0 解析，且出现在真实 balance 之后 → 覆写为 0。
+    const html = HYD('{"balance":500000000,"message":"insufficient balance:0"}');
+    expect(parseBillingPage(html)).toEqual({ balanceUnits: 500000000 });
+  });
+
+  it('字符串值里的 monthlyLimit:9 文本不覆写真实 monthlyLimit', () => {
+    const html = HYD('{"balance":5,"monthlyLimit":100,"note":"see monthlyLimit:9"}');
+    expect(parseBillingPage(html)).toEqual({ balanceUnits: 5, monthlyLimitUnits: 100 });
+  });
+
+  it('跨 script 块：无关块字符串值里的 balance:0 文本不覆写真实水合块', () => {
+    const html = `<script>{"balance":500000000}</script><script>{"msg":"insufficient balance:0"}</script>`;
+    expect(parseBillingPage(html)).toEqual({ balanceUnits: 500000000 });
+  });
+});
+
 describe('parseBillingPage：垃圾输入', () => {
   it('空串 / 无 script 文本 → null', () => {
     expect(parseBillingPage('')).toBeNull();

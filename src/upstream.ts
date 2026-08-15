@@ -1,6 +1,7 @@
 import type { AppConfig } from './config.js';
 import { KeyPool, PoolEmptyError, type UpstreamFailureKind } from './keypool.js';
 import { resolveUpstreamBaseUrl } from './deepseek.js';
+import { effectiveGlobalModels } from './settings.js';
 
 /** 上游响应头到达的超时（流式 body 读取不受此限制）。 */
 const UPSTREAM_TIMEOUT_MS = 120_000;
@@ -67,6 +68,15 @@ export interface UpstreamCallOptions {
    * 与池的被动学习 block（pool.isModelBlocked）。
    */
   allowedModelsOf?: (accountId: number) => string[] | null;
+  /**
+   * 密钥级模型授权查询（MODEL-ACCESS 入口 B）：按上游 key 原文返回该 key 的
+   * 自定义允许模型。返回 null = 该 key 无自定义（退回账号级/全局白名单）；
+   * 非空 = 精确匹配（自定义覆盖账号级与全局，见 MODEL-ACCESS §3）。
+   *
+   * 注意：这里传的是 **key 明文**（只在进程内），调用方（server.ts）负责对
+   * `sha256(rawKey)` 查 model_access 表，key 原文不出进程。
+   */
+  keyModelAccess?: (rawKey: string) => string[] | null;
 }
 
 /**
@@ -97,17 +107,21 @@ export async function postUpstreamChat(
   const model = typeof body.model === 'string' && body.model ? body.model : '';
   const baseUrl = resolveUpstreamBaseUrl(model, cfg.anthropicBaseUrl, cfg.payAsYouGoBaseUrl);
 
-  // 账号级选号过滤：健康过滤后逐 key 按 accountId 判断。两个条件都读的是
-  // 「账号归属知道后」才可见的信息 —— 账号模型白名单（accounts.allowedModelsOf
-  // 缓存）与被动学习 block（pool.isModelBlocked）。空模型（缺省走 fallback，
-  // 正常由 server 层在 body.model 里解析完）不做账号级过滤 —— 没有任何
-  // 白名单能匹配空串，硬过滤会把所有配了白名单的账号排除掉。
-  const eligible = (accountId: number): boolean => {
+  // 选号过滤（MODEL-ACCESS §3 优先级链）：健康过滤后逐 key 按 (accountId, key)
+  // 判断。三段式 —— 密钥级自定义授权（opts.keyModelAccess）> 账号级模型白名单
+  // （accounts.allowedModelsOf 缓存）> 全局默认白名单（cfg.globalAllowedModels）。
+  // 被动学习 block（pool.isModelBlocked）是「该账号端点不支持该模型」的观测性
+  // 排除，与授权过滤正交，仍在最前。空模型（缺省走 fallback，正常由 server 层
+  // 在 body.model 里解析完）不做任何过滤 —— 没有白名单能匹配空串，硬过滤会把
+  // 所有配了白名单的账号排除掉。
+  const eligible = (accountId: number, key: string): boolean => {
     if (!model) return true;
     if (pool.isModelBlocked(accountId, model)) return false;
+    const keyCustom = opts.keyModelAccess?.(key);
+    if (keyCustom != null) return keyCustom.includes(model);
     const allowed = opts.allowedModelsOf?.(accountId);
-    if (allowed != null && allowed.length > 0 && !allowed.includes(model)) return false;
-    return true;
+    if (allowed != null && allowed.length > 0) return allowed.includes(model);
+    return effectiveGlobalModels(cfg).has(model);
   };
 
   const key = pool.acquire(opts.excludeKey, eligible, model);

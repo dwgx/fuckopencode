@@ -105,7 +105,11 @@ const SCRIPT_RE = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
  * 主解析：水合数据里的整数 units。可选引号锚定：
  * JSON（"balance":5）与 JS 对象字面量（balance:5）两种形态都吃。
  */
-const HYDRATION_RE = /"?(balance|monthlyLimit|monthlyUsage)"?\s*:\s*(\d+)/g;
+// 词法约束（C-I1）：key 前必须紧跟 `{`/`,`（JSON/JS 对象键位置）——原正则无
+// 上下文约束，会把 JSON **字符串值**里的 `balance:0` 之类文本（如错误信息
+// "insufficient balance:0"）当余额字段解析，以 balance=0 覆写真实余额。加前缀
+// 后只在对象键位置命中，字符串值/任意同名变量不再误匹配。
+const HYDRATION_RE = /[{,]\s*"?(balance|monthlyLimit|monthlyUsage)"?\s*:\s*(\d+)/g;
 
 /** 兜底：data-slot 渲染文本里的美元（¥€ 同吃），只在主解析一个可用值都没有时跑。 */
 const SLOT_RE = /data-slot="(balance|monthlyLimit|monthlyUsage)"[^>]*>\s*(?:[$¥€])\s*([\d,]+(?:\.\d{1,2})?)/g;

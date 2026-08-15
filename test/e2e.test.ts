@@ -12,7 +12,10 @@ import { UsageDb } from '../src/usagedb.js';
 import { loadSecret } from '../src/secrets.js';
 import { KeyPool, keyFingerprint } from '../src/keypool.js';
 import { postUpstreamChat } from '../src/upstream.js';
-import { resolveModelName } from '../src/deepseek.js';
+import { resolveModelName, ALLOWED_MODELS } from '../src/deepseek.js';
+import { ModelAccessStore } from '../src/modelaccess.js';
+import { TokensStore } from '../src/tokens.js';
+import { applySettingsToConfig, SettingsStore } from '../src/settings.js';
 import type { AppConfig } from '../src/config.js';
 import type { OpenAIChatRequest } from '../src/types.js';
 
@@ -49,6 +52,46 @@ function rawRequest(
   });
 }
 
+/**
+ * 原始 TCP 连接上做两段式交换：先发 req1Head（声明大 Content-Length 但 body 只在
+ * 头部之后发一部分），等服务端提前响应（S-P2-2/3 的 204/404 在 body 读之前返回），
+ * 再补发 req1BodyTail + req2。用于验证「提前响应后 req2 在同一连接上仍被正确解析」。
+ * 收满两个 HTTP 响应即返回原始字节；超时抛错。
+ */
+function rawSocketExchange(
+  port: number,
+  req1Head: string,
+  req1BodyTail: string,
+  req2: string,
+  waitAfterFirst: number,
+  timeoutMs: number,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const net = require('node:net') as typeof import('node:net');
+    const sock = net.connect({ host: '127.0.0.1', port });
+    let buf = '';
+    let settled = false;
+    const finish = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.destroy();
+      if (err) reject(err);
+      else resolve(buf);
+    };
+    const timer = setTimeout(() => finish(new Error('raw socket exchange timed out')), timeoutMs);
+    sock.on('error', (e: Error) => finish(e));
+    sock.on('data', (c: Buffer) => {
+      buf += c.toString('utf8');
+      if ((buf.match(/HTTP\/1\.1/g) ?? []).length >= 2) finish();
+    });
+    sock.on('connect', () => {
+      sock.write(req1Head);
+      setTimeout(() => sock.write(req1BodyTail + req2), waitAfterFirst);
+    });
+  });
+}
+
 interface FakeUpstream {
   server: Server;
   baseUrl: string;
@@ -60,6 +103,11 @@ interface FakeUpstream {
    * 该条目的 closed 翻 true（未正常 end 就 close = 被对端掐断）。
    */
   hangEntries: Array<{ closed: boolean }>;
+  /**
+   * 「大错误体测试」钩子产生的错误响应条目：网关限长读 64KB 后 cancel 连接时，
+   * 该条目的 closedEarly 翻 true（连接在全部 body 写完后才 end 之前被对端掐断）。
+   */
+  bigErrEntries: Array<{ closedEarly: boolean; ended: boolean }>;
 }
 
 /**
@@ -72,6 +120,7 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
   const received: OpenAIChatRequest[] = [];
   const receivedHeaders: Array<Record<string, string>> = [];
   const hangEntries: Array<{ closed: boolean }> = [];
+  const bigErrEntries: Array<{ closedEarly: boolean; ended: boolean }> = [];
   const server = createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/v1/models') {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -149,6 +198,29 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
           if (!res.writableEnded) entry.closed = true;
         });
         return;
+      } else if (parsed.stream && messagesJson.includes('流式thinking记账测试')) {
+        // 测试钩子（F1）：流式带 reasoning_content + usage.reasoning_tokens ——
+        // 验证直通流式路径把 thinking 用量记进 ctx（非流式已记账、流式曾恒 0）。
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const base = { id: 'chatcmpl-think', object: 'chat.completion.chunk', created: 1, model: 'deepseek-v4-flash' };
+        const chunks: unknown[] = [
+          { ...base, choices: [{ index: 0, delta: { reasoning_content: '想' }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: { content: '答' }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+          {
+            ...base,
+            choices: [],
+            usage: {
+              prompt_tokens: 5,
+              completion_tokens: 9,
+              total_tokens: 14,
+              completion_tokens_details: { reasoning_tokens: 7 },
+            },
+          },
+        ];
+        for (const c of chunks) res.write(`data: ${JSON.stringify(c)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
       } else if (parsed.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         const base = { id: 'chatcmpl-fake', object: 'chat.completion.chunk', created: 1, model: 'deepseek-v4-flash' };
@@ -227,6 +299,33 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
         // 网关必须把这次 body 读失败记成失败（markFailure）而不是成功。
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('<html>502 Bad Gateway</html>');
+      } else if (messagesJson.includes('大错误体测试')) {
+        // 测试钩子（S-P2-5）：5MB 错误体分片背压写出。网关限长读 64KB 后 cancel
+        // 连接 → 本连接会在 body 未发完时就 close（closedEarly）；若网关整读 body
+        // （旧实现 text().slice()），这里会正常发完再 end（closedEarly=false）。
+        res.writeHead(502, { 'content-type': 'application/json' });
+        const big = JSON.stringify({ error: { type: 'server_error', message: 'x'.repeat(5 * 1024 * 1024) } });
+        const entry = { closedEarly: false, ended: false };
+        bigErrEntries.push(entry);
+        res.on('error', () => {});
+        res.on('close', () => {
+          if (!entry.ended) entry.closedEarly = true;
+        });
+        let sent = 0;
+        const CHUNK = 64 * 1024;
+        const pump = (): void => {
+          if (res.destroyed || res.writableEnded) return;
+          while (sent < big.length) {
+            if (!res.write(big.slice(sent, sent + CHUNK))) {
+              res.once('drain', pump);
+              return;
+            }
+            sent += CHUNK;
+          }
+          entry.ended = true;
+          res.end();
+        };
+        pump();
       } else if (messagesJson.includes('慢响应测试')) {
         // 测试钩子：上游延迟 ~150ms 再回 200 JSON —— 验证「长响应」的可观测性
         // （duration 落库/进 /__metrics events，面板能按耗时看到慢请求）。
@@ -260,7 +359,7 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
-  return { server, baseUrl: `http://127.0.0.1:${port}`, received, receivedHeaders, hangEntries };
+  return { server, baseUrl: `http://127.0.0.1:${port}`, received, receivedHeaders, hangEntries, bigErrEntries };
 }
 
 describe('v1 代理端到端', () => {
@@ -688,6 +787,28 @@ describe('v1 代理端到端', () => {
     await new Promise((r) => setTimeout(r, 150));
     expect(await poolFailCount()).toBe(before);
   });
+
+  it('直通路径错误体限长读取（S-P2-5）：5MB 错误体不整读，读满 64KB 即 cancel 上游连接', async () => {
+    const res = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer test-key',
+        'anthropic-beta': 'messages-2023-12-01',
+      },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', max_tokens: 50, messages: [{ role: 'user', content: '大错误体测试' }] }),
+    });
+    expect(res.status).toBe(502);
+    const text = await res.text();
+    // 客户端收到的错误体被限长（≤64KB + 脱敏改写余量）。
+    expect(text.length).toBeLessThanOrEqual(64 * 1024 + 1024);
+    // 上游连接被网关提前 cancel（5MB 未发完就断）——去掉限长修复（text().slice）
+    // 会整读 5MB 进堆、这里 closedEarly 恒 false。
+    const entry = fake.bigErrEntries.at(-1)!;
+    await new Promise((r) => setTimeout(r, 150));
+    expect(entry.closedEarly).toBe(true);
+    expect(entry.ended).toBe(false);
+  });
 });
 
 describe('并发在飞上限（P1-D：超限 503 + Retry-After，释放后恢复）', () => {
@@ -995,6 +1116,61 @@ describe('未鉴权放行模式的安全加固', () => {
       body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] }),
     });
     expect(res.status).toBe(403);
+  });
+
+  it('CSRF 403 消费请求体并关连接（S-P2-1）：响应带 connection: close（对齐限流路径）', async () => {
+    // 403 在 readBody 之前返回，请求体可能还在路上：不 resume + 不 close 会把未消费
+    // 的 body 留在连接上（keep-alive 假 400）。去掉修复这行断言会红（无 close 头）。
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const res = await rawRequest(port, '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+      body: JSON.stringify({ model: 'claude-opus-4-6', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(403);
+    expect(res.headers['connection']).toBe('close');
+    // 新连接上的正常请求不受影响。
+    const ok = await rawRequest(port, '/v1/models', { method: 'GET' });
+    expect(ok.status).toBe(200);
+  });
+
+  it('OPTIONS preflight 204 消费请求体（S-P2-2）：带大 body 的 preflight 后同一连接可复用', async () => {
+    // preflight 响应（204）不该带 connection: close（连接要复用给真实请求），
+    // 所以 body 靠 req.resume() 排空 —— 未消费的 body 会污染 keep-alive。
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const bodyA = 'x'.repeat(256 * 1024);
+    const head =
+      `OPTIONS /v1/messages HTTP/1.1\r\n` +
+      `Host: 127.0.0.1\r\n` +
+      `Content-Length: ${bodyA.length}\r\n` +
+      `\r\n`;
+    const raw = await rawSocketExchange(
+      port,
+      head,
+      bodyA,
+      `GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`,
+      120,
+      3000,
+    );
+    expect(raw).toMatch(/HTTP\/1\.1 204/);
+    expect(raw).toMatch(/HTTP\/1\.1 200/);
+  });
+
+  it('静态路径 204 消费请求体（S-P2-3 升级）：POST /favicon.ico 带 body → 204 + connection: close（不污染 keep-alive）', async () => {
+    // favicon 等浏览器自动请求的静态资源：204 静默（无内容）+ connection: close
+    // （与限流路径同款双保险：resume 消费残余 body + 干脆关连接，杜绝 keep-alive
+    // 污染）——浏览器 console 不再报 favicon 404 error。connection:close 语义下
+    // 连接不复用（真实浏览器 GET 无 body，无复用需求），用 fetch 验证 204 + 头。
+    const res = await fetch(`${baseUrl}/favicon.ico`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: 'x'.repeat(1024),
+    });
+    expect(res.status).toBe(204);
+    expect(String(res.headers.get('connection') ?? '').toLowerCase()).toContain('close');
+    // 新连接上服务照常
+    const models = await fetch(`${baseUrl}/v1/models`);
+    expect(models.status).toBe(200);
   });
 
   it('空请求体给出可定位的错误（区分于 JSON 写错）', async () => {
@@ -1474,6 +1650,37 @@ describe('观测计数接线（真实请求 -> /__metrics summary）', () => {
     expect(ev.stream).toBe(true);
     expect(ev.inputTokens).toBe(5);
     expect(ev.outputTokens).toBe(2);
+  });
+
+  it('流式直通：thinking_tokens 经 message_delta.output_tokens_details 进 ctx（F1，不再恒 0）', async () => {
+    // 回归：直通流式路径 thinking 记账恒 0（toAnthropic 把 reasoning_tokens 丢在
+    // message_delta 之外、server 直通流式也只取 output/input）—— 与 chat 路径
+    // 从 completion_tokens_details.reasoning_tokens 记账不一致。fake 上游的 usage
+    // chunk 带 reasoning_tokens=7，流式收尾应把 7 记进 ctx。
+    const res = await postMessages({ stream: true, messages: [{ role: 'user', content: '流式thinking记账测试' }] });
+    expect(res.status).toBe(200);
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    const json = (await (await fetch(`${baseUrl}/__metrics`)).json()) as {
+      events: Array<{ path: string; stream: boolean; inputTokens: number; outputTokens: number; thinkingTokens: number }>;
+    };
+    const ev = json.events.find((e) => e.path === '/v1/messages' && e.thinkingTokens === 7);
+    expect(ev).toBeDefined();
+    expect(ev!.stream).toBe(true);
+    expect(ev!.inputTokens).toBe(5);
+    expect(ev!.outputTokens).toBe(9);
+  });
+
+  it('直通路径非流式错误：OpenAI 错误体被包装成 Anthropic 形状（F2，顶层 type:"error"）', async () => {
+    // 回归：直通路径 !ok 时把上游 OpenAI 错误体 `{"error":{...}}` 原样透传，
+    // Anthropic 客户端期望顶层 type:"error"。改造后补顶层 type，内层 message
+    // 保留（上下文超限改写后的 "prompt is too long" 也在内层）。
+    const res = await postMessages({ messages: [{ role: 'user', content: '上下文超限测试' }] });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { type?: string; error?: { type?: string; message?: string } };
+    expect(json.type).toBe('error');
+    expect(json.error?.message).toContain('prompt is too long');
+    expect(json.error?.type).toBe('invalid_request_error');
   });
 });
 
@@ -2773,11 +2980,15 @@ describe('管理面板（/__admin）鉴权与 CRUD 全流程', () => {
       .all() as Array<{ op: string; account_id: number | null; ok: number; note: string | null }>;
     raw.close();
     const ops = rows.map((r) => [r.op, r.account_id, r.ok, r.note] as const);
-    expect(ops).toContainEqual(['account.create', accId, 1, null]);
-    expect(ops).toContainEqual(['account.patch', accId, 1, null]);
-    expect(ops).toContainEqual(['account.add-key', accId, 1, null]);
-    expect(ops).toContainEqual(['account.rename-key', accId, 1, null]);
-    expect(ops).toContainEqual(['account.delete', accId, 1, null]);
+    // A-P2-5：账号类写操作的审计 note 不再恒 null（create=账号名 / patch=变更字段 /
+    // add-key、rename-key=key 指纹 / delete=删除前账号名），只断言非空字符串。
+    const okNote = (op: string) =>
+      ops.some((r) => r[0] === op && r[1] === accId && r[2] === 1 && typeof r[3] === 'string' && r[3].length > 0);
+    expect(okNote('account.create')).toBe(true);
+    expect(okNote('account.patch')).toBe(true);
+    expect(okNote('account.add-key')).toBe(true);
+    expect(okNote('account.rename-key')).toBe(true);
+    expect(okNote('account.delete')).toBe(true);
     expect(ops).toContainEqual(['account.create', null, 0, 'conflict']);
     expect(ops).toContainEqual(['model-alias.save', null, 1, null]);
     expect(ops).toContainEqual(['model-alias.delete', null, 1, null]);
@@ -3218,6 +3429,37 @@ describe('OAuth device flow 接线（/__admin/api/oauth）', () => {
     expect(store.list()).toHaveLength(before); // 不重复建
     const acc = store.list().find((a) => a.workspaceId === 'ws_oauth_e2e')!;
     expect(store.getOauthRefresh(acc.id)).toBe('rt-e2e-secret');
+  });
+
+  it('OAuth 建号/补绑落 admin_audit（A-P2-2：oauth.account-create / oauth.refresh-update，不记 token 材料）', async () => {
+    // 自足：先走一遍完整登录（账号不存在则建号 / 已存在则补绑），再走一遍幂等补绑，
+    // 两种审计行都必须落库。
+    const runFlow = async (): Promise<void> => {
+      consoleMock.reset();
+      await startPost();
+      await pollPost('dc-e2e'); // pending
+      const done = await pollPost('dc-e2e'); // done → persistOauthAccount
+      expect(done.status).toBe(200);
+      expect(await done.json()).toEqual({ ok: true, status: 'done' });
+    };
+    await runFlow();
+    await runFlow();
+    const { DatabaseSync } = await import('node:sqlite');
+    const raw = new DatabaseSync(path.join(tmpDir, 'oauth.db'), { readOnly: true });
+    try {
+      const rows = raw
+        .prepare("SELECT op, account_id, ok, note FROM admin_audit WHERE op LIKE 'oauth.%' ORDER BY id")
+        .all() as Array<{ op: string; account_id: number | null; ok: number; note: string | null }>;
+      expect(rows.some((r) => r.op === 'oauth.account-create' && r.ok === 1 && r.account_id != null)).toBe(true);
+      expect(rows.some((r) => r.op === 'oauth.refresh-update' && r.ok === 1 && r.account_id != null)).toBe(true);
+      // 审计摘要绝不带 token 材料。
+      for (const r of rows) {
+        expect(r.note ?? '').not.toContain('rt-e2e-secret');
+        expect(r.note ?? '').not.toContain('at-e2e');
+      }
+    } finally {
+      raw.close();
+    }
   });
 
   it('非 POST 的 oauth 路径 → 404', async () => {
@@ -4796,8 +5038,9 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
         return { ok: false, reason: bad };
       }
       const r = this.readResult();
-      // 成功抓取即填充明文缓存（镜像 main.ts 的 listKeys 适配器）。
-      if (r.ok && this.cache) this.cache.set(id, this.plainRows());
+      // 成功抓取即填充明文缓存（镜像 main.ts 的 listKeys 适配器——带 ws 维度，
+      // C-P2-2：不传 ws 会让 e2e 全链路只走兼容放行路径，生产接线回归被 e2e 放过）。
+      if (r.ok && this.cache) this.cache.set(id, this.plainRows(), ws);
       return r;
     }
     async createKey(id: number, cookie: string | null, ws: string, name: string): Promise<LegacyWriteResult> {
@@ -4817,6 +5060,12 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
       const bad = this.cookieFail(cookie);
       if (bad) return { ok: false, reason: bad };
       return this.goStatusResult();
+    }
+    // zen usage JSON API（legacyKey 优先通道）。本组账号都不配 legacyKey，恒返回
+    // null（= 让端点回落 getGoStatus）；调用本身记进 calls 供断言「没走 zen」。
+    async getZenGoUsage(id: number, apiKey: string): Promise<LegacyGoStatus | null> {
+      this.calls.push({ method: 'getZenGoUsage', cookie: apiKey, ws: '' });
+      return null;
     }
     async setGoToggle(id: number, cookie: string | null, ws: string, toggle: 'useBalance' | 'chinaModels', value: boolean): Promise<LegacyWriteResult> {
       this.calls.push({ method: 'setGoToggle', cookie, ws, toggle, value });
@@ -6129,6 +6378,23 @@ describe('全局模型门（白名单外明确拒绝，不再回落 flash）', (
     expect(fake.received.length).toBe(before);
   });
 
+  it('直通路径：非法模型 + 非法结构 → 优先报结构错（F3，对齐 chat 路径 validate 先于模型门）', async () => {
+    // 回归：直通路径原顺序是「模型门 → validate」，同请求在两条路径报不同错误
+    // （chat 路径报结构错、直通路径报模型 400）。现在 validate 在前：缺
+    // max_tokens 的结构错应优先于白名单外模型的模型拒绝。
+    const before = fake.received.length;
+    const res = await POST('/v1/messages', {
+      model: 'claude-sonnet-4-6', // 白名单外
+      messages: [{ role: 'user', content: 'hi' }], // 缺 max_tokens → 结构错
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string; type: string } };
+    expect(json.error.message).toBe('max_tokens is required');
+    expect(json.error.type).toBe('invalid_request_error');
+    // 没打到上游（拒绝发生在网关内）。
+    expect(fake.received.length).toBe(before);
+  });
+
   it('alias 映射进白名单的模型仍 200（白名单语义不受影响）', async () => {
     const res = await POST('/v1/chat/completions', {
       model: 'gpt-4o',
@@ -6322,5 +6588,414 @@ describe('账号级模型白名单（选号过滤）与被动学习', () => {
     expect(m.catalog.count).toBe(2);
     expect(m.catalog.lastRefreshAt).toBeGreaterThan(0);
     expect(m.catalog.lastError).toBeNull();
+  });
+});
+
+describe('密钥-模型授权数据面（MODEL-ACCESS §4）', () => {
+  const API_KEY = 'model-access-api-key';
+  const KEY_A = 'sk-model-access-a';
+  const KEY_B = 'sk-model-access-b';
+  let fake: FakeUpstream;
+  let proxy: Server;
+  let db: UsageDb;
+  let store: AccountsStore;
+  let pool: KeyPool;
+  let tokens: TokensStore;
+  let modelAccess: ModelAccessStore;
+  let baseUrl: string;
+  let tmpDir: string;
+  let accAId: number;
+  let accBId: number;
+
+  const sha256 = (k: string): string => crypto.createHash('sha256').update(k, 'utf8').digest('hex');
+
+  const cfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: [API_KEY],
+    anthropicApiKey: null,
+    upstreamKeys: [],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: 'e2e-model-access-secret',
+    secretFilePath: '/dev/null',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+    cfg.anthropicBaseUrl = fake.baseUrl;
+    cfg.payAsYouGoBaseUrl = fake.baseUrl;
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-e2e-modelaccess-'));
+    db = new UsageDb(path.join(tmpDir, 'ma.db'), 30, () => {});
+    const secret = loadSecret({ gatewaySecret: 'e2e-model-access-secret', secretFilePath: '/dev/null' } as unknown as AppConfig)!;
+    store = new AccountsStore(db, secret, cfg, () => {});
+    const a1 = store.create({ name: 'accA', kind: 'subscription', workspaceId: null, keys: [KEY_A], cookie: null });
+    const a2 = store.create({ name: 'accB', kind: 'subscription', workspaceId: null, keys: [KEY_B], cookie: null });
+    if (!a1.ok || !a2.ok) throw new Error('account create failed');
+    accAId = a1.value.id;
+    accBId = a2.value.id;
+    const accountIds = store.keysForPool();
+    pool = new KeyPool([...accountIds.keys()], {
+      cooldownMs: cfg.keyCooldownMs,
+      failThreshold: cfg.keyFailThreshold,
+    }, accountIds);
+    tokens = new TokensStore(db, secret);
+    modelAccess = new ModelAccessStore(db);
+    proxy = createApp(cfg, pool, db, store, undefined, undefined, undefined, undefined, tokens, undefined, undefined, modelAccess);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    await new Promise<void>((resolve) => fake.server.close(() => resolve()));
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** 清掉上游 key 级自定义（每用例独立起点）。 */
+  function clearUpstreamCustoms(): void {
+    modelAccess.setCustom('upstream-key', sha256(KEY_A), null);
+    modelAccess.setCustom('upstream-key', sha256(KEY_B), null);
+  }
+
+  /** 恢复账号级白名单 + 全局白名单 + 上游 key 自定义到默认。 */
+  function resetConfig(): void {
+    store.setAllowedModels(accAId, null);
+    store.setAllowedModels(accBId, null);
+    applySettingsToConfig(cfg, { allowedModels: null });
+    clearUpstreamCustoms();
+  }
+
+  const chat = (body: unknown, token = API_KEY): Promise<Response> =>
+    fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+  const lastUpstreamAuth = (): string =>
+    fake.receivedHeaders[fake.receivedHeaders.length - 1]?.authorization ?? '';
+
+  /** 落库的最近一条请求（force flush 保证已入库）。 */
+  function lastRequestRow(): { error: string | null; api_key_fp: string | null } {
+    db.flush();
+    const row = db.sqlite()!.prepare('SELECT error, api_key_fp FROM requests ORDER BY at DESC LIMIT 1').get() as
+      | { error: string | null; api_key_fp: string | null }
+      | undefined;
+    if (!row) throw new Error('no request row');
+    return row;
+  }
+
+  it('上游 key 级授权：keyA 自定义 {free}、keyB 无 → 打 free 选 keyA、打 flash 选 keyB（自定义盖过账号级）', async () => {
+    resetConfig();
+    // 账号 A/B 都只允许 flash；keyA 自定义 {free} —— 自定义盖过账号级。
+    expect(store.setAllowedModels(accAId, ['deepseek-v4-flash'])).toBe(true);
+    expect(store.setAllowedModels(accBId, ['deepseek-v4-flash'])).toBe(true);
+    expect(modelAccess.setCustom('upstream-key', sha256(KEY_A), ['deepseek-v4-flash-free'])).toBe(true);
+
+    // 打 free：keyA 自定义命中；keyB 账号级只放 flash → 必须选 keyA。
+    const free = await chat({ model: 'deepseek-v4-flash-free', messages: [{ role: 'user', content: 'hi' }] });
+    expect(free.status).toBe(200);
+    expect(lastUpstreamAuth()).toBe(`Bearer ${KEY_A}`);
+
+    // 打 flash：keyA 自定义不含 flash（盖过账号 A 的 flash）→ 排除；keyB 账号级放行。
+    const flash = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    expect(flash.status).toBe(200);
+    expect(lastUpstreamAuth()).toBe(`Bearer ${KEY_B}`);
+  });
+
+  it('上游 key 级授权：全部 key 被滤掉 → ModelNotAllowedError → 400（选号在网关内终止，不打上游）', async () => {
+    resetConfig();
+    expect(modelAccess.setCustom('upstream-key', sha256(KEY_A), ['deepseek-v4-flash-free'])).toBe(true);
+    expect(modelAccess.setCustom('upstream-key', sha256(KEY_B), ['deepseek-v4-flash-free'])).toBe(true);
+    const before = fake.received.length;
+
+    const res = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string; type: string } };
+    expect(json.error.type).toBe('invalid_request_error');
+    expect(json.error.message).toContain('is not allowed');
+    expect(json.error.message).not.toContain('for this key'); // 账号级/选号拒绝路径，不是密钥门
+    expect(fake.received.length).toBe(before);
+  });
+
+  it('分发 token 自定义 {free}：打 free 200、打 flash 400（message 含 "for this key"，requests.error 含 not-allowed-for-key）', async () => {
+    resetConfig();
+    const created = tokens.create('gate-token', null, 'tk-model-gate-12345678');
+    if (!created.ok) throw new Error('token create failed');
+    const fp = created.value.fingerprint;
+    expect(modelAccess.setCustom('token', fp, ['deepseek-v4-flash-free'])).toBe(true);
+    const token = created.value.token;
+
+    const ok = await chat({ model: 'deepseek-v4-flash-free', messages: [{ role: 'user', content: 'hi' }] }, token);
+    expect(ok.status).toBe(200);
+
+    const denied = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }, token);
+    expect(denied.status).toBe(400);
+    const json = (await denied.json()) as { error: { message: string; type: string } };
+    expect(json.error.type).toBe('invalid_request_error');
+    expect(json.error.message).toContain('is not allowed for this key');
+    expect(json.error.message).toContain('deepseek-v4-flash-free');
+
+    // 审计：拒绝请求落库，error 带 not-allowed-for-key token:<末8>；token 调用 api_key_fp 为 null。
+    const row = lastRequestRow();
+    expect(row.error).toContain('not-allowed-for-key token:');
+    expect(row.error).toContain(fp.slice(-8));
+    expect(row.api_key_fp).toBeNull();
+
+    modelAccess.setCustom('token', fp, null);
+  });
+
+  it('API key 自定义 {free}：打 flash 400 且 api_key_fp 归因落库', async () => {
+    resetConfig();
+    expect(modelAccess.setCustom('api-key', sha256(API_KEY), ['deepseek-v4-flash-free'])).toBe(true);
+
+    const denied = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }, API_KEY);
+    expect(denied.status).toBe(400);
+    const json = (await denied.json()) as { error: { message: string } };
+    expect(json.error.message).toContain('for this key');
+
+    const row = lastRequestRow();
+    expect(row.error).toContain('not-allowed-for-key api-key:');
+    expect(row.error).toContain(sha256(API_KEY).slice(-8));
+    // 归因：API key 请求的 api_key_fp = sha256(API_KEY) 全 hex。
+    expect(row.api_key_fp).toBe(sha256(API_KEY));
+
+    modelAccess.setCustom('api-key', sha256(API_KEY), null);
+  });
+
+  it('settings 全局收窄 {free}：无自定义密钥打 flash 400（for this key）、打 free 200', async () => {
+    resetConfig();
+    applySettingsToConfig(cfg, { allowedModels: ['deepseek-v4-flash-free'] });
+
+    const denied = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }, API_KEY);
+    expect(denied.status).toBe(400);
+    const json = (await denied.json()) as { error: { message: string } };
+    expect(json.error.message).toContain('for this key');
+
+    const ok = await chat({ model: 'deepseek-v4-flash-free', messages: [{ role: 'user', content: 'hi' }] }, API_KEY);
+    expect(ok.status).toBe(200);
+
+    // 恢复：清 settings 键回硬底线。
+    applySettingsToConfig(cfg, { allowedModels: null });
+  });
+
+  // ── MODEL-ACCESS §5 管理端点（复用上面同一 app 实例；放在数据面用例之后，
+  // 末尾执行，afterEach 恢复授权/settings 状态，不破坏数据面用例的起点）──
+  describe('管理端点（MODEL-ACCESS §5）', () => {
+    // 惰性建：嵌套 describe 体在收集期执行（外层 db 还没赋值），beforeAll 里再建。
+    let settings: SettingsStore;
+    beforeAll(() => {
+      settings = new SettingsStore(db);
+    });
+
+    const adminGet = (p: string): Promise<Response> =>
+      fetch(`${baseUrl}${p}`, { headers: { authorization: `Bearer ${API_KEY}` } });
+
+    const adminPut = (p: string, body: unknown): Promise<Response> =>
+      fetch(`${baseUrl}${p}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
+        body: JSON.stringify(body),
+      });
+
+    /** 最近一条指定 op 的审计行（insertAdminAudit 同步落库，无需 flush）。 */
+    function lastAudit(op: string): { ok: number; note: string } | null {
+      const row = db
+        .sqlite()!
+        .prepare('SELECT op, ok, note FROM admin_audit WHERE op = ? ORDER BY id DESC LIMIT 1')
+        .get(op) as { op: string; ok: number; note: string } | undefined;
+      return row ? { ok: Number(row.ok), note: row.note } : null;
+    }
+
+    interface MaGetData {
+      global: { models: string[]; source: 'settings' | 'code'; core: string[] };
+      keys: {
+        apiKeys: Array<{ mask: string; subject: string; custom: string[] | null }>;
+        upstreamKeys: Array<{ fingerprint: string; accountId: number; accountName: string | null; subject: string; custom: string[] | null }>;
+      };
+    }
+
+    function getData(): Promise<MaGetData> {
+      return adminGet('/__admin/api/model-access').then((r) =>
+        (r.json() as Promise<{ data: MaGetData }>).then((j) => j.data),
+      );
+    }
+
+    afterEach(() => {
+      // 恢复起点：清 settings 键 + 全部自定义授权（幂等）。
+      settings.delete('allowedModels');
+      applySettingsToConfig(cfg, { allowedModels: null });
+      modelAccess.setCustom('upstream-key', sha256(KEY_A), null);
+      modelAccess.setCustom('upstream-key', sha256(KEY_B), null);
+      modelAccess.setCustom('api-key', sha256(API_KEY), null);
+    });
+
+    it('GET 未鉴权 401、跨 Origin 403', async () => {
+      const anon = await fetch(`${baseUrl}/__admin/api/model-access`);
+      expect(anon.status).toBe(401);
+      const cross = await fetch(`${baseUrl}/__admin/api/model-access`, {
+        headers: { authorization: `Bearer ${API_KEY}`, origin: 'http://evil.example' },
+      });
+      expect(cross.status).toBe(403);
+    });
+
+    it('GET 全量：global(models/source/core) + models 全表 + 三类 keys 带 subject/custom', async () => {
+      const res = await adminGet('/__admin/api/model-access');
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as {
+        ok: boolean;
+        data: {
+          global: { models: string[]; source: 'settings' | 'code'; core: string[] };
+          models: string[];
+          keys: {
+            tokens: Array<{ id: number; fingerprint: string; mask: string; status: string; custom: string[] | null }>;
+            apiKeys: Array<{ mask: string; subject: string; custom: string[] | null }>;
+            upstreamKeys: Array<{ fingerprint: string; accountId: number; accountName: string | null; subject: string; custom: string[] | null }>;
+          };
+        };
+      };
+      expect(json.ok).toBe(true);
+      // 默认：全局 = 硬底线、source code；全表 = 硬底线（modelMap 空）。
+      expect(json.data.global.models).toEqual([...ALLOWED_MODELS]);
+      expect(json.data.global.source).toBe('code');
+      expect(json.data.global.core).toEqual([...ALLOWED_MODELS]);
+      expect(json.data.models).toEqual([...ALLOWED_MODELS]);
+      // API key：mask 掩码 + subject = sha256 全 hex（面板编辑用，不泄明文）。
+      expect(json.data.keys.apiKeys).toHaveLength(1);
+      expect(json.data.keys.apiKeys[0]).toMatchObject({ mask: keyFingerprint(API_KEY), subject: sha256(API_KEY), custom: null });
+      // 上游 key：KEY_A → accA、KEY_B → accB，带账号名与 sha256 subject。
+      expect(json.data.keys.upstreamKeys).toHaveLength(2);
+      const bySubject = new Map(json.data.keys.upstreamKeys.map((k) => [k.subject, k]));
+      expect(bySubject.get(sha256(KEY_A))).toMatchObject({ accountId: accAId, accountName: 'accA', custom: null });
+      expect(bySubject.get(sha256(KEY_B))).toMatchObject({ accountId: accBId, accountName: 'accB', custom: null });
+    });
+
+    it('PUT global 合法 200 + audit + settings 表值 + GET source 变 settings', async () => {
+      const res = await adminPut('/__admin/api/model-access/global', { models: ['deepseek-v4-flash'] });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { ok: boolean; data: { global: { models: string[]; source: 'settings' | 'code' } } };
+      expect(json.ok).toBe(true);
+      expect(json.data.global.models).toEqual(['deepseek-v4-flash']);
+      expect(json.data.global.source).toBe('settings');
+      expect(settings.get('allowedModels')).toBe(JSON.stringify(['deepseek-v4-flash']));
+      expect(lastAudit('model-access.global')).toMatchObject({ ok: 1, note: 'models:1' });
+      // cfg 运行时生效（数据面读的同一个对象）。
+      expect(cfg.globalAllowedModels?.has('deepseek-v4-flash')).toBe(true);
+      const data = await getData();
+      expect(data.global.source).toBe('settings');
+      expect(data.global.models).toEqual(['deepseek-v4-flash']);
+    });
+
+    it('PUT global 硬底线外 400（不落库）；空数组等价清键回代码默认', async () => {
+      const bad = await adminPut('/__admin/api/model-access/global', { models: ['glm-5'] });
+      expect(bad.status).toBe(400);
+      expect((await bad.json()) as { error: { message: string } }).toMatchObject({
+        error: { message: expect.stringContaining('hard allowlist') },
+      });
+      expect(settings.get('allowedModels')).toBeNull();
+
+      const empty = await adminPut('/__admin/api/model-access/global', { models: [] });
+      expect(empty.status).toBe(200);
+      expect(settings.get('allowedModels')).toBeNull();
+      const data = await getData();
+      expect(data.global.source).toBe('code');
+      expect(data.global.models).toEqual([...ALLOWED_MODELS]);
+    });
+
+    it('PUT global models:null 删键回代码默认 + audit reset', async () => {
+      settings.set('allowedModels', JSON.stringify(['deepseek-v4-flash-free']));
+      applySettingsToConfig(cfg, { allowedModels: ['deepseek-v4-flash-free'] });
+      const res = await adminPut('/__admin/api/model-access/global', { models: null });
+      expect(res.status).toBe(200);
+      expect(settings.get('allowedModels')).toBeNull();
+      expect(lastAudit('model-access.global')).toMatchObject({ ok: 1, note: 'reset' });
+      const data = await getData();
+      expect(data.global.source).toBe('code');
+      expect(data.global.models).toEqual([...ALLOWED_MODELS]);
+    });
+
+    it('PUT keys token：合法 200 + listByType 有值；models:null 清除', async () => {
+      const created = tokens.create('ma-token', null, 'tk-ma-12345678901234');
+      if (!created.ok) throw new Error('token create failed');
+      const fp = created.value.fingerprint;
+
+      const res = await adminPut(`/__admin/api/model-access/keys/token/${fp}`, { models: ['deepseek-v4-flash-free'] });
+      expect(res.status).toBe(200);
+      expect(modelAccess.getCustom('token', fp)).toEqual(['deepseek-v4-flash-free']);
+      expect(lastAudit('model-access.key')).toMatchObject({ ok: 1, note: `token:${fp.slice(-8)}` });
+
+      const clear = await adminPut(`/__admin/api/model-access/keys/token/${fp}`, { models: null });
+      expect(clear.status).toBe(200);
+      expect(modelAccess.getCustom('token', fp)).toBeNull();
+    });
+
+    it('PUT keys api-key：合法 200；硬底线外 400；清除', async () => {
+      const subject = sha256(API_KEY);
+      const res = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: ['deepseek-v4-flash-free'] });
+      expect(res.status).toBe(200);
+      expect(modelAccess.getCustom('api-key', subject)).toEqual(['deepseek-v4-flash-free']);
+      expect(lastAudit('model-access.key')).toMatchObject({ ok: 1, note: `api-key:${subject.slice(-8)}` });
+
+      const bad = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: ['glm-5'] });
+      expect(bad.status).toBe(400);
+
+      const clear = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: null });
+      expect(clear.status).toBe(200);
+      expect(modelAccess.getCustom('api-key', subject)).toBeNull();
+    });
+
+    it('PUT keys upstream-key：合法 200；清除；subject 不存在 404（三类）', async () => {
+      const subject = sha256(KEY_A);
+      const res = await adminPut(`/__admin/api/model-access/keys/upstream-key/${subject}`, { models: ['deepseek-v4-flash-free'] });
+      expect(res.status).toBe(200);
+      expect(modelAccess.getCustom('upstream-key', subject)).toEqual(['deepseek-v4-flash-free']);
+      expect(lastAudit('model-access.key')).toMatchObject({ ok: 1, note: `upstream-key:${subject.slice(-8)}` });
+
+      const clear = await adminPut(`/__admin/api/model-access/keys/upstream-key/${subject}`, { models: null });
+      expect(clear.status).toBe(200);
+      expect(modelAccess.getCustom('upstream-key', subject)).toBeNull();
+
+      const missingUp = await adminPut('/__admin/api/model-access/keys/upstream-key/deadbeef', { models: ['deepseek-v4-flash'] });
+      expect(missingUp.status).toBe(404);
+      const missingTok = await adminPut('/__admin/api/model-access/keys/token/000000000000000000000000', { models: ['deepseek-v4-flash'] });
+      expect(missingTok.status).toBe(404);
+      const missingApi = await adminPut(`/__admin/api/model-access/keys/api-key/${'0'.repeat(64)}`, { models: ['deepseek-v4-flash'] });
+      expect(missingApi.status).toBe(404);
+    });
+
+    it('PUT keys type 非法 400', async () => {
+      const res = await adminPut('/__admin/api/model-access/keys/bogus/xyz', { models: ['deepseek-v4-flash'] });
+      expect(res.status).toBe(400);
+    });
   });
 });

@@ -29,14 +29,32 @@ export function estimateBytes(json: string): number {
 }
 
 /**
+ * 按码点截断前 max 个字符。UTF-16 `slice` 会把 4 字节字符切成孤立 surrogate
+ * （M-P2-3）；`text.length <= max` 时无代理对问题，直接快路径返回。
+ */
+function truncateByCodePoint(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let out = '';
+  let count = 0;
+  for (const ch of text) {
+    if (count >= max) break;
+    out += ch;
+    count++;
+  }
+  return out;
+}
+
+/**
  * 折叠单段文本：连续空白 → 单空格；超长截断（保留省略标记）。
  * 未改动（折叠/截断后与原串相同）返回 null，供调用方判断是否发生压缩。
  */
 function collapseText(text: string, maxMessageChars: number): string | null {
   if (text.length === 0) return null;
-  let out = text.replace(/\s+/g, ' ');
+  // 只折叠空格/制表符类空白（[ \t]+），保留 \n —— 否则 tool_result 里的代码段
+  // 会被拍成单行，破坏代码可读性（M-P2-3）。
+  let out = text.replace(/[ \t]+/g, ' ');
   if (out.length > maxMessageChars) {
-    out = out.slice(0, maxMessageChars) + TRUNCATE_MARK;
+    out = truncateByCodePoint(out, maxMessageChars) + TRUNCATE_MARK;
   }
   return out === text ? null : out;
 }

@@ -20,9 +20,9 @@
  */
 
 import type { AppConfig } from './config.js';
-import { classifyAccountError, classifyUpstreamFailure, resetDelayMsFromError, stripSecrets } from './errors.js';
+import { classifyAccountError, classifyUpstreamFailure, isModelUnsupported, resetDelayMsFromError, stripSecrets } from './errors.js';
 import type { KeyPool } from './keypool.js';
-import { keyFingerprint } from './keypool.js';
+import { keyFingerprint, MODEL_BLOCK_TTL_MS } from './keypool.js';
 import type { UsageDb } from './usagedb.js';
 import type { AccountsStore, AccountView } from './accounts.js';
 
@@ -53,6 +53,9 @@ export interface ProbeResult {
   durationMs: number;
   /** 失败时的分类，与真实流量用同一套 classifyUpstreamFailure。 */
   kind?: 'auth' | 'rate-limit' | 'quota-exhausted' | 'transient';
+  /** 该账号/端点不支持探活模型（isModelUnsupported 命中）：模型不可用 ≠ key 不可用，
+   *  已跳过 markFailure 并记被动学习 block，runProbeRound 据此不给账户标 error。 */
+  modelUnsupported?: boolean;
   error?: string;
   /** 上游错误响应体（失败时可能有）。runProbeRound 的账户级分类与 status_detail 用。 */
   body?: unknown;
@@ -130,6 +133,22 @@ export async function probeKey(
     }
     const kind = classifyUpstreamFailure(res.status, body);
     const resetMs = resetDelayMsFromError(body);
+    // 该账号/端点不支持探活模型（`-free` 打订阅端点等，M-P2-5）：模型不可用 ≠
+    // key 不可用 —— 不 markFailure（否则把好 key 标 error 推 15min），记被动学习
+    // (account, model) blocked，选号时排除该组合（与真实流量 errors.ts 同口径）。
+    if (isModelUnsupported(res.status, body)) {
+      pool.blockModel(pool.accountIdOf(key), model, MODEL_BLOCK_TTL_MS);
+      return {
+        fingerprint,
+        ok: false,
+        status: res.status,
+        durationMs,
+        modelUnsupported: true,
+        // 先脱敏再截断：错误体可能回显 Bearer sk-xxx（见 stripSecrets 注释）。
+        error: `probe ${res.status}: ${stripSecrets(raw).slice(0, 200)}`,
+        body,
+      };
+    }
     pool.markFailure(key, kind, resetMs ?? undefined);
     // 探活也能发现额度耗尽：记录上游错误，供池空时原样透传给下游。
     if (kind === 'quota-exhausted') pool.noteQuotaError(res.status, body);
@@ -172,8 +191,10 @@ export async function probeKey(
  * 2. 账户至少 1 个 key
  * 3. 该账户任一 key 的 lastUsedAt 新鲜（> now - keyProbeIdleMs）→ 跳过（有真实流量）
  *
- * 代表 key 取账户第一个，不因 pool 禁用跳过 —— 禁用中探一次恰好是「到期前
- * 确认恢复」的主力手段（重报同类错误不会延长 pool 冷却，见 §4.3）。
+ * 代表 key：**每个 key 都探**，不只 keys[0]（env 种子把整组 OPENSEA_KEYS 塞进一个
+ * 账户，只探第一个会让排在后边的 key 的额度耗尽永远不被发现，2026-08-14 线上实测）。
+ * 不因 pool 禁用跳过 —— 禁用中探一次恰好是「到期前确认恢复」的主力手段（重报同类
+ * 错误不会延长 pool 冷却，见 §4.3）。
  *
  * 串行探而非并发：探活是后台维护动作，没必要为了快去抢占上游并发额度，
  * 也避免同时打多个请求触发上游的速率限制。
@@ -274,6 +295,17 @@ export async function runProbeRound(
         `[keyprobe] account=${acc.name} probe ok ` +
           (keys.length === 1 && ok ? `${ok.status}（${ok.durationMs}ms）` : `${keys.length} keys`),
       );
+    } else if (firstFail.modelUnsupported) {
+      // 探活模型不被该账号端点支持（-free 打订阅端点等）：账户本身没坏，不标 error
+      // （M-P2-5）。记 ok + 详情注明，retry 推到空闲窗口之后再探（避免每轮重复打
+      // 无意义的模型探针）；被动学习 blockModel 已在 probeKey 里记过。
+      accounts.setProbeResult(acc.id, {
+        status: 'ok',
+        detail: `探活模型不被该账号端点支持（${firstFail.status}）`,
+        retryUntil: now + cfg.keyProbeIdleMs,
+        lastProbeAt: now,
+      });
+      log(`[keyprobe] account=${acc.name} probe model unsupported ${firstFail.status}（${firstFail.error ?? ''}）`);
     } else {
       const acct = classifyAccountError(firstFail.status, firstFail.body, cfg.keyCooldownMs);
       const detail = probeDetail(firstFail.body) || firstFail.error || null;

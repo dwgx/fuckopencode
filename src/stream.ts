@@ -19,8 +19,8 @@ interface StreamState {
   textChars: number;
   /** JSON mode：被转换为 content 的 json_mode 工具块（不暴露 tool_calls） */
   jsonModeBlocks: Set<number>;
-  /** JSON mode：每块累积的 arguments */
-  jsonModeArgs: Map<number, string>;
+  /** JSON mode：每块累积的 arguments（segment 数组，收尾一次 join，避免逐段 `+` 的 O(n²)） */
+  jsonModeArgs: Map<number, string[]>;
   /** 流里出现过 json_mode 工具（收尾 finish_reason 用 stop 而非 tool_calls） */
   emittedJsonMode: boolean;
   /** 是否已发出带 finish_reason 的收尾 chunk（防漏发/重复发） */
@@ -81,7 +81,7 @@ export async function* anthropicStreamToOpenAI(
           if (ev.content_block.name === 'json_mode') {
             // JSON mode：不暴露工具调用，累积参数后转 content；不占用 tool_calls 槽位。
             state.jsonModeBlocks.add(ev.index);
-            state.jsonModeArgs.set(ev.index, '');
+            state.jsonModeArgs.set(ev.index, []);
             break;
           }
           const toolIndex = state.toolBlockIndex.size;
@@ -112,8 +112,9 @@ export async function* anthropicStreamToOpenAI(
           yield makeChunk(state, { delta: { reasoning_content: ev.delta.thinking }, finish_reason: null });
         } else if (ev.delta.type === 'input_json_delta') {
           if (state.jsonModeBlocks.has(ev.index)) {
-            // JSON mode：累积参数，不产出 tool_calls delta。
-            state.jsonModeArgs.set(ev.index, (state.jsonModeArgs.get(ev.index) ?? '') + ev.delta.partial_json);
+            // JSON mode：segment 数组累积（收尾一次 join），不产出 tool_calls delta。
+            // 逐段 `(get ?? '') + partial_json` 拼接是 O(n²)（M-P2-4）。
+            state.jsonModeArgs.get(ev.index)?.push(ev.delta.partial_json);
             state.textChars += ev.delta.partial_json.length;
             break;
           }
@@ -139,7 +140,7 @@ export async function* anthropicStreamToOpenAI(
           // JSON mode：块结束，把完整 JSON 作为 content 发出（OpenAI json_object 语义）。
           state.jsonModeBlocks.delete(ev.index);
           state.emittedJsonMode = true;
-          const acc = state.jsonModeArgs.get(ev.index) ?? '';
+          const acc = (state.jsonModeArgs.get(ev.index) ?? []).join('');
           state.jsonModeArgs.delete(ev.index);
           let jsonText = acc;
           try {

@@ -72,7 +72,19 @@ export interface OauthIdentity {
 export type OauthPollResult =
   | { ok: true; status: 'pending' }
   | { ok: true; status: 'done'; identity: OauthIdentity }
-  | { ok: false; reason: 'expired' | 'denied' | 'not_found' | 'error' };
+  | {
+      ok: false;
+      reason: 'expired' | 'denied' | 'not_found' | 'error';
+      /**
+       * 重试路径 refresh 已轮换但 orgs 仍失败时带回的**新** refresh_token
+       * （调用方按需落库；undefined = 本次失败没有轮换发生）。refresh 轮换
+       * 语义下旧值在轮换瞬间失效——不落库则进程重启/会话丢失后，下次用旧值
+       * 刷新必然 invalid_grant。
+       */
+      refreshToken?: string;
+      /** 与 refreshToken 配对的轮换前旧值（调用方按「旧值 == 账号存值」定位账号）。 */
+      prevRefreshToken?: string;
+    };
 
 /** 单次 HTTP 往返的结果：body 能解析成 JSON 即算拿到（device flow 的失败也是 JSON）。 */
 type HttpJsonResult = { ok: true; json: unknown } | { ok: false; reason: string };
@@ -214,6 +226,9 @@ export class OauthManager {
     // 只调一次，device_code 一次性），直接用 access_token 不可重取——需要
     // refresh_token 换新 access。这里用 refresh 换 access 再拉 orgs。
     if (session.refreshToken != null) {
+      // refresh 用的旧值：轮换写回会话后它就不再可读，先存下来——orgs 再失败
+      // 时随结果带回，调用方按旧值匹配现有账号把新值落库。
+      const prevRefreshToken = session.refreshToken;
       const refreshed = await this.postJson(
         `${consoleUrl}/auth/device/token`,
         { grant_type: 'refresh_token', refresh_token: session.refreshToken, client_id: clientId },
@@ -232,18 +247,28 @@ export class OauthManager {
         this.log('[oauth] 重试路径 refresh 响应缺 access_token');
         return { ok: false, reason: 'error' };
       }
+      // refresh token 轮换（对齐 console.ts doRefresh 的轮换语义）：refresh 响应
+      // 带新 refresh_token 就写回会话 —— 上游轮换后旧值立即失效，不写回则 orgs
+      // 再次瞬时失败时（本分支不删会话）下一个重试用旧值必然 invalid_grant，
+      // 且下面返回的 identity.refreshToken 会把死值交回调用方落库。
+      if (rb != null && typeof rb.refresh_token === 'string' && rb.refresh_token) {
+        session.refreshToken = rb.refresh_token;
+      }
       const [orgs2, user2] = await Promise.all([
         this.getJson(`${consoleUrl}/api/orgs`, accessToken, fetchImpl),
         this.getJson(`${consoleUrl}/api/user`, accessToken, fetchImpl),
       ]);
       if (!orgs2.ok) {
         this.log(`[oauth] 重试路径 orgs 拉取失败: ${orgs2.reason}`);
-        return { ok: false, reason: 'error' };
+        // refresh 轮换已写回会话但 orgs 仍失败：把新值带回（否则旧值已失效，
+        // 进程重启/会话丢失后下次刷新必然 invalid_grant）。会话保留——下次
+        // poll 继续用新值重试（与 C-P2-1 语义一致）。
+        return { ok: false, reason: 'error', refreshToken: session.refreshToken, prevRefreshToken };
       }
       const parsed2 = parseOrgs(orgs2.json, user2.ok ? user2.json : undefined);
       if (parsed2 == null) {
         this.log('[oauth] 重试路径 /api/orgs 响应里找不到可用 workspace');
-        return { ok: false, reason: 'error' };
+        return { ok: false, reason: 'error', refreshToken: session.refreshToken, prevRefreshToken };
       }
       this.sessions.delete(deviceCode);
       return {

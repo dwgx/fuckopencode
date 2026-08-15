@@ -20,9 +20,19 @@
  * 旧签名立即失效（无需黑名单枚举）。登出走内存黑名单（按签名值，带过期清理）。
  */
 
+import { ALLOWED_MODELS } from './deepseek.js';
 import { DEFAULT_ADMIN_PASS } from './config.js';
 import type { AppConfig } from './config.js';
 import type { UsageDb } from './usagedb.js';
+
+/**
+ * 生效的全局默认模型白名单（MODEL-ACCESS）：cfg.globalAllowedModels 若未设置
+ * （测试字面量省略）回落硬底线。config.ts 总是生成此字段，这里兜底保证数据面
+ * 读取恒定。
+ */
+export function effectiveGlobalModels(cfg: AppConfig): ReadonlySet<string> {
+  return cfg.globalAllowedModels ?? ALLOWED_MODELS;
+}
 
 /** 校验结果：ok 带规范化后的值，失败带可回给调用方的文案。 */
 type SettingValidation = { ok: true; value: unknown } | { ok: false; error: string };
@@ -108,6 +118,36 @@ export function apiKeysMeta(value: unknown): SettingValidation {
 }
 
 /**
+ * 全局模型白名单数组（MODEL-ACCESS）：≤50 项、trim 去重、非空；每项必须在
+ * 硬底线 ALLOWED_MODELS 内 —— 硬底线不可放宽，常量外的模型加了也过不了
+ * resolveModel，明确拒绝比「存了但永远 400」省排查。null/空数组 = 清键回
+ * 代码默认（= 硬底线）。
+ */
+export function allowedModelsMeta(value: unknown): SettingValidation {
+  if (value == null) return { ok: true, value: null };
+  if (!Array.isArray(value)) return { ok: false, error: 'must be an array of strings' };
+  if (value.length > 50) return { ok: false, error: 'must be at most 50 models' };
+  const models: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') return { ok: false, error: 'must be an array of strings' };
+    const m = item.trim();
+    if (m.length === 0) continue;
+    if (!ALLOWED_MODELS.has(m)) return { ok: false, error: `model not in hard allowlist: ${m}` };
+    if (!seen.has(m)) {
+      seen.add(m);
+      models.push(m);
+    }
+  }
+  // 空数组 → null（= 清键回代码默认）。审查 MAJOR-1：通用 settings PATCH 与
+  // 专用端点（handlePutModelAccessGlobal）共用这一校验，两者语义必须一致——
+  // 空数组若返回 [] 会让 applySettingsToConfig 把 globalAllowedModels 置成
+  // 空集合（全部模型对全部客户端 400），且 '[]' 落库后跨重启存活。
+  if (models.length === 0) return { ok: true, value: null };
+  return { ok: true, value: models };
+}
+
+/**
  * 可热改字段清单。**默认值必须与 config.ts 的 loadConfig 对齐**
  * （adminUser/adminPass/实验开关那组；apiKeys 的 env 默认是空数组）。
  */
@@ -115,6 +155,8 @@ export const SETTINGS_META: Readonly<Record<string, SettingMeta>> = {
   adminUser: { default: 'admin', validate: stringMeta(1, 100) },
   adminPass: { default: DEFAULT_ADMIN_PASS, validate: passwordMeta(8, 200) },
   apiKeys: { default: [], validate: apiKeysMeta },
+  // 全局默认模型白名单（MODEL-ACCESS）：默认 = 硬底线 ALLOWED_MODELS（可收窄）。
+  allowedModels: { default: [...ALLOWED_MODELS], validate: allowedModelsMeta },
   scaleClientTokens: { default: false, validate: boolMeta },
   clientTokenScale: { default: 0.6657, validate: floatMeta(0.001, 1) },
   compactEnabled: { default: false, validate: boolMeta },
@@ -158,6 +200,12 @@ export function applySettingsToConfig(cfg: AppConfig, values: Record<string, unk
   if (typeof values.adminUser === 'string') cfg.adminUser = values.adminUser;
   if (typeof values.adminPass === 'string') cfg.adminPass = values.adminPass;
   if (Array.isArray(values.apiKeys)) cfg.apiKeys = values.apiKeys as string[];
+  // 全局模型白名单：数组 = 应用（收窄）；null = 清键回硬底线（MODEL-ACCESS）。
+  if (Array.isArray(values.allowedModels)) {
+    cfg.globalAllowedModels = new Set(values.allowedModels as string[]);
+  } else if (values.allowedModels === null) {
+    cfg.globalAllowedModels = new Set(ALLOWED_MODELS);
+  }
   if (typeof values.scaleClientTokens === 'boolean') cfg.scaleClientTokens = values.scaleClientTokens;
   if (typeof values.clientTokenScale === 'number') cfg.clientTokenScale = values.clientTokenScale;
   if (typeof values.compactEnabled === 'boolean') cfg.compactEnabled = values.compactEnabled;

@@ -11,6 +11,14 @@ import { AccountsStore } from './accounts.js';
 import { applySettingsToConfig, parseSettingValue, SettingsStore } from './settings.js';
 import { TokensStore } from './tokens.js';
 import { shutdown } from './shutdown.js';
+import { currentVersion, otaProjectRoot } from './ota.js';
+import { clearStaleLock, confirmHealth } from './ota-guard.js';
+
+// OTA 启动守卫（OTA.md §5）：先清残留 .ota-lock（崩溃留下的陈旧锁会永久 409
+// 阻断下一次 OTA）。计数 +1 与回滚裁决由 systemd ExecStartPre（scripts/
+// rollback-guard.sh）负责，进程只在这里清零（bind 成功后）与写健康标记。
+const projectRoot = otaProjectRoot();
+clearStaleLock(projectRoot);
 
 const cfg = loadConfig();
 
@@ -102,7 +110,7 @@ import { importCookieFromChrome } from './cookie.js';
 const consoleClient = accounts.enabled ? new ConsoleClient(cfg, accounts) : undefined;
 // 旧版控制台（opencode.ai）key 通道：legacy.ts 的纯函数直接当 client 用
 // （端点层只做凭据组装；fetch 走全局）。
-import { fetchLegacyKeys, createLegacyKey, deleteLegacyKey, fetchLegacyGoStatus, setLegacyGoToggle, fetchLegacyBilling, legacyCookieStatus, LegacyPlainCache } from './legacy.js';
+import { fetchLegacyKeys, createLegacyKey, deleteLegacyKey, fetchLegacyGoStatus, fetchZenGoUsage, setLegacyGoToggle, fetchLegacyBilling, legacyCookieStatus, LegacyPlainCache } from './legacy.js';
 // 旧版控制台域（不是 oauthConsoleUrl=console.opencode.ai）——旧版 workspace 页面只在 opencode.ai。
 const LEGACY_BASE_URL = 'https://opencode.ai';
 // legacy keys 明文的内存缓存：listKeys 每次成功抓取后填充；cookie 失效/写操作
@@ -116,7 +124,7 @@ const legacyClient = {
       return Promise.resolve({ ok: false as const, reason: (st === 'missing' ? 'no-cookie' : st) as 'wrong-console' });
     }
     return fetchLegacyKeys(LEGACY_BASE_URL, cookie!, workspaceId, undefined, (keys) =>
-      legacyPlainCache.set(accountId, keys),
+      legacyPlainCache.set(accountId, keys, workspaceId),
     );
   },
   createKey: (accountId: number, cookie: string | null, workspaceId: string, name: string) => {
@@ -149,6 +157,9 @@ const legacyClient = {
       ? fetchLegacyGoStatus(LEGACY_BASE_URL, cookie!, workspaceId)
       : Promise.resolve({ ok: false as const, reason: (st === 'missing' ? 'no-cookie' : st) as 'wrong-console' });
   },
+  // zen usage JSON API：旧版 Default API Key 直读 Go 订阅，零 cookie。失败返回
+  // null 由端点层回落 cookie HTML 抓取（getGoStatus 兜底）。
+  getZenGoUsage: (accountId: number, apiKey: string) => fetchZenGoUsage(LEGACY_BASE_URL, apiKey),
   setGoToggle: (accountId: number, cookie: string | null, workspaceId: string, toggle: 'useBalance' | 'chinaModels', value: boolean) => {
     const st = legacyCookieStatus(cookie);
     return st === 'ok'
@@ -182,6 +193,21 @@ server.listen(cfg.port, cfg.host, () => {
   console.log(`[proxy] listening on http://${cfg.host}:${cfg.port}`);
   console.log(`[proxy] injection mode: ${cfg.injectionMode}`);
   console.log(`[proxy] upstream key pool: ${pool.size} keys (${pool.healthyCount} healthy)`);
+  // OTA 启动守卫（OTA.md §5）：boot_attempts **进程侧不清**（计数完全由
+  // rollback-guard.sh ExecStartPre 管理：每次启动 +1，守卫裁决后重置或回滚后删）。
+  // 进程只在稳定运行 30s 后写 health 标记（version + confirmed_at）——守卫用
+  // confirmed_at 新鲜度区分「刚确认过又崩 = 版本问题（回滚）」与「确认后跑了很久
+  // 才失败 = 无关原因（不回滚）」。dist.prev 健康后刻意不删 —— deploy.sh rollback
+  // 手动回滚点。unref：裸跑/测试无活跃句柄时不拖住进程退出。
+  const healthTimer = setTimeout(() => {
+    confirmHealth(projectRoot, currentVersion(projectRoot));
+  }, 30_000);
+  healthTimer.unref?.();
+  console.log(
+    (cfg.otaCheckIntervalMs ?? 0) > 0
+      ? `[proxy] ota: enabled=${cfg.otaEnabled} check every ${Math.round((cfg.otaCheckIntervalMs ?? 0) / 3_600_000)}h (${cfg.otaRepo})`
+      : '[proxy] ota: check off',
+  );
   console.log(
     usageDb.enabled
       ? `[proxy] usage db: ${cfg.usageDbPath} (retention ${cfg.usageDbRetentionDays}d)`

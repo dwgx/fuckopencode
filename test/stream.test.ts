@@ -200,6 +200,40 @@ describe('anthropicStreamToOpenAI', () => {
     expect(chunks[2]!.choices[0]!.delta.tool_calls).toBeUndefined();
   });
 
+  it('json_mode 大量增量片段累积完整（segment 数组 join，M-P2-4 回归）', async () => {
+    // 旧实现逐段 `(get ?? '') + partial_json` 拼接是 O(n²)；改用 segment 数组
+    // 收尾一次 join。这里用 60 段增量验证累积结果不丢段、顺序正确。
+    const kvs = Array.from({ length: 60 }, (_, i) => `"k${i}":${i}`);
+    const fragments: string[] = ['{'];
+    kvs.forEach((kv, i) => {
+      if (i > 0) fragments.push(',');
+      fragments.push(kv);
+    });
+    fragments.push('}');
+    const fullJson = fragments.join('');
+    const events: AnthropicStreamEvent[] = [
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_many', type: 'message', role: 'assistant', model: 'claude-x',
+          content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 0 },
+        },
+      },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_m', name: 'json_mode', input: {} } },
+      ...fragments.map(
+        (f): AnthropicStreamEvent => ({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: f } }),
+      ),
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 4 } },
+      { type: 'message_stop' },
+    ];
+    const chunks = await collect(anthropicStreamToOpenAI(iter(events)));
+    const expected = JSON.stringify(JSON.parse(fullJson));
+    expect(chunks[1]!.choices[0]!.delta.content).toBe(expected);
+    expect(chunks[2]!.choices[0]!.finish_reason).toBe('stop');
+  });
+
   it('message_delta 无 usage：用已累积文本长度估算 output_tokens', async () => {
     const events: AnthropicStreamEvent[] = [
       {

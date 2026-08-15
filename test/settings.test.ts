@@ -145,6 +145,7 @@ describe('validateSetting / parseSettingValue', () => {
       'adminUser',
       'adminPass',
       'apiKeys',
+      'allowedModels',
       'scaleClientTokens',
       'clientTokenScale',
       'compactEnabled',

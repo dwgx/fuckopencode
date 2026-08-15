@@ -590,7 +590,10 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   function devices(ev) {
     var seen = {}, out = [];
     for (var i = 0; i < ev.length && out.length < 4; i++) {
-      var k = ev[i].device.ip + '|' + ev[i].device.ua;
+      var d = ev[i].device;
+      // 公网匿名 device 已剥 ip/ua（server.ts 白名单），dedup 键回落 client+os；
+      // 管理鉴权完整 device 下两者等效。
+      var k = (d.client || '') + '|' + (d.os || '') + '|' + (d.ip || '') + '|' + (d.ua || '');
       if (seen[k]) continue; seen[k] = 1; out.push(ev[i]);
     }
     if (!out.length) { $('devs').innerHTML = '<div class="w" style="padding:7px 0">' + T('noDev') + '</div>'; return; }
@@ -904,7 +907,7 @@ export const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   }
 
   function tick() {
-    if (paused) return;
+    if (paused || document.hidden) return;
     fetch('/__metrics', { headers: { accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error(String(r.status))); })
       .then(function (m) { $('h-live').className = 'stat-inline ok'; $('h-live').textContent = '[*] ' + T('live'); apply(m); })

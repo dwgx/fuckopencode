@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { KeyPool, ModelNotAllowedError, PoolEmptyError, keyFingerprint } from '../src/keypool.js';
 import { classifyUpstreamFailure } from '../src/errors.js';
 
@@ -219,6 +220,22 @@ describe('KeyPool.quotaEmptyError（池空透传 GoUsageLimitError）', () => {
 
     expect(pool.healthyCount).toBe(0);
     expect(pool.quotaEmptyError).toEqual({ status: 429, body: QUOTA_BODY });
+  });
+
+  it('quota-exhausted 无重置时间 → 24h 兜底冷却（2026-08-14 从 1h 提升，防假冷却）', () => {
+    // 回归：FreeUsageLimitError 等额度错误没有 "Resets in" 时，旧兜底 1h 让 key
+    // 每小时回池再撞一次 429（面板显示 5 分钟/1 小时假冷却，用户确认「只有
+    // 2day 是真的」）。现在兜底 24h，对齐 free IP 日窗的真实恢复时长。
+    const clock = fakeClock();
+    const pool = new KeyPool(['a'], { ...OPTS, now: clock.now });
+    pool.markFailure('a', 'quota-exhausted'); // 不传 resetDelayMs → 走兜底
+    const snap = pool.snapshot()[0]!;
+    expect(snap.disabledReason).toBe('quota-exhausted');
+    expect(snap.recoverInMs).toBe(24 * 3_600_000);
+    // 有重置时间 → 精确时长 + 60s 余量（不退回兜底）。
+    clock.advance(1000);
+    pool.markFailure('a', 'quota-exhausted', 3 * 86_400_000);
+    expect(pool.snapshot()[0]!.recoverInMs).toBe(3 * 86_400_000 + 60_000);
   });
 
   it('禁用原因混着非额度（auth/transient）→ 不伪装成额度问题，返回 null', () => {
@@ -621,7 +638,9 @@ describe('KeyPool.policy（面板要能解释「为什么恢复时刻是这个�
     const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
     const rule = pool.policy().rules.find((r) => r.kind === 'quota-exhausted')!;
     expect(rule.ms).toBeNull();
-    expect(rule.fallbackMs).toBe(3_600_000);
+    // 2026-08-14：兜底 1h → 24h（free IP 日窗真实恢复；1h 是假冷却，key 每小时
+    // 回池撞一次 429，面板显示「5 分钟/1 小时」假时长）。
+    expect(rule.fallbackMs).toBe(24 * 3_600_000);
 
     // 解析不出重置时间 -> 用兜底值。
     pool.markFailure(KEY, 'quota-exhausted');
@@ -827,6 +846,28 @@ describe('KeyPool acquire(isEligible)（账号级选号过滤）', () => {
     expect(['a', 'b']).toContain(pool.acquire());
     expect(() => pool.acquire('a')).not.toThrow();
   });
+
+  it('isEligible 带 key 参数：按 key 精确过滤（密钥级授权，MODEL-ACCESS 入口 B）', () => {
+    const pool = new KeyPool(['sk-a-1', 'sk-b-2', 'sk-c-3'], OPTS, ids({ 'sk-a-1': 1, 'sk-b-2': 2, 'sk-c-3': 3 }));
+    // 只放行 key='sk-b-2'（与 accountId 无关）—— 模拟「只有这把 key 配了该模型」。
+    expect(pool.acquire(undefined, (acc, key) => key === 'sk-b-2', 'm')).toBe('sk-b-2');
+    // key 参数与 accountId 可组合：同账号 + 同 key。
+    expect(pool.acquire(undefined, (acc, key) => acc === 3 && key === 'sk-c-3', 'm')).toBe('sk-c-3');
+  });
+
+  it('isEligible 收 key 后仍兼容只收 accountId 的旧闭包（忽略第二参）', () => {
+    const pool = new KeyPool(['sk-a-1', 'sk-b-2'], OPTS, ids({ 'sk-a-1': 1, 'sk-b-2': 2 }));
+    // 单参闭包照常工作（JS 丢弃多传的参数）。
+    expect(pool.acquire(undefined, (acc) => acc === 2, 'm')).toBe('sk-b-2');
+  });
+
+  it('isEligible 把不匹配的 key 全滤掉 → ModelNotAllowedError（key 级过滤同样适用）', () => {
+    const pool = new KeyPool(['sk-a-1', 'sk-b-2'], OPTS, ids({ 'sk-a-1': 1, 'sk-b-2': 2 }));
+    // 两把 key 的自定义授权都不含 'flash'：全滤 → 模型拒绝。
+    expect(() => pool.acquire(undefined, (acc, key) => key !== 'sk-a-1' && key !== 'sk-b-2', 'deepseek-v4-flash')).toThrow(
+      ModelNotAllowedError,
+    );
+  });
 });
 
 describe('KeyPool 被动学习模型 block（(account, model) 永久不可用）', () => {
@@ -867,5 +908,68 @@ describe('KeyPool 被动学习模型 block（(account, model) 永久不可用）
     expect(
       pool.acquire(undefined, (acc) => !pool.isModelBlocked(acc, 'deepseek-v4-flash') && acc === 2, 'deepseek-v4-flash'),
     ).toBe('sk-b-2');
+  });
+});
+
+describe('KeyPool.hasKeyWithHash（管理面校验 upstream-key subject，不外泄明文）', () => {
+  const sha256 = (k: string): string => createHash('sha256').update(k, 'utf8').digest('hex');
+
+  it('命中：池内 key 的 sha256 全 hex 返回 true', () => {
+    const key = 'sk-secret-hash-key';
+    const pool = new KeyPool([key, 'sk-other'], OPTS);
+    expect(pool.hasKeyWithHash(sha256(key))).toBe(true);
+  });
+
+  it('未命中：不存在的 hash 返回 false', () => {
+    const pool = new KeyPool(['sk-a'], OPTS);
+    expect(pool.hasKeyWithHash(sha256('sk-nonexistent'))).toBe(false);
+    expect(pool.hasKeyWithHash('deadbeef')).toBe(false);
+    expect(pool.hasKeyWithHash('')).toBe(false);
+  });
+
+  it('空池恒 false', () => {
+    const pool = new KeyPool([], OPTS);
+    expect(pool.hasKeyWithHash(sha256('anything'))).toBe(false);
+  });
+
+  it('只比较 hash，不暴露任何 key 材料', () => {
+    const key = 'sk-ultra-secret-value-123';
+    const pool = new KeyPool([key], OPTS);
+    // 拿不到明文：方法只收 hash 参数，返回布尔。
+    expect(typeof pool.hasKeyWithHash).toBe('function');
+    expect(pool.hasKeyWithHash(sha256(key))).toBe(true);
+    expect(JSON.stringify(pool.snapshot())).not.toContain('ultra-secret');
+  });
+});
+
+describe('KeyPool sha256 指纹预计算索引（P2-4）', () => {
+  const sha256 = (k: string): string => createHash('sha256').update(k, 'utf8').digest('hex');
+
+  it('构造时预计算：池内全部 key（去空去重后）的 hash 命中', () => {
+    const pool = new KeyPool(['sk-a-1', ' sk-b-2 ', 'sk-a-1', ''], OPTS);
+    expect(pool.hasKeyWithHash(sha256('sk-a-1'))).toBe(true);
+    expect(pool.hasKeyWithHash(sha256('sk-b-2'))).toBe(true);
+    // 入池前 trim 过：带空格的原样不入索引。
+    expect(pool.hasKeyWithHash(sha256('sk-a-1 '))).toBe(false);
+  });
+
+  it('addKey 后索引同步更新：新增 key 的 hash 可命中', () => {
+    const pool = new KeyPool(['sk-a-1'], OPTS);
+    expect(pool.hasKeyWithHash(sha256('sk-new-1'))).toBe(false);
+    expect(pool.addKey('sk-new-1', 2)).toBe(true);
+    expect(pool.hasKeyWithHash(sha256('sk-new-1'))).toBe(true);
+    // addKey 去重失败时不索引。
+    expect(pool.addKey('sk-new-1', 3)).toBe(false);
+    expect(pool.hasKeyWithHash(sha256('sk-new-1'))).toBe(true);
+  });
+
+  it('removeKey 后索引同步删除：已删 key 的 hash 不再命中', () => {
+    const pool = new KeyPool(['sk-a-1', 'sk-b-2'], OPTS);
+    expect(pool.removeKey('sk-a-1')).toBe(true);
+    expect(pool.hasKeyWithHash(sha256('sk-a-1'))).toBe(false);
+    expect(pool.hasKeyWithHash(sha256('sk-b-2'))).toBe(true);
+    // 删除未知 key 不改索引。
+    expect(pool.removeKey('sk-nope')).toBe(false);
+    expect(pool.hasKeyWithHash(sha256('sk-nope'))).toBe(false);
   });
 });

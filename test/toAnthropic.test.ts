@@ -391,6 +391,63 @@ describe('openAIStreamToAnthropic', () => {
     expect(delta.usage).toEqual({ output_tokens: 9, input_tokens: 5 });
   });
 
+  it('流式 message_delta usage 带 thinking（F1：reasoning_tokens → output_tokens_details.thinking_tokens）', async () => {
+    // 回归：message_delta.usage 只带 output/input，reasoning_tokens 被丢 → 直通
+    // 流式路径 thinking 记账恒 0。与 openAIUsageToAnthropic 同源同 scale：有
+    // reasoning_tokens 时折进 output_tokens_details.thinking_tokens。
+    const usageChunk = {
+      id: 'chatcmpl-1',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'm',
+      choices: [],
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 9,
+        total_tokens: 14,
+        completion_tokens_details: { reasoning_tokens: 7 },
+      },
+    } as OpenAIStreamChunk;
+    const events = await collect(
+      openAIStreamToAnthropic(chunks([chunk({ content: 'x' }), chunk({}, 'stop'), usageChunk])),
+    );
+    const delta = events.find(
+      (e): e is Extract<AnthropicStreamEvent, { type: 'message_delta' }> => e.type === 'message_delta',
+    )!;
+    expect(delta.usage).toEqual({
+      output_tokens: 9,
+      input_tokens: 5,
+      output_tokens_details: { thinking_tokens: 7 },
+    });
+  });
+
+  it('流式 message_delta usage 的 thinking 随 scale 缩放（与 output_tokens 同源）', async () => {
+    const usageChunk = {
+      id: 'chatcmpl-1',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'm',
+      choices: [],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 100,
+        total_tokens: 110,
+        completion_tokens_details: { reasoning_tokens: 40 },
+      },
+    } as OpenAIStreamChunk;
+    const events = await collect(
+      openAIStreamToAnthropic(chunks([chunk({ content: 'x' }), chunk({}, 'stop'), usageChunk]), {
+        scale: 0.6657,
+      }),
+    );
+    const delta = events.find(
+      (e): e is Extract<AnthropicStreamEvent, { type: 'message_delta' }> => e.type === 'message_delta',
+    )!;
+    expect(delta.usage?.output_tokens_details).toEqual({ thinking_tokens: Math.round(40 * 0.6657) });
+    // input 侧保持真实（未缩放）：实验开关不污染网关自身记账。
+    expect(delta.usage?.input_tokens).toBe(10);
+  });
+
   it('content 先于 reasoning_content 时，各自独立成块，文本不进 thinking 块', async () => {
     // 回归：上游先 content 后 reasoning_content 时，旧实现把缓冲文本在收尾以
     // text_delta 发进仍开着的 thinking 块（协议非法，Claude Code 报错/丢弃）。

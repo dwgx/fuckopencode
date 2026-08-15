@@ -189,6 +189,26 @@ describe('probeKey：结论与真实流量一致', () => {
     expect(snap.failCount).toBe(1);
     vi.unstubAllGlobals();
   });
+
+  it('探活遇模型不支持（401 ModelError）→ 不 markFailure、记被动学习 blocked（M-P2-5）', async () => {
+    let t = 1_000_000;
+    const p = pool(() => t);
+    const body = JSON.stringify({
+      error: { type: 'ModelError', message: 'Model deepseek-v4-flash is not supported' },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 401 })));
+
+    const r = await probeKey(cfg(), p, 'sk-key-aaaa', '****aaaa', 5_000, UPSTREAM, PROBE_MODEL);
+    expect(r.ok).toBe(false);
+    expect(r.modelUnsupported).toBe(true);
+    // 模型不可用 ≠ key 不可用：不 markFailure，key 保持健康、失败计数不涨
+    const snap = p.snapshot().find((s) => s.fingerprint === '****aaaa')!;
+    expect(snap.healthy).toBe(true);
+    expect(snap.failCount).toBe(0);
+    // 被动学习 (account, model) blocked：选号排除该组合（env 兜底 accountId=0）
+    expect(p.isModelBlocked(0, PROBE_MODEL)).toBe(true);
+    vi.unstubAllGlobals();
+  });
 });
 
 // ─── 账户驱动（MULTI-ACCOUNT.md §4.4） ──────────────────────────────────────
@@ -447,6 +467,30 @@ describe('runProbeRound：账户驱动（MULTI-ACCOUNT.md §4.4）', () => {
     expect(String(calls[0]!.result.detail)).toContain('ETIMEDOUT');
     // transient 走失败计数：一次失败不到阈值（5），key 保持健康
     expect(p.snapshot().find((s) => s.fingerprint === '****aaaa')!.healthy).toBe(true);
+  });
+
+  it('探活模型不支持（401 ModelError）→ 账户不标 error，记 ok + 详情（M-P2-5）', async () => {
+    const accts: FakeAccountDef[] = [{ id: 1, name: 'env', kind: 'unknown', retryUntil: 0, keys: ['sk-key-aaaa'] }];
+    const { store, calls } = fakeAccounts(accts);
+    const p = acctPool(accts);
+    const body = JSON.stringify({
+      error: { type: 'ModelError', message: 'Model deepseek-v4-flash is not supported' },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 401 })));
+
+    await runProbeRound(cfg(), p, null, store, () => {});
+    expect(calls).toHaveLength(1);
+    // 模型/端点不匹配 ≠ 账户坏：不标 error/cooldown（旧逻辑会标 error 推 15min）
+    expect(calls[0]!.result.status).toBe('ok');
+    expect(String(calls[0]!.result.detail)).toContain('探活模型不被该账号端点支持');
+    // retry 推到空闲窗口（避免每轮重复打无意义的模型探针）
+    expect(calls[0]!.result.retryUntil).toBe(T0 + 3_600_000);
+    // key 不被 markFailure：保持健康、失败计数不涨
+    const snap = p.snapshot().find((s) => s.fingerprint === '****aaaa')!;
+    expect(snap.healthy).toBe(true);
+    expect(snap.failCount).toBe(0);
+    // 被动学习 (account, model) blocked（acctPool 把 key 映射到账户 1）
+    expect(p.isModelBlocked(1, PROBE_MODEL)).toBe(true);
   });
 
   it('日志带账户名与账户级结论：[keyprobe] account=env probe fail 429 cooldown', async () => {

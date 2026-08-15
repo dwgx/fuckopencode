@@ -87,6 +87,13 @@ describe('面板渲染修复钉住（本轮 bug 回归防线）', () => {
     expect(code).toContain('evs.slice(0, 6)');
     expect(code).toMatch(/var recent = evs\.slice\(0, 6\);/);
   });
+
+  it('devices 去重键带 client/os 回落（M-P2-1：公网匿名 device 已剥 ip/ua）', () => {
+    const code = inlineScript();
+    // 公网匿名 /__metrics 的 device 只留 client/os/mobile 之类，dedup 键不能只靠
+    // ip+ua（会塌缩成一行）。这句断言钉住 client/os 兜底拼进 dedup 键。
+    expect(code).toContain("(d.client || '') + '|' + (d.os || '')");
+  });
 });
 
 describe('i18n 词条 en/zh 对齐', () => {
@@ -235,5 +242,12 @@ describe('未归属请求不冒充成一个 key', () => {
     const code = inlineScript();
     expect(code).toContain('unattributedRequests');
     expect(code).toContain("T('unattributed')");
+  });
+});
+
+describe('INFO-4：tick 后台 tab 门控（与 admin.ts tick 同款）', () => {
+  it('tick 开头有 document.hidden 检查（后台 tab 每 2s 不白打 /__metrics）', () => {
+    const code = inlineScript();
+    expect(code).toMatch(/function tick\(\)\s*\{\s*if \(paused \|\| document\.hidden\) return;/);
   });
 });

@@ -1,8 +1,17 @@
-import { describe, expect, it } from 'vitest';
-import { ADMIN_HTML, LOGIN_HTML, parseAccountId, validateCreateAccount, validatePatchAccount, validateModelAlias } from '../src/admin.js';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { ADMIN_HTML, LOGIN_HTML, originAllowed, parseAccountId, validateCreateAccount, validatePatchAccount, validateModelAlias } from '../src/admin.js';
 import { UsageDb } from '../src/usagedb.js';
-import { deleteModelAlias, loadModelAliases, saveModelAlias, seedDefaultModelAliases } from '../src/modelmap.js';
+import { deleteModelAlias, loadModelAliases, saveModelAlias, seedDefaultModelAliases, DEFAULT_MODEL_ALIASES } from '../src/modelmap.js';
 import { resolveModelName } from '../src/deepseek.js';
+import { createApp, LEGACY_TTL_MS, LegacyTtlCache } from '../src/server.js';
+import type { LegacyBillingReadResult, LegacyClientLike, LegacyGoReadResult, LegacyGoStatus, LegacyReadResult, LegacyWriteResult } from '../src/server.js';
+import { AccountsStore } from '../src/accounts.js';
+import { KeyPool, keyFingerprint } from '../src/keypool.js';
+import { loadSecret } from '../src/secrets.js';
+import { ModelAccessStore } from '../src/modelaccess.js';
+import type { AppConfig } from '../src/config.js';
+import type { Server } from 'node:http';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -696,6 +705,19 @@ describe('PATCH 部分更新校验（§6.3）', () => {
     expect(validatePatchAccount({ allowedModels: Array.from({ length: 51 }, (_, i) => `m${i}`) }).ok).toBe(false);
     expect(validatePatchAccount({ allowedModels: Array.from({ length: 50 }, (_, i) => `m${i}`) }).ok).toBe(true);
   });
+
+  it('legacyKey：字符串保存（stripControl + 截断 2048），null/空串清除，超长/坏类型 400', () => {
+    const key = 'sk-AOpQOUTje3uIJRVctKiLocPCaPPF1yWBQwOlwP7JfiOX47iCoL8BeTFTviyd0osU';
+    expect(validatePatchAccount({ legacyKey: key })).toEqual({ ok: true, value: { legacyKey: key } });
+    expect(validatePatchAccount({ legacyKey: null })).toEqual({ ok: true, value: { legacyKey: null } });
+    expect(validatePatchAccount({ legacyKey: '' })).toEqual({ ok: true, value: { legacyKey: null } });
+    // 控制符剥离（与 legacyCookie 同口径）。
+    expect(validatePatchAccount({ legacyKey: 'sk-\x1babc' })).toEqual({ ok: true, value: { legacyKey: 'sk-abc' } });
+    expect(validatePatchAccount({ legacyKey: 'x'.repeat(2048) }).ok).toBe(true);
+    expect(validatePatchAccount({ legacyKey: 'x'.repeat(2049) }).ok).toBe(false);
+    expect(validatePatchAccount({ legacyKey: 42 }).ok).toBe(false);
+    expect(validatePatchAccount({ legacyKey: ['sk-x'] }).ok).toBe(false);
+  });
 });
 
 describe(':id 路径参数校验（§6.3 必须 /^\d+$/）', () => {
@@ -848,7 +870,7 @@ describe('模型映射 UI 与校验（设置页 sec-modelmap）', () => {
     expect(code).toContain('function addModelAlias(');
     expect(code).toContain('function delModelAlias(');
     expect(code).toContain('function renderModelMap(');
-    expect(code).toContain("if (v === 'settings') { refreshModelMap(); loadSettings(false); }");
+    expect(code).toContain("if (v === 'settings') { refreshModelMap(); loadSettings(false); loadOtaStatus(false); }");
     expect(code).toContain('closest(\'button[data-action="del-alias"]\')');
   });
 
@@ -923,30 +945,29 @@ describe('模型映射存储层（modelmap.ts + usage db）', () => {
     expect(seedDefaultModelAliases(null)).toBe(false);
   });
 
-  it('seed：表空时写入默认别名，表非空时不再 seed，重启幂等', () => {
+  it('seed：默认别名表为空（初始配置干净，无 fable/mythos 内部映射），表空时 no-op', () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-seed-'));
     const db = new UsageDb(path.join(tmpDir, 'usage.db'), 30, log);
     expect(db.enabled).toBe(true);
 
-    // 空表 seed：两条默认映射，与旧内置别名一致（fable-5 走订阅端点 flash）。
+    // 2026-08-14：默认别名清空 —— 初始配置不预设任何映射（fable/mythos 是内部
+    // 测试别名，对部署者是「离谱映射」）。seed 空列表 = 每次启动 no-op。
+    expect(DEFAULT_MODEL_ALIASES).toEqual([]);
     expect(seedDefaultModelAliases(db)).toBe(true);
-    const list = loadModelAliases(db);
-    expect(list).toHaveLength(2);
-    expect(list.find((m) => m.alias === 'claude-mythos-5')).toEqual({
-      alias: 'claude-mythos-5', target: 'deepseek-v4-flash', note: expect.any(String),
-    });
-    expect(list.find((m) => m.alias === 'claude-fable-5')?.target).toBe('deepseek-v4-flash');
+    expect(loadModelAliases(db)).toEqual([]);
 
-    // 已有数据（哪怕只手动加了一条）就不再 seed —— 配置归属用户。
+    // 用户手动加一条后，后续启动不再 seed（配置归属用户）。
+    expect(saveModelAlias(db, 'claude-sonnet-4-6', 'deepseek-v4-flash')).toBe(true);
     db.close();
     const db2 = new UsageDb(path.join(tmpDir, 'usage.db'), 30, log);
     expect(seedDefaultModelAliases(db2)).toBe(false);
-    expect(loadModelAliases(db2)).toHaveLength(2);
-
-    // 用户删掉一条后依然不 seed（防「用户刻意删除」被还原）。
-    expect(deleteModelAlias(db2, 'claude-fable-5')).toBe(true);
-    expect(seedDefaultModelAliases(db2)).toBe(false);
     expect(loadModelAliases(db2)).toHaveLength(1);
+
+    // 用户删掉后依然不 seed（防「用户刻意删除」被还原）——默认别名表为空的
+    // 时代价天然为零（无可还原内容），seed 空列表是 no-op。
+    expect(deleteModelAlias(db2, 'claude-sonnet-4-6')).toBe(true);
+    expect(seedDefaultModelAliases(db2)).toBe(true); // no-op（写入 0 条）
+    expect(loadModelAliases(db2)).toHaveLength(0);
 
     db2.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -996,6 +1017,20 @@ describe('旧版 workspace 的 key 管控（legacy console 区块）', () => {
     expect(code).toContain("T('legacyCookieMissing')");
     expect(code).toContain('function isLegacyCookieError(');
     expect(code).toContain("indexOf('cookie') >= 0");
+  });
+
+  it('MINOR：go 的确定性配置错误（401/403）打点 TTL 门——2s tick 不再反复打无效 legacy key 的 zen', () => {
+    const src = fnSource('loadGo');
+    // 401/403 分支在 detailErr 前先 legacyDetailMark：无效 key / 无 cookie 是确定性
+    // 失败，30s 内不重试；网络/上游失败（.catch）不打点，保留 2s 重试自愈。
+    expect(src).toMatch(/r\.status === 401 \|\| r\.status === 403/);
+    expect(src).toMatch(/legacyDetailMark\(id, 'go'\)/);
+    const markIdx = src.indexOf('legacyDetailMark(id, \'go\')');
+    const errIdx = src.indexOf("detailErr('go', T('legacyCookieMissing'))");
+    expect(markIdx).toBeGreaterThan(-1);
+    expect(errIdx).toBeGreaterThan(markIdx);
+    expect(src).toMatch(/\.catch\(function \(\) \{ if \(detailState\.id !== id\) return; detailErr\('go', T\('consoleUnavailable'\)\);/);
+    expect(src).not.toContain("legacyDetailMark(id, 'go')" + ";\n" + "        detailErr('go', T('consoleUnavailable')");
   });
 
   it('创建/删除走 confirm 弹层（danger 删除 + 名称非空校验 + 成功重拉列表）', () => {
@@ -1699,7 +1734,7 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     expect(code).toContain("var srcOf = function (k) { return T(SETTINGS_SRC[(s[k] && s[k].source === 'db') ? 'db' : 'env']); };");
   });
 
-  it('保存账号密码：密码留空不提交 adminPass（防覆盖成空）；成功 flash 旧会话 24h 提示', () => {
+  it('保存账号密码：密码留空不提交 adminPass（防覆盖成空）；成功 flash 会话失效提示', () => {
     const code = inlineScript();
     expect(code).toContain('function saveAdminAuth(');
     expect(code).toContain('if (pass) body.adminPass = pass;');
@@ -1707,6 +1742,11 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     expect(code).toContain("T('aaNothing')");
     expect(code).toContain("flash(T('authSaved') + (pass ? ' — ' + T('adminPassHint') : ''));");
     expect(code).toContain("$('aa-pass').value = '';");
+    // P2-1：改密码后旧会话立即失效（密码版本 sha256 编进 HMAC，24h 文案是误导）。
+    // en/zh/HTML 三处同步。
+    expect(code).toContain("adminPassHint: 'all logged-in sessions are invalidated immediately after a password change; re-login required'");
+    expect(code).toContain("adminPassHint: '改密码后所有已登录会话立即失效，需重新登录'");
+    expect(ADMIN_HTML).toContain('data-i18n="adminPassHint">all logged-in sessions are invalidated immediately after a password change; re-login required</div>');
   });
 
   it('来源标记：env/db 小字；默认密码强提示读服务端 adminPassIsDefault（非 source 近似）', () => {
@@ -2091,6 +2131,54 @@ function evalFn<T extends (...args: any[]) => any>(name: string, stubs: Record<s
   return new Function(...params, body)(...Object.values(stubs)) as T;
 }
 
+describe('M3：renderLegacyKey 跨账号残留输入清理', () => {
+  /** 造 renderLegacyKey 的沙箱依赖：fake DOM（el + 共享 input）+ 假账号。 */
+  function makeEnv(acct: { hasLegacyKey: boolean; legacyKeyMasked: string | null }) {
+    const input = { value: '' };
+    const renderLegacyKey = evalFn('renderLegacyKey', {
+      detailState: { id: 0, range: '7d', billing: null, legacyKeyInputFor: null },
+      $: (sel: string) =>
+        sel === 'detail-legacy-key' ? { innerHTML: '' } : sel === 'detail-legacy-key-paste' ? input : null,
+      findAccount: () => acct,
+      T: (k: string) => k,
+      esc: (s: string) => String(s),
+      dBlock: () => '',
+    });
+    return { input, renderLegacyKey };
+  }
+
+  it('账号 A 输入未保存 → 切到账号 B：残留输入被清空（不把 A 的输入带进 B）', () => {
+    // 先渲染账号 A 并输入未保存值（同账号重渲染不清 → 输入保留）。
+    const a = makeEnv({ hasLegacyKey: false, legacyKeyMasked: null });
+    a.renderLegacyKey();
+    a.input.value = 'sk-typed-in-A';
+    a.renderLegacyKey();
+    expect(a.input.value).toBe('sk-typed-in-A'); // 同账号正在输入不被 tick 清掉
+
+    // 切到账号 B：上次渲染账号（A）≠ 当前 id → 强制清空再走渲染。
+    const detailState = { id: 7, range: '7d', billing: null, legacyKeyInputFor: 6 };
+    const input = { value: 'sk-typed-in-A' };
+    const render = evalFn('renderLegacyKey', {
+      detailState,
+      $: (sel: string) =>
+        sel === 'detail-legacy-key' ? { innerHTML: '' } : sel === 'detail-legacy-key-paste' ? input : null,
+      findAccount: () => ({ hasLegacyKey: false, legacyKeyMasked: null }),
+      T: (k: string) => k,
+      esc: (s: string) => String(s),
+      dBlock: () => '',
+    });
+    render();
+    // 残留输入被清空 + 归属账号更新为 B：后续 saveLegacyKey 不会把 A 的值写进 B。
+    expect(input.value).toBe('');
+    expect(detailState.legacyKeyInputFor).toBe(7);
+  });
+
+  it('renderLegacyKey 源码保留 M3 守卫（切账号清空输入框的判定）', () => {
+    expect(fnSource('renderLegacyKey')).toContain('detailState.legacyKeyInputFor !== id');
+    expect(fnSource('renderLegacyKey')).toContain("input.value = ''");
+  });
+});
+
 describe('对抗审查 6 项修复的回归测试', () => {
   it('1a. money() 仍是 microCents→美元（把美元值再过 money 会压成 $0.00）', () => {
     const money = evalFn<(mc: unknown) => string>('money');
@@ -2222,6 +2310,678 @@ describe('对抗审查 6 项修复的回归测试', () => {
       expect(thenI, `${fn} 找不到 .then`).toBeGreaterThan(-1);
       expect(src.slice(thenI, thenI + 160), `${fn} 的 then 回调首行必须是守卫`).toContain('if (detailState.id !== id) return;');
     }
+  });
+});
+
+describe('Model Access 面板（MODEL-ACCESS §6）', () => {
+  it('tab 按钮 + 四段挂载点存在（view-access + 全局/搜索/上游/分发/API key）', () => {
+    expect(ADMIN_HTML).toContain('data-tab="access"');
+    for (const id of ['view-access', 'sec-access-global', 'sec-access-upstream',
+                      'sec-access-token', 'sec-access-apikey', 'ma-global-chips',
+                      'ma-global-save', 'ma-global-reset', 'ma-search', 'ma-filter',
+                      'ma-upstream', 'ma-token', 'ma-apikey', 'ma-refresh']) {
+      expect(ADMIN_HTML, `缺挂载点 #${id}`).toContain(`id="${id}"`);
+    }
+  });
+
+  it('内联 JS 有 model-access 渲染/编辑逻辑（loadModelAccess + 编辑委托 + 端点路径）', () => {
+    const code = inlineScript();
+    expect(code).toContain('function loadModelAccess(');
+    expect(code).toContain('function editModelAccess(');
+    expect(code).toContain('function renderMaGlobal(');
+    expect(code).toContain('data-action="ma-edit"');
+    expect(code).toContain("data-subject=\"' + esc(k.subject || k.fingerprint || '')");
+    expect(code).toContain("' + type + '/' + encodeURIComponent(subject)");
+    expect(code).toContain('/__admin/api/model-access/global');
+    expect(code).toContain("access: 'view-access'");
+    expect(code).toContain("if (v === 'access') { loadModelAccess(); }");
+  });
+
+  it('切到 access tab 才拉配置（switchView 分支），2s tick 里不轮询（数据静态）', () => {
+    const code = inlineScript();
+    const tickSrc = code.slice(code.indexOf('function tick('), code.indexOf('function tick(') + 2000);
+    expect(tickSrc.length).toBeGreaterThan(100);
+    expect(tickSrc).not.toContain('loadModelAccess');
+  });
+
+  it('Model Access 词条 en/zh 都有（tab + 四段 + 编辑交互 + 搜索筛选）', () => {
+    const keys = (lang: 'en' | 'zh'): Set<string> => {
+      const code = inlineScript();
+      const start = code.indexOf(`${lang}:`);
+      expect(start).toBeGreaterThan(-1);
+      const slice = code.slice(start);
+      const end = slice.indexOf('\n    }');
+      const body = slice.slice(0, end > 0 ? end : 4000);
+      return new Set([...body.matchAll(/(?:^\s+|,\s*)([A-Za-z][\w]*)\s*:/gm)].map((m) => m[1]!).filter((k) => k !== lang));
+    };
+    const en = keys('en');
+    const zh = keys('zh');
+    for (const k of ['tabModelAccess', 'subModelAccess', 'maGlobalTitle', 'maGlobalSub',
+                     'maGlobalModels', 'maGlobalFloor', 'maResetGlobal', 'maGlobalSaved',
+                     'maSearchPh', 'maFilterAll', 'maFilterUpstream', 'maFilterToken', 'maFilterApiKey',
+                     'maRefresh', 'maUpstreamTitle', 'maUpstreamSub', 'maTokenTitle', 'maTokenSub',
+                     'maApiKeyTitle', 'maApiKeySub', 'maEmpty', 'maNoMatch', 'maCustomBadge',
+                     'maFollowsGlobal', 'maEditTitle', 'maSaved', 'maFollowGlobal', 'maNotGrantable']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
+  });
+
+  it('OTA sec-update 挂载点 + 交互锚点齐全', () => {
+    expect(ADMIN_HTML).toContain('id="sec-update"');
+    expect(ADMIN_HTML).toContain('id="btn-ota-check"');
+    expect(ADMIN_HTML).toContain('id="btn-ota-update"');
+    expect(ADMIN_HTML).toContain('id="update-overlay"');
+    expect(ADMIN_HTML).toContain('id="tab-dot-update"');
+    // 设置 tab 子导航含 sec-update（在 sec-about 之前）。
+    expect(inlineScript()).toContain("['subUpdate', 'sec-update'], ['subAbout', 'sec-about']");
+    // 交互入口：检查 / 更新按钮 + 进度阶段文案轮换 + 60s 红点轮询。
+    const code = inlineScript();
+    expect(code).toContain("api('POST', '/__admin/api/update/check'");
+    expect(code).toContain("api('POST', '/__admin/api/update/perform'");
+    expect(code).toContain("api('GET', '/__admin/api/update/status', null)");
+    expect(code).toContain("['otaStageCheck', 'otaStageDownload', 'otaStageVerify', 'otaStageSwap', 'otaStageRestart']");
+    expect(code).toContain("loadOtaStatus(false)");
+  });
+
+  it('OTA 词条 en/zh 都有（设置 tab + 状态 + 阶段 + 确认弹层）', () => {
+    const keys = (lang: 'en' | 'zh'): Set<string> => {
+      const code = inlineScript();
+      const start = code.indexOf(`${lang}:`);
+      expect(start).toBeGreaterThan(-1);
+      const slice = code.slice(start);
+      const end = slice.indexOf('\n    }');
+      const body = slice.slice(0, end > 0 ? end : 4000);
+      return new Set([...body.matchAll(/(?:^\s+|,\s*)([A-Za-z][\w]*)\s*:/gm)].map((m) => m[1]!).filter((k) => k !== lang));
+    };
+    const en = keys('en');
+    const zh = keys('zh');
+    for (const k of ['subUpdate', 'otaTitle', 'otaSub', 'otaCurrent', 'otaLatest', 'otaDisabled',
+                     'otaCheck', 'otaChecking', 'otaUpdate', 'otaCheckedAt', 'otaCheckFailed',
+                     'otaPrevPresent', 'otaRolledBack', 'otaRollbackState', 'otaHint',
+                     'otaConfirmTitle', 'otaConfirmBody',
+                     'otaStageCheck', 'otaStageDownload', 'otaStageVerify', 'otaStageSwap', 'otaStageRestart',
+                     'otaRestarting', 'otaChangelog', 'otaNoChangelog', 'otaClose']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 审计轮 P2 修复回归（2026-08-15）
+// ---------------------------------------------------------------------------
+
+/** originAllowed 只读 req.headers，fake req 用最小形状 + as never 断言。 */
+function fakeReq(headers: Record<string, unknown>): never {
+  return { headers } as never;
+}
+
+describe('A-P2-1：多值 Origin 数组头 fail-closed', () => {
+  it('数组头（多 Origin）按拒绝处理', () => {
+    expect(originAllowed(fakeReq({ origin: ['https://good.example', 'https://evil.example'], host: 'good.example' }))).toBe(false);
+    expect(originAllowed(fakeReq({ origin: ['https://good.example'], host: 'good.example' }))).toBe(false);
+  });
+
+  it('单值同源放行；跨站/跨端口拒绝', () => {
+    expect(originAllowed(fakeReq({ origin: 'https://good.example', host: 'good.example' }))).toBe(true);
+    expect(originAllowed(fakeReq({ origin: 'https://good.example:443', host: 'good.example' }))).toBe(true);
+    expect(originAllowed(fakeReq({ origin: 'https://evil.example', host: 'good.example' }))).toBe(false);
+    expect(originAllowed(fakeReq({ origin: 'https://good.example:8443', host: 'good.example' }))).toBe(false);
+  });
+
+  it('无 Origin / 空 Origin 放行（curl 等非浏览器场景）', () => {
+    expect(originAllowed(fakeReq({}))).toBe(true);
+    expect(originAllowed(fakeReq({ origin: '', host: 'good.example' }))).toBe(true);
+  });
+});
+
+describe('A-P2-4 / A-P2-7：面板前端改动（cookie 留空不更新 + tick 后台门控）', () => {
+  it('saveEdit：cookie 输入框为空不发送该键，显式勾选清除才发 cookie:""', () => {
+    const code = inlineScript();
+    expect(code).toContain('if (cookie) body.cookie = cookie;');
+    expect(code).toContain("else if (clearCookie) body.cookie = '';");
+    expect(code).toContain("var clearCookie = $('e-clearcookie-' + id) && $('e-clearcookie-' + id).checked;");
+    expect(code).toContain("T('cookieKeep')");
+    expect(code).toContain("T('cookieClearCheckbox')");
+    // 显式清除 checkbox 出现在编辑表单里。
+    expect(ADMIN_HTML).toContain('id="e-clearcookie-\' + a.id + \'"');
+  });
+
+  it('A-P2-4 词条 cookieKeep / cookieClearCheckbox en/zh 都有', () => {
+    for (const lang of ['en', 'zh']) {
+      const code = inlineScript();
+      const start = code.indexOf(`${lang}:`);
+      expect(start).toBeGreaterThan(-1);
+      const slice = code.slice(start);
+      const end = slice.indexOf('\n    }');
+      const body = slice.slice(0, end > 0 ? end : 4000);
+      for (const k of ['cookieKeep', 'cookieClearCheckbox']) {
+        expect(body, `${lang} 缺 ${k}`).toMatch(new RegExp(`\\b${k}\\s*:`));
+      }
+    }
+  });
+
+  it('tick 开头有 document.hidden 门控（后台 tab 不空转，与 OTA 轮询同款）', () => {
+    const code = inlineScript();
+    expect(code).toMatch(/function tick\(manual\)\s*\{\s*if \(document\.hidden\) return;/);
+  });
+});
+
+describe('P2-2 / INFO-1 / INFO-2 修复回归（面板前端改动）', () => {
+  it('P2-2：.ops 操作菜单触屏/键盘可达（focus-within + hover:none），桌面 hover 保留', () => {
+    expect(ADMIN_HTML).toContain('.card:hover .ops { opacity: 1; }');
+    expect(ADMIN_HTML).toContain('.ops:focus-within { opacity: 1; }');
+    expect(ADMIN_HTML).toContain('@media (hover: none) { .ops { opacity: 1; } }');
+  });
+
+  it('INFO-1：requests/ipstats/audit 三请求只在 usage 视图拉取（其余视图 2s tick 不白打）', () => {
+    const code = inlineScript();
+    const tickSrc = code.slice(code.indexOf('function tick('), code.indexOf('function tick(') + 2500);
+    expect(tickSrc).toMatch(/if \(curView === 'usage'\) \{\s*fetchRequests\(\);\s*fetchIpStats\(\);\s*fetchAudit\(\);/);
+    // 总览卡组（fetchUsage/fetchOverviewTrend）不包在门里，任何视图都要拉。
+    const gated = tickSrc.slice(tickSrc.indexOf("if (curView === 'usage')"));
+    expect(gated).not.toContain('fetchUsage');
+    expect(gated).not.toContain('fetchOverviewTrend');
+  });
+
+  it('INFO-2：401 时一并清掉 OTA 60s 轮询定时器（赋值给 otaTimer，可被 clearInterval）', () => {
+    const code = inlineScript();
+    expect(code).toContain('var otaTimer = 0;');
+    expect(code).toMatch(/otaTimer = setInterval\(function \(\) \{/);
+    expect(code).toMatch(/clearInterval\(fcTickTimer\);[\s\S]*?if \(otaTimer\) clearInterval\(otaTimer\);/);
+  });
+});
+
+describe('审计轮 P2 修复回归（admin 端点 e2e）', () => {
+  let tmpDir: string;
+  let db: UsageDb;
+  let cfg: AppConfig;
+  let store: AccountsStore;
+  let pool: KeyPool;
+  let server: Server;
+  let baseUrl: string;
+  let billingFail = false;
+  // P2-3：console 返回形状可控（缺余额字段 / 显式 null / 正常值）。
+  let billingShape: unknown = { balanceMicroCents: '12345678' };
+
+  function makeCfg(): AppConfig {
+    return {
+      host: '127.0.0.1', port: 0,
+      apiKeys: ['admin-key'],
+      anthropicApiKey: 'sk-ant-fake',
+      upstreamKeys: [],
+      keyFailThreshold: 5, keyCooldownMs: 300_000,
+      anthropicBaseUrl: 'http://placeholder',
+      payAsYouGoBaseUrl: 'http://placeholder-payg',
+      modelMap: {}, fallbackModel: 'deepseek-v4-flash',
+      injectionMode: 'block', allowUnauthenticated: false,
+      maxBodyBytes: 10 * 1024 * 1024,
+      maxMessageChars: 200_000, maxMessages: 4_000,
+      stripControlChars: true, trustClaudeCodeHeaders: false,
+      dashboardOpen: true, dashboardPublic: false,
+      usageDbPath: '', usageDbRetentionDays: 30,
+      keyProbeIntervalMs: 0, keyProbeIdleMs: 1_800_000, keyProbeTimeoutMs: 5_000,
+      gatewaySecret: 'p2-admin-secret', secretFilePath: '/dev/null',
+      billingIntervalMs: 1_800_000, billingTimeoutMs: 20_000,
+      oauthClientId: 'opencode-cli', oauthConsoleUrl: 'https://console.opencode.ai',
+      scaleClientTokens: false, clientTokenScale: 0.6657,
+      compactEnabled: false, compactTriggerBytes: 4 * 1024 * 1024, compactMaxMessageChars: 8000,
+      adminUser: 'admin', adminPass: 'thankyouopencode',
+      adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+    };
+  }
+
+  /** 面板只用 billingStatus/cookieStatus/lastError 三个方法，其余打不住。 */
+  const consoleClient = {
+    billingStatus: async (): Promise<unknown | null> =>
+      billingFail ? null : billingShape,
+    cookieStatus: (): 'ok' | 'invalid' => (billingFail ? 'invalid' : 'ok'),
+    lastError: (): 'auth' | null => (billingFail ? 'auth' : null),
+  } as unknown as Parameters<typeof createApp>[5];
+
+  async function createAccount(name: string, keys: string[], cookie?: string): Promise<number> {
+    const res = await fetch(`${baseUrl}/__admin/api/accounts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, kind: 'unknown', keys, cookie }),
+    });
+    expect(res.status).toBe(201);
+    return ((await res.json()) as { account: { id: number } }).account.id;
+  }
+
+  function lastAudit(op: string): { ok: number; note: string | null } {
+    const row = db
+      .sqlite()!
+      .prepare('SELECT ok, note FROM admin_audit WHERE op = ? ORDER BY id DESC LIMIT 1')
+      .get(op) as { ok: number; note: string | null } | undefined;
+    return row ?? { ok: -1, note: null };
+  }
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-admin-p2-'));
+    cfg = makeCfg();
+    db = new UsageDb(path.join(tmpDir, 'p2.db'), 30, () => {});
+    const secret = loadSecret({ gatewaySecret: 'p2-admin-secret', secretFilePath: '/dev/null' } as unknown as AppConfig)!;
+    store = new AccountsStore(db, secret, cfg, () => {});
+    pool = new KeyPool([], { cooldownMs: cfg.keyCooldownMs, failThreshold: cfg.keyFailThreshold });
+    server = createApp(cfg, pool, db, store, undefined, consoleClient);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const a = server.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('A-P2-4：PATCH 不带 cookie 键不覆盖已存 cookie；显式 cookie:"" 才清除', async () => {
+    const id = await createAccount('cookie-keep', [], 'auth=keepme');
+    expect(store.cookieOf(id)).toBe('auth=keepme');
+    const patch = await fetch(`${baseUrl}/__admin/api/accounts/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'renamed' }),
+    });
+    expect(patch.status).toBe(200);
+    expect(store.cookieOf(id)).toBe('auth=keepme');
+    // 显式清除路径仍可用（前端勾选「清除已存 cookie」→ 发 cookie:''）。
+    const clear = await fetch(`${baseUrl}/__admin/api/accounts/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cookie: '' }),
+    });
+    expect(clear.status).toBe(200);
+    expect(store.cookieOf(id)).toBe(null);
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+  });
+
+  it('A-P2-3：手动刷新余额有审计（成功 ok=1 / 失败 ok=0 带原因）', async () => {
+    const id = await createAccount('billing-audit', ['sk-billing-1']);
+    const ok = await fetch(`${baseUrl}/__admin/api/accounts/${id}/billing`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(ok.status).toBe(200);
+    expect(lastAudit('account.billing-refresh')).toEqual({ ok: 1, note: 'ok' });
+    billingFail = true;
+    try {
+      const fail = await fetch(`${baseUrl}/__admin/api/accounts/${id}/billing`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      expect(fail.status).toBe(502);
+      expect(lastAudit('account.billing-refresh')).toEqual({ ok: 0, note: 'console auth invalid' });
+    } finally {
+      billingFail = false;
+    }
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+  });
+
+  it('P2-3：console 缺余额字段不覆盖历史余额（部分更新），显式 null 才清空', async () => {
+    const id = await createAccount('billing-partial', ['sk-billing-partial']);
+    const refresh = () =>
+      fetch(`${baseUrl}/__admin/api/accounts/${id}/billing`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+    try {
+      // 先刷出历史余额。
+      billingShape = { balanceMicroCents: '5000000' };
+      expect((await refresh()).status).toBe(200);
+      expect(store.get(id)!.balanceUnits).toBe(5000000);
+      // 字段缺失（只带月额度，无 combinedAvailable/balanceMicroCents）→ 保留历史余额。
+      billingShape = { monthlyLimitMicroCents: '1000000000' };
+      expect((await refresh()).status).toBe(200);
+      expect(store.get(id)!.balanceUnits).toBe(5000000);
+      // 显式 null（上游明确无余额）→ 清空。
+      billingShape = { balanceMicroCents: null };
+      expect((await refresh()).status).toBe(200);
+      expect(store.get(id)!.balanceUnits).toBe(null);
+    } finally {
+      billingShape = { balanceMicroCents: '12345678' };
+      await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+    }
+  });
+
+  it('A-P2-5：账号写操作审计 note 不再恒 null（create/patch/add-key/remove-key/delete）', async () => {
+    const id = await createAccount('note-test', ['sk-note-1']);
+    expect(lastAudit('account.create')).toEqual({ ok: 1, note: 'note-test' });
+
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: 'sk-note-2' }),
+    });
+    expect(lastAudit('account.add-key')).toEqual({ ok: 1, note: keyFingerprint('sk-note-2') });
+
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'note-renamed' }),
+    });
+    expect(lastAudit('account.patch')).toEqual({ ok: 1, note: 'name' });
+
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}/keys/${encodeURIComponent(keyFingerprint('sk-note-1'))}`, {
+      method: 'DELETE',
+    });
+    expect(lastAudit('account.remove-key')).toEqual({ ok: 1, note: keyFingerprint('sk-note-1') });
+
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+    expect(lastAudit('account.delete')).toEqual({ ok: 1, note: 'note-renamed' });
+  });
+
+  it('A-P2-6：setLegacyCookie 落库失败 → 500 + 审计 note', async () => {
+    class FailLegacyStore extends AccountsStore {
+      override setLegacyCookie(_id: number, _cookie: string | null): boolean {
+        return false;
+      }
+    }
+    const secret = loadSecret({ gatewaySecret: 'p2-admin-secret', secretFilePath: '/dev/null' } as unknown as AppConfig)!;
+    const store2 = new FailLegacyStore(db, secret, cfg, () => {});
+    const pool2 = new KeyPool([], { cooldownMs: cfg.keyCooldownMs, failThreshold: cfg.keyFailThreshold });
+    const server2 = createApp(cfg, pool2, db, store2);
+    await new Promise<void>((r) => server2.listen(0, '127.0.0.1', r));
+    const a2 = server2.address();
+    const url = `http://127.0.0.1:${typeof a2 === 'object' && a2 ? a2.port : 0}`;
+    try {
+      const create = await fetch(`${url}/__admin/api/accounts`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'legacy-cookie-fail', kind: 'unknown', keys: [] }),
+      });
+      expect(create.status).toBe(201);
+      const id = ((await create.json()) as { account: { id: number } }).account.id;
+      const patch = await fetch(`${url}/__admin/api/accounts/${id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ legacyCookie: 'auth=legacy' }),
+      });
+      expect(patch.status).toBe(500);
+      expect(lastAudit('account.patch')).toEqual({ ok: 0, note: 'legacy cookie save failed' });
+    } finally {
+      await new Promise<void>((r) => server2.close(() => r()));
+    }
+  });
+
+  it('PATCH legacyKey：保存（加密落库、响应只给掩码）+ null 清除 + 明文绝不外泄', async () => {
+    const id = await createAccount('legacy-key-patch', []);
+    const plain = 'sk-AOpQOUTje3uIJRVctKiLocPCaPPF1yWBQwOlwP7JfiOX47iCoL8BeTFTviyd0osU';
+    const patch = await fetch(`${baseUrl}/__admin/api/accounts/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ legacyKey: plain }),
+    });
+    expect(patch.status).toBe(200);
+    // 进程内明文可解（zen usage 端点要发 Bearer）。
+    expect(store.legacyKeyOf(id)).toBe(plain);
+    const body = (await patch.json()) as { account: { hasLegacyKey: boolean; legacyKeyMasked: string | null } };
+    expect(body.account.hasLegacyKey).toBe(true);
+    expect(body.account.legacyKeyMasked).toBe('sk-AOpQ...0osU');
+    // 隐私：响应绝不含明文。
+    expect(JSON.stringify(body)).not.toContain('OUTje3uIJRVctKiLocPCaPPF1y');
+    expect(body.account).not.toHaveProperty('legacyKey');
+    // null = 清除。
+    const clear = await fetch(`${baseUrl}/__admin/api/accounts/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ legacyKey: null }),
+    });
+    expect(clear.status).toBe(200);
+    expect(store.legacyKeyOf(id)).toBeNull();
+    const clearBody = (await clear.json()) as { account: { hasLegacyKey: boolean } };
+    expect(clearBody.account.hasLegacyKey).toBe(false);
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+  });
+
+  it('D-P2-3：删账户/删 key 清理 model_access 的 upstream-key 行（sha256 subject）', async () => {
+    const ma = new ModelAccessStore(db);
+    const sha = (k: string): string => createHash('sha256').update(k, 'utf8').digest('hex');
+    // 删账户：整批 key 的授权行一起清。
+    const id1 = await createAccount('ma-delete', ['sk-ma-1', 'sk-ma-2']);
+    ma.setCustom('upstream-key', sha('sk-ma-1'), ['deepseek-v4-flash']);
+    ma.setCustom('upstream-key', sha('sk-ma-2'), ['deepseek-v4-flash']);
+    expect(ma.listByType('upstream-key')).toHaveLength(2);
+    const del = await fetch(`${baseUrl}/__admin/api/accounts/${id1}`, { method: 'DELETE' });
+    expect(del.status).toBe(204);
+    expect(ma.listByType('upstream-key')).toHaveLength(0);
+
+    // 删单 key：只清那一把，其余保留。
+    const id2 = await createAccount('ma-remkey', ['sk-ma-3', 'sk-ma-4']);
+    ma.setCustom('upstream-key', sha('sk-ma-3'), ['deepseek-v4-flash']);
+    ma.setCustom('upstream-key', sha('sk-ma-4'), ['deepseek-v4-flash']);
+    expect(ma.listByType('upstream-key')).toHaveLength(2);
+    const delKey = await fetch(
+      `${baseUrl}/__admin/api/accounts/${id2}/keys/${encodeURIComponent(keyFingerprint('sk-ma-3'))}`,
+      { method: 'DELETE' },
+    );
+    expect(delKey.status).toBe(204);
+    const rows = ma.listByType('upstream-key');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.subjectId).toBe(sha('sk-ma-4'));
+    await fetch(`${baseUrl}/__admin/api/accounts/${id2}`, { method: 'DELETE' });
+  });
+
+  it('D-P2-3b：管理面删 key 后数据面共享实例缓存失效（getCustom 回退 null，防旧授权复活）', async () => {
+    // M1（对抗审查实证复现）：admin.ts 若自建 ModelAccessStore 删行，server 数据面
+    // 共享实例的 getCustom 缓存不失效 → 同值 key 换账号重加后仍按旧授权限制。
+    // 这里把同一个 ma 实例注入 createApp（server.ts:2975 handleAdminRoutes 收到共享实例），
+    // 删 key 后同一实例缓存必须已清。
+    const ma = new ModelAccessStore(db);
+    const pool3 = new KeyPool([], { cooldownMs: cfg.keyCooldownMs, failThreshold: cfg.keyFailThreshold });
+    const server3 = createApp(cfg, pool3, db, store, undefined, consoleClient, undefined, undefined, undefined, undefined, undefined, ma);
+    await new Promise<void>((r) => server3.listen(0, '127.0.0.1', r));
+    const a3 = server3.address();
+    const url = `http://127.0.0.1:${typeof a3 === 'object' && a3 ? a3.port : 0}`;
+    try {
+      const sha = (k: string): string => createHash('sha256').update(k, 'utf8').digest('hex');
+      // 数据面（同一 ma）先缓存一条 upstream-key 授权。
+      ma.setCustom('upstream-key', sha('sk-ma-cache'), ['deepseek-v4-flash']);
+      expect(ma.getCustom('upstream-key', sha('sk-ma-cache'))).toEqual(['deepseek-v4-flash']);
+      // 建账号（含该 key），走管理面删 key 端点。
+      const create = await fetch(`${url}/__admin/api/accounts`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'ma-cache', kind: 'unknown', keys: ['sk-ma-cache'] }),
+      });
+      expect(create.status).toBe(201);
+      const id = ((await create.json()) as { account: { id: number } }).account.id;
+      const delKey = await fetch(
+        `${url}/__admin/api/accounts/${id}/keys/${encodeURIComponent(keyFingerprint('sk-ma-cache'))}`,
+        { method: 'DELETE' },
+      );
+      expect(delKey.status).toBe(204);
+      // 同一实例缓存必须已失效，否则数据面仍按旧授权限制该 key。
+      expect(ma.getCustom('upstream-key', sha('sk-ma-cache'))).toBeNull();
+      await fetch(`${url}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+    } finally {
+      await new Promise<void>((r) => server3.close(() => r()));
+    }
+  });
+});
+
+describe('go 端点 legacyKey 优先：zen usage 成功走 zen、失败回落 cookie HTML', () => {
+  let tmpDir: string;
+  let db: UsageDb;
+  let cfg: AppConfig;
+  let store: AccountsStore;
+  let client: FakeLegacyZenClient;
+  let server: Server;
+  let baseUrl: string;
+  let ttl: LegacyTtlCache;
+
+  const WS = 'wrk_01KZEQCBJ59Y3T34CSJNRVQJV7';
+  const ZEN_STATUS: LegacyGoStatus = {
+    subscribed: true, useBalance: false, chinaModels: false,
+    rolling: { status: 'ok', resetInSec: 3600, usagePercent: 5 },
+    weekly: { status: 'ok', resetInSec: 86400, usagePercent: 41 },
+    monthly: { status: 'ok', resetInSec: 2592000, usagePercent: 20 },
+  };
+
+  /** fake LegacyClientLike：记录 zen / cookie HTML 两条路径的调用，zen 可切换。 */
+  class FakeLegacyZenClient implements LegacyClientLike {
+    zen: LegacyGoStatus | null = null;
+    /** cookie HTML 通道模拟失败（401 等），用于验证 cookie 失败时开关保持 false。 */
+    cookieFail = false;
+    calls: Array<{ method: string; cookie?: string | null; ws?: string; apiKey?: string }> = [];
+    async listKeys(): Promise<LegacyReadResult> {
+      this.calls.push({ method: 'listKeys' });
+      return { ok: false, reason: 'upstream' };
+    }
+    async createKey(): Promise<LegacyWriteResult> {
+      this.calls.push({ method: 'createKey' });
+      return { ok: true };
+    }
+    async deleteKey(): Promise<LegacyWriteResult> {
+      this.calls.push({ method: 'deleteKey' });
+      return { ok: true };
+    }
+    async getGoStatus(_id: number, cookie: string | null, ws: string): Promise<LegacyGoReadResult> {
+      this.calls.push({ method: 'getGoStatus', cookie, ws });
+      if (this.cookieFail) return { ok: false, reason: 'auth' };
+      return {
+        ok: true,
+        status: {
+          subscribed: true, useBalance: false, chinaModels: true,
+          rolling: { status: 'ok', resetInSec: 15184, usagePercent: 5 },
+          weekly: { status: 'ok', resetInSec: 461761, usagePercent: 46 },
+          monthly: { status: 'ok', resetInSec: 2413712, usagePercent: 60 },
+        },
+      };
+    }
+    async getZenGoUsage(_id: number, apiKey: string): Promise<LegacyGoStatus | null> {
+      this.calls.push({ method: 'getZenGoUsage', apiKey });
+      return this.zen;
+    }
+    async setGoToggle(): Promise<LegacyWriteResult> {
+      this.calls.push({ method: 'setGoToggle' });
+      return { ok: true };
+    }
+    async getBilling(): Promise<LegacyBillingReadResult> {
+      this.calls.push({ method: 'getBilling' });
+      return { ok: true, billing: { balanceDollars: 0, reload: null, payments: [], monthlyLimitDollars: null } };
+    }
+  }
+
+  function makeCfg(): AppConfig {
+    return {
+      host: '127.0.0.1', port: 0,
+      apiKeys: ['admin-key'],
+      anthropicApiKey: 'sk-ant-fake',
+      upstreamKeys: [],
+      keyFailThreshold: 5, keyCooldownMs: 300_000,
+      anthropicBaseUrl: 'http://placeholder',
+      payAsYouGoBaseUrl: 'http://placeholder-payg',
+      modelMap: {}, fallbackModel: 'deepseek-v4-flash',
+      injectionMode: 'block', allowUnauthenticated: false,
+      maxBodyBytes: 10 * 1024 * 1024,
+      maxMessageChars: 200_000, maxMessages: 4_000,
+      stripControlChars: true, trustClaudeCodeHeaders: false,
+      dashboardOpen: true, dashboardPublic: false,
+      usageDbPath: '', usageDbRetentionDays: 30,
+      keyProbeIntervalMs: 0, keyProbeIdleMs: 1_800_000, keyProbeTimeoutMs: 5_000,
+      gatewaySecret: 'p2-admin-secret', secretFilePath: '/dev/null',
+      billingIntervalMs: 1_800_000, billingTimeoutMs: 20_000,
+      oauthClientId: 'opencode-cli', oauthConsoleUrl: 'https://console.opencode.ai',
+      scaleClientTokens: false, clientTokenScale: 0.6657,
+      compactEnabled: false, compactTriggerBytes: 4 * 1024 * 1024, compactMaxMessageChars: 8000,
+      adminUser: 'admin', adminPass: 'thankyouopencode',
+      adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+    };
+  }
+
+  async function mkAccount(legacyKey: string | null, cookie: string | null): Promise<number> {
+    const created = store.create({ name: 'zen-a', kind: 'unknown', workspaceId: null, keys: [], cookie });
+    if (!created.ok) throw new Error('account create failed');
+    store.setLegacyWorkspaceId(created.value.id, WS);
+    if (legacyKey) store.setLegacyKey(created.value.id, legacyKey);
+    return created.value.id;
+  }
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-legacykey-zen-'));
+    cfg = makeCfg();
+    db = new UsageDb(path.join(tmpDir, 'zen.db'), 30, () => {});
+    const secret = loadSecret({ gatewaySecret: 'p2-admin-secret', secretFilePath: '/dev/null' } as unknown as AppConfig)!;
+    store = new AccountsStore(db, secret, cfg, () => {});
+    client = new FakeLegacyZenClient();
+    ttl = new LegacyTtlCache(LEGACY_TTL_MS);
+    server = createApp(cfg, undefined, db, store, undefined, undefined, undefined, client, undefined, undefined, ttl);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const a = server.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  beforeEach(() => {
+    client.zen = null;
+    client.cookieFail = false;
+    client.calls = [];
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('有 legacyKey + zen 成功 → 并行取 cookie 开关，合并：窗口来自 zen、开关来自 cookie HTML', async () => {
+    const id = await mkAccount('sk-zen-legacy-key', 'auth=legacy-secret');
+    ttl.clear(id);
+    client.zen = ZEN_STATUS;
+    const res = await fetch(`${baseUrl}/__admin/api/legacy/account/${id}/go`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; data: { go: LegacyGoStatus } };
+    expect(body.data.go.monthly!.usagePercent).toBe(20); // 窗口来自 zen 形状
+    expect(body.data.go.chinaModels).toBe(true); // 开关来自 cookie HTML（fake getGoStatus）
+    expect(body.data.go.useBalance).toBe(false);
+    expect(client.calls.filter((c) => c.method === 'getZenGoUsage')).toHaveLength(1);
+    expect(client.calls.find((c) => c.method === 'getZenGoUsage')!.apiKey).toBe('sk-zen-legacy-key');
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(1); // 并行取开关
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+  });
+
+  it('有 legacyKey + zen 成功 + cookie 失效 → 开关保持 false，窗口仍来自 zen', async () => {
+    const id = await mkAccount('sk-zen-legacy-key', 'auth=expired');
+    ttl.clear(id);
+    client.zen = ZEN_STATUS;
+    client.cookieFail = true; // cookie HTML 通道 401
+    const res = await fetch(`${baseUrl}/__admin/api/legacy/account/${id}/go`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; data: { go: LegacyGoStatus } };
+    expect(body.data.go.monthly!.usagePercent).toBe(20); // 窗口仍来自 zen
+    expect(body.data.go.chinaModels).toBe(false); // cookie 失效 → 开关 false
+    expect(body.data.go.useBalance).toBe(false);
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(1);
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+  });
+
+  it('有 legacyKey + zen 失败（null）→ 回落 cookie HTML（getGoStatus 被调，带 store 解密 cookie）', async () => {
+    const id = await mkAccount('sk-zen-legacy-key', 'auth=legacy-secret');
+    ttl.clear(id);
+    client.zen = null; // zen 失败
+    const res = await fetch(`${baseUrl}/__admin/api/legacy/account/${id}/go`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; data: { go: LegacyGoStatus } };
+    expect(body.data.go.monthly!.usagePercent).toBe(60); // HTML 抓取形状（fake getGoStatus）
+    expect(client.calls.filter((c) => c.method === 'getZenGoUsage')).toHaveLength(1);
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(1); // fallback
+    expect(client.calls.find((c) => c.method === 'getGoStatus')!.cookie).toBe('auth=legacy-secret');
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
+  });
+
+  it('无 legacyKey → 完全走 cookie HTML（getZenGoUsage 零调用，既有行为不变）', async () => {
+    const id = await mkAccount(null, 'auth=legacy-secret');
+    ttl.clear(id);
+    const res = await fetch(`${baseUrl}/__admin/api/legacy/account/${id}/go`);
+    expect(res.status).toBe(200);
+    expect(client.calls.filter((c) => c.method === 'getZenGoUsage')).toHaveLength(0);
+    expect(client.calls.filter((c) => c.method === 'getGoStatus')).toHaveLength(1);
+    await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
   });
 });
 

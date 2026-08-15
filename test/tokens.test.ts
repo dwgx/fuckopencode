@@ -13,7 +13,7 @@
  * - 用量聚合：requests 按 token_fp 聚合（请求数 / tokens / cost）
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -230,7 +230,9 @@ describe('TokensStore', () => {
     expect(store.update(a.value.id, { rpmLimit: 7 })).toBe('ok');
     expect(store.verify(a.value.token)).toEqual({ ok: true, fingerprint: a.value.fingerprint, rpmLimit: 7 });
     // 脏数据（负值）归一 0：verify 与 getRpmLimit 共用同一套归一化。
-    db.sqlite()!.prepare('UPDATE tokens SET rpm_limit = ? WHERE id = ?').run(-3, a.value.id);
+    // 经 store.update 写脏值会失效 verify 缓存，verify 重新查库时归一化为 0
+    // （P2-4 缓存只存已归一化结果，命中缓存时不会读到原始脏值）。
+    expect(store.update(a.value.id, { rpmLimit: -3 })).toBe('ok');
     const dirty = store.verify(a.value.token);
     expect(dirty.ok).toBe(true);
     if (dirty.ok) expect(dirty.rpmLimit).toBe(0);
@@ -238,6 +240,80 @@ describe('TokensStore', () => {
     // 未知指纹仍是 fail-closed。
     expect(store.verify('tk-' + 'f'.repeat(64))).toEqual({ ok: false });
     db.close();
+  });
+
+  it('P2-2：自定义 key 去前缀后不足 16 位拒绝；≥16 位接受', () => {
+    const db = new UsageDb(path.join(tmpDir, 'len.db'), 30, () => {});
+    const store = new TokensStore(db);
+    // 短 key（去 sk-/tk- 前缀后 < 16）：拒绝，不落库。
+    expect(store.create('short', null, 'sk-short').ok).toBe(false);
+    expect(store.create('short', null, 'tk-short').ok).toBe(false);
+    // 无前缀但整体过短：同样拒绝。
+    expect(store.create('short', null, 'only14charkey?').ok).toBe(false);
+    expect(store.list()).toEqual([]);
+    // 去前缀后恰好 16：接受（自定义 key 校验只看下限，不查熵）。
+    const ok = store.create('ok', null, 'sk-1234567890abcdef');
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(ok.value.token).toBe('sk-1234567890abcdef');
+    expect(store.create('ok', null, 'tk-1234567890abcdef').ok).toBe(true);
+    // 空白 customKey = 走随机生成（原有语义，不受长度校验影响）。
+    const rnd = store.create('rnd', null, '   ');
+    expect(rnd.ok).toBe(true);
+    if (rnd.ok) expect(rnd.value.token).toMatch(/^tk-/);
+    expect(store.list()).toHaveLength(3);
+    db.close();
+  });
+
+  it('P2-4：verify 10s TTL 缓存 —— 命中不查库、写操作即时失效、TTL 过期重查', () => {
+    vi.useFakeTimers();
+    try {
+      const db = new UsageDb(path.join(tmpDir, 'verify-cache.db'), 30, () => {});
+      const store = new TokensStore(db);
+      const a = store.create('cache', null);
+      expect(a.ok).toBe(true);
+      if (!a.ok) return;
+      const fp = a.value.fingerprint;
+      // 首次 verify 查库并写缓存。
+      expect(store.verify(a.value.token)).toEqual({ ok: true, fingerprint: fp, rpmLimit: 0 });
+
+      // 绕过 store 直接改库（rpm_limit=99）：命中缓存时 verify 返回旧值 0
+      // （证明没有重新查库 —— 若查库会读到 99）。
+      db.sqlite()!.prepare('UPDATE tokens SET rpm_limit = 99 WHERE id = ?').run(a.value.id);
+      const cached = store.verify(a.value.token);
+      expect(cached.ok).toBe(true);
+      if (cached.ok) expect(cached.rpmLimit).toBe(0);
+
+      // 直接改 status='disabled'：缓存命中仍放行（禁用不即时生效，直到失效/过期）。
+      db.sqlite()!.prepare("UPDATE tokens SET status = 'disabled' WHERE id = ?").run(a.value.id);
+      expect(store.verify(a.value.token).ok).toBe(true);
+
+      // 写操作（update）即时失效：改回 active + rpmLimit=7 后 verify 重新查库。
+      expect(store.update(a.value.id, { status: 'active', rpmLimit: 7 })).toBe('ok');
+      const afterUpdate = store.verify(a.value.token);
+      expect(afterUpdate.ok).toBe(true);
+      if (afterUpdate.ok) expect(afterUpdate.rpmLimit).toBe(7);
+
+      // delete 即时失效：删除后 verify 拒绝（缓存不再放行已删 token）。
+      store.delete(a.value.id);
+      expect(store.verify(a.value.token).ok).toBe(false);
+
+      // TTL 过期重查：新 key 入缓存后直接改库，未过期命中旧值、过期后读到新值。
+      const b = store.create('cache2', null);
+      expect(b.ok).toBe(true);
+      if (!b.ok) return;
+      expect(store.verify(b.value.token).ok).toBe(true); // 入缓存（rpmLimit 0）
+      db.sqlite()!.prepare('UPDATE tokens SET rpm_limit = 42 WHERE id = ?').run(b.value.id);
+      const beforeExpire = store.verify(b.value.token);
+      expect(beforeExpire.ok).toBe(true);
+      if (beforeExpire.ok) expect(beforeExpire.rpmLimit).toBe(0);
+      vi.advanceTimersByTime(TokensStore.VERIFY_CACHE_TTL_MS + 1);
+      const afterExpire = store.verify(b.value.token);
+      expect(afterExpire.ok).toBe(true);
+      if (afterExpire.ok) expect(afterExpire.rpmLimit).toBe(42);
+      db.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -847,13 +923,13 @@ describe('分发密钥明文存储与查看（token_enc 加密 + /plain 端点 +
     const { UsageDb } = await import('../src/usagedb.js');
     const db = new UsageDb(path.join(dir, 't.db'));
     const store = new TokensStore(db as never, secret as never);
-    const created = store.create('plain-test', null, 'sk-mytestkey123');
+    const created = store.create('plain-test', null, 'sk-mytestkey1234567890');
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     // 明文能解密还原（与新创建一致）
-    expect(store.plainOf(created.value.id)).toBe('sk-mytestkey123');
+    expect(store.plainOf(created.value.id)).toBe('sk-mytestkey1234567890');
     // 指纹仍按明文派生（校验不受影响）
-    expect(fingerprintOf('sk-mytestkey123')).toBe(created.value.fingerprint);
+    expect(fingerprintOf('sk-mytestkey1234567890')).toBe(created.value.fingerprint);
     db.close();
   });
 
@@ -867,7 +943,7 @@ describe('分发密钥明文存储与查看（token_enc 加密 + /plain 端点 +
     const db = new UsageDb(path.join(dir, 't.db'));
     // 无 secret：create 时 token_enc 存 null
     const store = new TokensStore(db as never, null);
-    const created = store.create('null-plain', null, 'sk-oldkey');
+    const created = store.create('null-plain', null, 'sk-another-long-key-000');
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     expect(store.plainOf(created.value.id)).toBeNull();

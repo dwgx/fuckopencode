@@ -74,6 +74,12 @@ import { UNITS_PER_DOLLAR, type FetchLike } from './billing.js';
 /** 单次上游调用超时（与 console.ts 同款）。 */
 export const LEGACY_TIMEOUT_MS = 15_000;
 
+/**
+ * zen usage JSON API 的超时（/zen/go/v1/usage 是轻量 JSON，比 HTML 页更快，
+ * 不需要 HTML 抓取的 15s）。
+ */
+export const ZEN_TIMEOUT_MS = 10_000;
+
 /** 创建 server function 的 X-Server-Id（实测：弹窗表单 action id，跨构建可能变化）。 */
 export const LEGACY_CREATE_SERVER_ID =
   '444825072757feb3b2ec98a3260e2c32488cb05899076c0afb36b9eb5142bc62';
@@ -172,9 +178,11 @@ export function legacyCookieStatus(
   return 'ok';
 }
 
-/** 掩码兜底：`sk-` + 前 4 + `...` + 后 4（与 SSR 的 keyDisplay 格式一致）。 */
-function maskKey(key: string): string {
-  if (key.length <= 11) return key;
+/** 掩码兜底：`sk-` + 前 4 + `...` + 后 4（与 SSR 的 keyDisplay 格式一致）。
+ *  exported：accounts.ts 给旧版 Default API Key 算掩码视图用（同隐私口径）。 */
+export function maskKey(key: string): string {
+  // 异常短 key（≤11 位，够不出前 4 后 4）直接整段打码，绝不让明文进 masked 字段。
+  if (key.length <= 11) return '***';
   return `${key.slice(0, 7)}...${key.slice(-4)}`;
 }
 
@@ -198,7 +206,12 @@ export const LEGACY_PLAIN_CACHE_TTL_MS = 15 * 60 * 1000;
 export const LEGACY_PLAIN_CACHE_MAX_ACCOUNTS = 64;
 
 /**
- * legacy keys 明文的进程内缓存（Map<accountId, Array<{id,name,key}>>）。
+ * legacy keys 明文的进程内缓存（Map<accountId, {ws, Array<{id,name,key}>}>）。
+ *
+ * workspace 维度：条目在 set 时记下抓取所用的 ws，get 校验请求 ws —— 账号
+ * 切换 legacyWorkspaceId 后 TTL 内绝不返回旧 workspace 的明文 key（凭证级串
+ * 数据，跨 workspace 泄露不可接受）。任何一方未传 ws（旧调用方形态）时无法
+ * 校验，按兼容放行。
  *
  * 生命周期设计（任务契约）：
  * - **只存内存**：进程重启即清空，绝不落库、绝不进日志、绝不进掩码端点；
@@ -209,7 +222,7 @@ export const LEGACY_PLAIN_CACHE_MAX_ACCOUNTS = 64;
  *   （64，超出逐出最旧）双保险，兜住「账号删除后无人再访问」的残留条目。
  */
 export class LegacyPlainCache {
-  private entries = new Map<number, { keys: LegacyPlainKey[]; fetchedAt: number }>();
+  private entries = new Map<number, { ws: string | null; keys: LegacyPlainKey[]; fetchedAt: number }>();
   private ttlMs: number;
   private maxAccounts: number;
 
@@ -218,19 +231,25 @@ export class LegacyPlainCache {
     this.maxAccounts = opts.maxAccounts ?? LEGACY_PLAIN_CACHE_MAX_ACCOUNTS;
   }
 
-  /** 命中且未过期 → 明文列表；未命中/已过期 → null（过期条目就地清除）。 */
-  get(accountId: number): LegacyPlainKey[] | null {
+  /**
+   * 命中且未过期 → 明文列表；未命中/已过期 → null（过期条目就地清除）。
+   * ws 维度：条目按当时抓取的 workspace 填的，请求 ws 与条目不一致 → miss
+   * （调用方用当前 ws 重抓并覆盖），绝不跨 workspace 返回明文 key。任何一方
+   * 未传 ws（旧调用方形态）→ 无法校验，按兼容放行。
+   */
+  get(accountId: number, ws?: string): LegacyPlainKey[] | null {
     const e = this.entries.get(accountId);
     if (!e) return null;
     if (Date.now() - e.fetchedAt > this.ttlMs) {
       this.entries.delete(accountId);
       return null;
     }
+    if (ws != null && e.ws != null && ws !== e.ws) return null;
     return e.keys;
   }
 
   /** 填充/刷新条目。超过账号上限时逐出最旧（Map 插入序第一个）。 */
-  set(accountId: number, keys: LegacyPlainKey[]): void {
+  set(accountId: number, keys: LegacyPlainKey[], ws?: string): void {
     // 顺带清一遍过期条目：不访问的已删账号残留靠它收敛（上限仍是最后兜底）。
     if (this.entries.size >= this.maxAccounts) {
       const now = Date.now();
@@ -239,7 +258,7 @@ export class LegacyPlainCache {
       }
     }
     this.entries.delete(accountId); // 重插到末尾：最旧优先逐出
-    this.entries.set(accountId, { keys, fetchedAt: Date.now() });
+    this.entries.set(accountId, { ws: ws ?? null, keys, fetchedAt: Date.now() });
     while (this.entries.size > this.maxAccounts) {
       const oldest = this.entries.keys().next().value;
       if (oldest == null) break;
@@ -536,6 +555,94 @@ export async function fetchLegacyGoStatus(
   const parsed = parseLegacyGoHtml(html, workspaceId);
   if (parsed === null) return { ok: false, reason: 'parse' };
   return { ok: true, status: parsed };
+}
+
+// ---------------------------------------------------------------------------
+// Zen usage（/zen/go/v1/usage，API key 通道，零 cookie）
+// ---------------------------------------------------------------------------
+
+/**
+ * 用旧版 Default API Key 读 Go 订阅用量：GET {baseUrl}/zen/go/v1/usage。
+ *
+ * 2026-08-15 服务器实测：`Authorization: Bearer <旧版 Default API Key>` → 200
+ * JSON `{"usage":{"rolling":{"status":"ok","percent":5,"resetsAt":"..."},...}}`；
+ * 每个 key 返回该 key 所属 workspace 的订阅（与 HTML 抓取数据一致）。无效 key
+ * → 401 `{"type":"error","error":{"type":"AuthError","message":"Unauthorized"}}`。
+ *
+ * 映射到 LegacyGoStatus：percent → usagePercent；resetsAt → resetInSec（秒数，
+ * 已过期钳到 0）；status 直接透传。zen 响应不含 useBalance/chinaModels/订阅标记
+ * —— 200 即该 workspace 有 Go 订阅（subscribed=true），两个开关给 false
+ * （写开关仍走 cookie 通道，见 setLegacyGoToggle）。
+ *
+ * 失败一律返回 null（不抛）：401/非 2xx/网络错/畸形 JSON 都由调用方 fallback
+ * 到 cookie HTML 抓取。
+ */
+export async function fetchZenGoUsage(
+  baseUrl: string,
+  apiKey: string,
+  fetchImpl: FetchLike = fetch,
+): Promise<LegacyGoStatus | null> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${baseUrl.replace(/\/+$/, '')}/zen/go/v1/usage`, {
+      headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
+      signal: AbortSignal.timeout(ZEN_TIMEOUT_MS),
+    });
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  let raw: unknown;
+  try {
+    raw = await res.json();
+  } catch {
+    return null;
+  }
+  const usage = (raw as { usage?: unknown } | null)?.usage;
+  if (typeof usage !== 'object' || usage === null) return null;
+  const u = usage as Record<string, unknown>;
+  const windowOf = (name: string): GoUsageWindow | null => {
+    const w = u[name];
+    if (typeof w !== 'object' || w === null) return null;
+    const win = w as Record<string, unknown>;
+    if (typeof win.status !== 'string') return null;
+    const pct = Number(win.percent);
+    if (!Number.isFinite(pct)) return null;
+    const resetsAt = win.resetsAt;
+    const resetInSec =
+      typeof resetsAt === 'string' && Number.isFinite(Date.parse(resetsAt))
+        ? Math.max(0, Math.floor((Date.parse(resetsAt) - Date.now()) / 1000))
+        : 0;
+    return { status: win.status, resetInSec, usagePercent: pct };
+  };
+  return {
+    subscribed: true,
+    useBalance: false,
+    chinaModels: false,
+    rolling: windowOf('rolling'),
+    weekly: windowOf('weekly'),
+    monthly: windowOf('monthly'),
+  };
+}
+
+/**
+ * 合并 zen 用量与 cookie HTML go 页的 Go 状态（go 端点 zen 优先路径用，见
+ * server.ts handleLegacyGoStatus）：窗口与 subscribed 取 zen（零 cookie 通道，
+ * 服务器实测数据一致）；开关（useBalance/chinaModels）取 cookie —— zen JSON
+ * 无这两个字段恒 false。cookieStatus 为 null（cookie 缺失/失效/解析失败）时
+ * 返回 zen 原样，开关保持 false —— 与 zen 单独使用时一致，不新增错误面；
+ * cookie 失败不阻塞窗口数据返回。
+ */
+export function mergeLegacyGoStatus(
+  zen: LegacyGoStatus,
+  cookieStatus: LegacyGoStatus | null,
+): LegacyGoStatus {
+  if (!cookieStatus) return zen;
+  return {
+    ...zen,
+    useBalance: cookieStatus.useBalance,
+    chinaModels: cookieStatus.chinaModels,
+  };
 }
 
 /**

@@ -242,7 +242,8 @@ describe('normalizeAnthropicRequest', () => {
       maxMessageChars: 8000,
     });
     const outText = (out.messages as Array<{ content: Array<{ text: string }> }>)[0]!.content[0]!.text;
-    expect(outText).toBe('a b c');
+    // M-P2-3：折叠只折空格/制表符（[ \t]+），保留换行 —— tool_result 代码段不被拍平。
+    expect(outText).toBe('a b\n\n c');
     // 入参不被压缩改写。
     const inText = (input.messages as Array<{ content: Array<{ text: string }> }>)[0]!.content[0]!.text;
     expect(inText).toBe('a   b\n\n  c');
@@ -570,8 +571,8 @@ describe('normalizeAnthropicRequest 被动压缩（实验性 COMPACT_ENABLED）'
       COMPACT(5 * 1024 * 1024, 100),
     );
     const content = (out.messages as { content: { content: string }[] }[])[0]!.content[0]!.content;
-    // 折叠后为 'a b c ' + 'word '.repeat(3000)；截断取前 100 字符 + 省略标记。
-    const collapsed = `a b c ${'word '.repeat(3000)}`;
+    // M-P2-3 后折叠为 'a b\n\n c ' + 'word '.repeat(3000)（换行保留）；截断取前 100 字符 + 省略标记。
+    const collapsed = `a b\n\n c ${'word '.repeat(3000)}`;
     expect(content).toBe(collapsed.slice(0, 100) + '…[truncated]');
   });
 

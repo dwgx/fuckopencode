@@ -1,5 +1,7 @@
 export type InjectionMode = 'block' | 'log' | 'off';
 
+import { ALLOWED_MODELS } from './deepseek.js';
+
 /**
  * 面板登录密码的默认值（ADMIN_PASS env 未设时生效）。
  *
@@ -94,6 +96,13 @@ export interface AppConfig {
    * 可选字段：config.ts 总是生成；server 侧兜底 `?? 400`，测试字面量可省略。
    */
   maxConcurrentRequests?: number;
+  /**
+   * 全局默认模型白名单（MODEL-ACCESS.md）：settings 热配置 `allowedModels`
+   * 应用后的运行时值。默认 = ALLOWED_MODELS 硬底线（代码常量，不可放宽——
+   * 任何配置层都只能收窄）。config.ts 总是生成；数据面读取用
+   * `effectiveGlobalModels(cfg)`（可选字段，测试字面量可省略）。
+   */
+  globalAllowedModels?: ReadonlySet<string>;
   /** 单条消息文本字符上限 */
   maxMessageChars: number;
   /** messages 条数上限（防超长列表遍历 DoS；0 = 不限）。 */
@@ -143,6 +152,17 @@ export interface AppConfig {
    * 时该门 fail-open —— 拉取失败保留旧目录，不影响代理链路。
    */
   modelCatalogRefreshMs?: number;
+  /**
+   * GitHub OTA 自更新（OTA.md）。总开关，默认 0（fail-closed）。只锁
+   * perform（写盘 + 自重启），status/check 只读照常。
+   */
+  otaEnabled?: boolean;
+  /** 更新源仓库 owner/repo（OTA_REPO）。非法值回落默认 dwgx/fuckopencode。 */
+  otaRepo?: string;
+  /** 私有仓库 token（OTA_TOKEN）。配了只走直连、不交给 gh-proxy，永不进日志/响应。 */
+  otaToken?: string;
+  /** 后台版本检查周期（OTA_CHECK_INTERVAL_MS，默认 6h）。0 = 关闭。只检查不自动应用。 */
+  otaCheckIntervalMs?: number;
 }
 
 function boolFromEnv(value: string | undefined, fallback: boolean): boolean {
@@ -237,6 +257,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // data/secret.key（不存在自动生成 0600）。用于加密账户 key 与 billing cookie。
     gatewaySecret: env.GATEWAY_SECRET ? String(env.GATEWAY_SECRET) : null,
     secretFilePath: env.SECRET_FILE || 'data/secret.key',
+    // 全局默认模型白名单：默认 = ALLOWED_MODELS 硬底线（MODEL-ACCESS）。
+    // settings 热配置 `allowedModels` 应用时覆盖（只能收窄）。
+    globalAllowedModels: new Set(ALLOWED_MODELS),
     // 面板登录凭证：账号密码（默认 admin/DEFAULT_ADMIN_PASS，默认密码有告警）。
     // 登录成功签发 HttpOnly 会话 cookie（24h），与 API key 并存。
     adminUser: env.ADMIN_USER || 'admin',
@@ -283,6 +306,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     compactMaxMessageChars: intFromEnv(env.COMPACT_MAX_MESSAGE_CHARS, 8_000, 1),
     // 上游模型目录定时刷新：默认 6h，0 = 关闭（只做启动时一次拉取）。
     modelCatalogRefreshMs: intFromEnv(env.MODEL_CATALOG_REFRESH_MS, 6 * 3_600_000, 0),
+    // GitHub OTA 自更新：默认全关（fail-closed）。OTA_ENABLED=1 才允许 perform
+    // （写盘 + 自重启）；status/check 是只读检查，不受开关影响。
+    otaEnabled: boolFromEnv(env.OTA_ENABLED, false),
+    otaRepo: env.OTA_REPO || 'dwgx/fuckopencode',
+    otaToken: env.OTA_TOKEN || '',
+    otaCheckIntervalMs: intFromEnv(env.OTA_CHECK_INTERVAL_MS, 6 * 3_600_000, 0),
   };
 }
 
