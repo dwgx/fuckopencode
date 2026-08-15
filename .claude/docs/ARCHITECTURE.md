@@ -8,6 +8,17 @@ Claude Code 和 Anthropic SDK 只会说 Anthropic Messages 协议。DeepSeek 便
 
 顺带暴露 OpenAI Chat Completions 端点，让 OpenAI 客户端也能用同一个上游。
 
+## 部署形态（2026-08-15 去盾后）
+
+```
+客户端 → FurCDN（cdn.taipei，边缘缓存/加速）→ 网关 0.0.0.0:8787（直连，无盾）
+```
+
+2026-08-15 起 Python 护盾（kiro_shield.py）退役停用，网关自己监听 `0.0.0.0:8787`
+（原盾端口），FurCDN 直连网关，链路中不再有盾。盾的失败重试/并发闸门职责由
+网关自身兜住（数据面并发在飞上限 + 错误分级冷却）。盾文档保留在
+[SHIELD.md](SHIELD.md) 供回滚/参考。
+
 ## 上游协议：为什么走 OpenAI
 
 **2026-08-09 改造。** 上游 opencode Zen 同时提供两套端点，但只有 OpenAI 那套可用：
@@ -139,8 +150,10 @@ dsml / deepseek 的直通链 + sse 的 `parseOpenAISSE`**，其余是改造前�
 | `legacy.ts` | 旧版控制台（opencode.ai，wrk_ 前缀）数据层：SSR 水合 HTML 解析 keys/GO 订阅/计费，/_server 写通道（创建/删除/开关）。key 明文绝不出模块，LegacyPlainCache 15min TTL |
 | `oauth.ts` | OAuth device flow 登录（RFC 8628）：start 拿 device_code、poll 轮询换 refresh_token，refresh 由调用方转 AccountsStore 加密落库。device_code 不落库不落日志 |
 | `billing.ts` | 余额抓取（SSR 页面解析，units 整数 1e8=$1）：每 15min tick + 失败退避阶梯（15→120min）。主通道已停用，handleRefreshBilling 兜底路径仍用 |
-| `tokens.ts` | 分发密钥系统：tk-+64hex 生成，库内只存 sha256 指纹（96-bit，校验全程无解密），token 明文仅创建响应出现一次；按 token 聚合用量/费用（取 requests.cost_micro_cents，不自己定价）；verify prepared 复用 |
-| `settings.ts` | 设置页热配置：settings 表 + 运行时 apply（env 是默认、settings 覆盖、不重启生效）；apiKeys 数组引用替换、adminPass 密码版本进 HMAC。SETTINGS_META 是唯一真源 |
+| `tokens.ts` | 分发密钥系统：tk-+64hex 生成，库内只存 sha256 指纹（96-bit，校验全程无解密），token 明文仅创建响应出现一次；按 token 聚合用量/费用（取 requests.cost_micro_cents，不自己定价）；verify prepared 复用 + 10s 缓存。**配额计费**（2026-08-15，QUOTA.md）：tokens 表配额列（$ 存储 microCents / tokens / requests / cycle / expires_at）+ `settleQuota`（完成时逐口径条件 UPDATE，M3 防并发超额）+ `quotaCheck`（expires→403 / 超限→429）+ `TokenQuotaView` 全美元视图 |
+| `money.ts` | 单一金额换算权威（2026-08-15 新建）：`MICROCENTS_PER_DOLLAR`（1e8=$1）+ microCentsToUsd/usdToMicroCents；billing 的 UNITS_PER_DOLLAR 是它的别名，console/accounts/legacy 换算系数收敛到这里（B1 复发面根治） |
+| `modelaccess.ts` | 密钥-模型授权 store（2026-08-15 新建，MODEL-ACCESS.md）：model_access 表 getCustom/setCustom/listByType，subject=token 指纹 / api-key sha256 / upstream-key sha256；热路径懒加载缓存 + 写操作失效 |
+| `settings.ts` | 设置页热配置：settings 表 + 运行时 apply（env 是默认、settings 覆盖、不重启生效）；apiKeys 数组引用替换、adminPass 密码版本进 HMAC。SETTINGS_META 是唯一真源。配额计费的 `model_prices` 定价表（上游模型名 key，支持 `*` 通配）也存这里（2026-08-15，QUOTA.md §4） |
 | `modelmap.ts` | 模型映射持久化层（后台设置页「模型映射」）：model_aliases 表 CRUD，调用方同步进 cfg.modelMap 即时生效；db 挂返回空不抛 |
 | `ratelimit.ts` | 每 key RPM 限流器：60 个 1 秒桶滑动窗口，拒绝也计数（防攻击者靠连拒永不占窗），惰性清零 + prune 防 Map 膨胀。全同步无 await |
 | `secrets.ts` | 管理面加密密钥：secret.key/GATEWAY_SECRET → sha256 派生 32B，AES-256-GCM（1:<b64(iv‖tag‖ct)>）。任何失败返回 null，加密设施绝不成代理链路故障源 |
@@ -180,19 +193,35 @@ dsml / deepseek 的直通链 + sse 的 `parseOpenAISSE`**，其余是改造前�
 ## 管理面与数据层
 
 **管理面板** `/__admin`（admin.ts 单文件内联 HTML，与 `/__dash` 共用登录，
-默认 admin/13141516，Origin 校验防跨站表单锁定）：
+默认 admin/13141516，Origin 校验防跨站表单锁定；**i18n 三语 en/zh/ja**，2026-08-15
+ja 全量，check-i18n.mjs 三语言对称核对；账号列表卡片网格 + 总览 KPI 卡化 +
+设置页分组 + 详情 5 tab + 性能仪表盘区块 + 数字 spinner，全部内联 JS 零依赖）：
 
 - 登录鉴权：`POST /__admin/api/login`、`POST /__admin/api/logout`、`GET /__admin/api/config`
-- 账户：`/__admin/api/accounts/*`（CRUD + `:id/usage-gateway` 网关实际用量 + 明文 key 端点，进程内解密）
-- 分发密钥：`GET/POST /__admin/api/tokens`、`PATCH/DELETE /__admin/api/tokens/:id`、`GET /__admin/api/tokens/stats`
+- 账户：`/__admin/api/accounts/*`（CRUD + `:id/usage-gateway` 网关实际用量 + `:id/keys/plain`
+  上游 key 明文复制（H2，admin 会话 + Origin 双校验）+ 明文 key 端点，进程内解密）
+- 分发密钥：`GET/POST /__admin/api/tokens`、`PATCH/DELETE /__admin/api/tokens/:id`、
+  `GET /__admin/api/tokens/stats`（PATCH 额外接受配额字段 `quotaUsd/quotaTokens/quotaRequests/
+  quotaCycle/expiresAt`，2026-08-15 QUOTA）
+- key 池管理（2026-08-15）：`GET /__admin/api/keys/usage?rangeDays=N`（全部 key 窗口用量）、
+  `POST /__admin/api/keys/:fp/disable` / `:fp/reset`（手动启停，掩码指纹，manual 持久化 / reset 恢复）
 - 控制台通道：`/__admin/api/console/*`（import-cookie + account/:id/{billing,workspaces,usage,
   usage/cost-by-day,usage/models,usage/users,members,keys,providers,budgets,budgets/users-status,models-pricing}）
-- 旧版通道：`/__admin/api/legacy/*`（account/{id}/... keys/go/billing，服务端 TTL 缓存 LegacyTtlCache 30s）
+- 旧版通道：`/__admin/api/legacy/*`（account/{id}/... keys/go/billing，服务端 TTL 缓存
+  LegacyTtlCache 30s；`account/:id/go-toggle` 改 **PUT** 且 body 只带被切换键
+  `{useBalance?}|{chinaModels?}`，2026-08-15 契约；`GET /__admin/api/legacy-key/:id/plain`
+  旧版 key 明文复制）
+- 模型授权（2026-08-15，MODEL-ACCESS.md）：`GET /__admin/api/model-access`（全局+各 key 授权全量，
+  含 pricing 可选项）、`PUT /__admin/api/model-access/global`（settings allowedModels，可任意模型名）、
+  `PUT /__admin/api/model-access/keys/:type/:subject`（token/api-key/upstream-key 自定义授权）
 - 热配置：`GET/PATCH /__admin/api/settings`、`GET /__admin/api/settings/keys/:index/plain`
 - 审计/请求：`GET /__admin/api/audit`、`GET /__admin/api/requests`、`GET /__admin/api/requests/stats-by-ip`、
   `GET /__admin/api/overview/trend`
 - 模型：`POST /__admin/api/models/refresh`（订阅目录定时刷新 + 手动）、`PUT/DELETE /__admin/api/model-aliases/:alias`
 - OAuth：`POST /__admin/api/oauth/start`、`POST /__admin/api/oauth/poll`
+- 性能面板（2026-08-15）：`GET /__admin/api/performance`（进程 RSS/CPU/负载/并发门/延迟分位/池状态，
+  10s TTL 缓存 + 延迟查询 LIMIT 1000 防扫描）
+- OTA（2026-08-15，OTA.md）：`GET /__admin/api/update/check`、`POST /__admin/api/update/perform`
 
 **数据面端点**：`POST /v1/chat/completions`、`POST /v1/messages`、
 `POST /v1/messages/count_tokens`（本地估算不转上游，只落库不进内存指标）、
@@ -208,6 +237,12 @@ dsml / deepseek 的直通链 + sse 的 `parseOpenAISSE`**，其余是改造前�
 | `admin_audit` | 管理面操作审计（op/account_id/ok/note/ip，脱敏摘要） |
 | `accounts` | 多账号（keys_enc/cookie_enc/oauth_refresh_enc 加密、allowed_models 账号级白名单、legacy_workspace_id） |
 | `settings` | 热配置（key-value，settings.ts 唯一真源 SETTINGS_META） |
-| `tokens` | 分发密钥（fingerprint sha256 前 24 hex、token_enc 按 DDL 保留恒 NULL、rpm_limit） |
+| `tokens` | 分发密钥（fingerprint sha256 前 24 hex、token_enc 按 DDL 保留恒 NULL、rpm_limit、**配额列**：quota_usd/quota_tokens/quota_requests/quota_used_*/quota_cycle/quota_reset_at/expires_at，2026-08-15 QUOTA.md §1） |
+| `model_access` | **2026-08-15 新增**：密钥-模型授权（subject_type token/api-key/upstream-key + subject_id sha256 + models JSON，行存在=已配自定义，MODEL-ACCESS.md） |
 | `model_aliases` | 模型映射（alias UNIQUE） |
 | `key_totals` | **2026-08-14 新增**：按 key 累计 requests/ok/failed/input/output_tokens/last_at/min_at 聚合表；flush 同事务 upsert（口径与 byKey 一致），prune 随 requests 窗口重建，旧库升级时按 requests 现存量初始重建 |
+
+另有两个进程内持久化小文件（`data/`，原子写，2026-08-15 绊脚石轮）：
+- `data/pool-disabled.json`：keypool 冷却持久化（`{fp:{until,reason}}`，重启恢复禁用；manual/auth/
+  quota-exhausted 才持久化，reapRecovered/reset 清除；旧 `{"fp":ts}` 格式兼容迁移）
+- `data/revoked-sessions.json`：已撤销面板会话（重启后仍生效）

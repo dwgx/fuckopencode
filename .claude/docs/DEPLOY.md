@@ -13,8 +13,8 @@
 **这是唯一进入通道，务必备份。** 丢了只能走 VPS 控制台（VNC / 网页终端）重新植入公钥。
 
 机器资源紧（2 核 / 1.9G 内存），上面还跑着 xray、x-ui、cloudflared、blog、fail2ban。
-网关的 systemd unit 里有 `MemoryMax=400M` + `OOMScoreAdjust=500`，
-刻意保证网关绝不挤掉 xray。改 unit 时别把这两行删了。
+网关的 systemd unit 里有 `MemoryMax=320M`（实测线上值；曾漂移为 400M，2026-08-16
+修正）+ `OOMScoreAdjust=500`，刻意保证网关绝不挤掉 xray。改 unit 时别把这两行删了。
 
 ## 部署形态
 
@@ -30,6 +30,8 @@
 | env | `/root/fuckopencode/fuckopencode.env`，权限 600 |
 | node | v22.20.0（`/usr/local/bin/node`） |
 | 依赖 | 无 `node_modules` —— 零运行时依赖，只需 `dist/` |
+| 版本 | dist/version.txt = `0.3.0`（tag v0.3.0 已发）；但线上 dist 实际含 v0.3.0 **之后**的
+  工作树改动（配额计费/UI 重构/绊脚石/性能面板/i18n ja，尚未 commit，见 PLAN.md） |
 
 服务器上没有源码，也没有 git remote，**所以不能 `git pull` 更新**，
 只能从本地构建后推 `dist/`。
@@ -58,6 +60,28 @@ cd fuckopencode
 [deploy.sh](../../scripts/deploy.sh)（本地构建 → 推 dist → 原子替换 → 重启 →
 健康检查），不走 install.sh。OTA 自更新到货后，nbus 的日常小版本也可靠 OTA
 免登录更新，deploy.sh 保留为手动回滚点。
+
+## Windows 部署（install.ps1）
+
+Windows 用 [scripts/install.ps1](../../scripts/install.ps1)（PowerShell 5.1+，
+零外部依赖，Windows 10 17063+ 内置 tar）：
+
+```powershell
+git clone <仓库地址>
+cd fuckopencode
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+- 与 install.sh 同源：GitHub API 取最新 tag → 下载 dist tarball + sha256 校验 →
+  解压 → 生成 fuckopencode.env 最小模板 → Start-Process 后台启动（更新时先停旧实例）。
+- 安装目录：管理员 `%ProgramFiles%\fuckopencode`，普通用户 `%USERPROFILE%\fuckopencode`，
+  `$env:FC_INSTALL_DIR` 覆盖。
+- 网关只读 `process.env`，Windows 下 env 由启动包装脚本 `start-fuckopencode.cmd`
+  （手动重启 / 计划任务开机自启用）读取并注入进程环境，与 systemd
+  `EnvironmentFile` / install.sh nohup 的 source 语义一致。
+- 与 Linux/macOS 的差异：无 systemd/launchd 托管，进程崩溃不会自动拉起；
+  开机自启用脚本打印的 schtasks 命令（`/SC ONLOGON`，当前用户登录时启动）。
+- Windows 上 npm 构建（`npm run build` → `node dist/main.js`）同样可用，等价 `--source` 模式。
 
 ## 更新流程
 
@@ -104,7 +128,7 @@ PR 触发，node 22/24 × typecheck + test + build）。发版走 tag：
 
 | 变量 | 说明 |
 |---|---|
-| `OPENSEA_KEYS` | 上游 key 池，逗号分隔。当前 2 个（`****0osU` / `****ZOBb`，面板可见状态）|
+| `OPENSEA_KEYS` | 上游 key 池，逗号分隔。当前池 key `****0osU` / `****7qpF`（ZOBb 已因 401 失效移除；0osU 周额度满、7qpF 主流量，面板可见状态）|
 | `API_KEYS` | 客户端 key。当前 1 个 |
 | `ANTHROPIC_BASE_URL` | `https://opencode.ai/zen/go`（**订阅**端点，cost=0）|
 | `PAYG_BASE_URL` | `https://opencode.ai/zen`（按量付费，仅 `-free` 模型走这里）|
@@ -119,7 +143,7 @@ PR 触发，node 22/24 × typecheck + test + build）。发版走 tag：
 | `KEY_PROBE_INTERVAL_MS` | 不设 = 900000（15 分钟）。`0` = 关闭探活 |
 | `KEY_PROBE_IDLE_MS` | 不设 = 3600000（60 分钟）。key 空闲超过这个时长才探 |
 | `KEY_PROBE_TIMEOUT_MS` | 不设 = 30000 |
-| `MAX_BODY_BYTES` | 不设 = 64MB（67108864）。**线上当前设 0（无上限）是认证客户端内存 DoS 面，建议改 33554432**（改 env 后 systemctl restart） |
+| `MAX_BODY_BYTES` | 不设 = 64MB（67108864）。**线上当前 32MB（33554432）**（2026-08-15 去盾轮由 0 改回，I-17 已修）|
 | `MAX_CONCURRENT_REQUESTS` | 数据面并发在飞上限，不设 = 400，`0` = 不限（不推荐：曾是该进程唯一 OOM 向量） |
 | `ADMIN_USER` | 面板登录账号，不设 = `admin` |
 | `ADMIN_PASS` | 面板登录密码，不设 = `13141516`（DEFAULT_ADMIN_PASS）。使用默认值时有 `adminPassIsDefault` 徽章 + stderr 告警，**上线必改** |
@@ -162,7 +186,7 @@ db 损坏 —— 任何一种情况都只打一行 warn，然后整个模块退�
 
 盘占用量级：每条请求约 100 字节，30 天保留期下几万行 ≈ 几 MB。清理是惰性触发的
 （跟着写入走，每 6 小时一次），不占常驻定时器 —— 那台机器 1.9 GB 内存、
-网关 `MemoryMax=400M`。
+网关 `MemoryMax=320M`。
 
 隐私口径与日志/面板一致：**只存 key 指纹（末 4 位），不存 key 原文，不存 IP/UA。**
 IP 和 UA 只在内存窗口里（200 条），长期留存反而是负担。

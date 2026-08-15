@@ -3,7 +3,7 @@
 状态：`确认` 有复现路径 / `可疑` 只是读代码推断 / `已修` 本轮修掉 / `设计取舍` 不是 bug
 / `已证伪` 曾被记为缺陷，但查证后不存在
 
-最后核对：2026-08-15（深度挖掘轮，`tsc --noEmit` 干净；行号随版本漂移，以源码为准）。
+最后核对：2026-08-16（文档同步轮；`tsc --noEmit` 干净；行号随版本漂移，以源码为准）。
 
 ## 已证伪（2026-08-09 第二轮核查）
 
@@ -150,6 +150,41 @@ rollback-guard.sh 判定 crashloop 时比对 `health 文件记录版本` 与
   注释标注「死代码 + 已知缺陷，勿在网关内启用」，不改行为
 - I-15 history/usageTrend/statsByIp 缓存返回内部引用 —— 本轮补修（见上）
 
+## 已修（2026-08-15 配额 BLOCKER/MAJOR + 绊脚石 + 收尾核查轮）
+
+### 配额计费对抗审查 1 BLOCKER + 3 MAJOR + 3 MINOR — 已修（见 QUOTA.md §8）
+
+- **B1**（$ 配额单位错配 1e8 倍，一用即满）：存储层统一 microCents（`usdToMicroCents`
+  ×1e8 / `microCentsToUsd` ÷1e8），API/UI 入参美元、视图全美元，校验/结算两侧同单位。
+- **M1**（流式断开 usage 不更新 → settle 扣 0）：两条流式路径累计已回显文本字符数，
+  断开按 `Math.max(已记 outputTokens, textChars/4)` 兜底。
+- **M2**（messages 缓存读免计 + 双路径 input 不一致）：`cache_read_input_tokens` 入 settle
+  —— $ 补 read 价、tokens 口径补回 cacheRead；chat 路径 cacheRead=0（不双算）。
+- **M3**（verify 10s 缓存 + 无条件累加 = 并发 N 倍超额）：settle 改逐口径条件 UPDATE
+  （已超限口径不扣，其余照扣），并发超额被封顶。
+- MINOR：m1 `model_prices` 放行 `'*'` 通配、m2 cycle 值变化无条件刷新 quota_reset_at、
+  m3/m4 QUOTA.md 文档（pricing key 用上游模型名 / 上游故障照实结算消耗配额）。
+
+### 绊脚石修复批 — 已修（ISSUES.md 相关项）
+
+- **I-11 面板用量 tab 三请求空转**：见上，已修。
+- 状态管理分散重启丢 → `data/pool-disabled.json`（keypool 冷却持久化）+
+  `data/revoked-sessions.json`（已撤销会话持久化），原子写。
+- 单位口径散落 → 新建 `src/money.ts` 单一换算权威，5 文件收敛（B1 复发面根治）。
+- 前端配额读服务端算好的 `exhausted/expired/remainingUsd`（删 ×1e8 手写比较）。
+- settings source 三元组（db/env/code-default），`EXCLUDE_OBSERVED` 单一常量（10 处 SQL
+  收敛），`scripts/check-i18n.mjs`（vm 真执行核对 data-i18n/T()/en==zh==ja）。
+
+### 收尾核查批 — 已修
+
+- 持久化键指纹碰撞 → **sha256 全量哈希**（旧 `****XXXX` 键加载兼容 + 写入迁移 + drop 双删）。
+- MINOR manual 365 天复活 → **哨兵 until（MAX_SAFE_INTEGER）**，只有 reset 恢复；manual
+  显示「永久停用」（修掉 9e15 超大地狱副作用）。
+- modelBlocks 持久化回退（恢复纯内存态，删 persistModelBlocks）。
+- X-Error-Scope 头删除（无消费者，含 CSRF 第三处死头）；M-3 retry-after 保留。
+- money.ts 收敛补全（server.ts 改 import microCentsToUsd）；写失败 warn + tmp 唯一后缀 +
+  persistDir 路径统一。
+
 ## 确认（未修）
 
 ### I-3 chat 路径与直通路径的 deepseek 适配是两套实现
@@ -206,21 +241,22 @@ MaxListenersExceededWarning。
   `removeListener`（server.ts writeChunk，行号随版本漂移，以源码为准）
 - 未构造复现（需要慢客户端 + 长流）；修复本身不改变数据面行为
 
-### I-11 面板用量 tab 三请求非 usage 视图每 2s 空转 — 确认（未修）
+### I-11 面板用量 tab 三请求非 usage 视图每 2s 空转 — 已修（2026-08-15 深度优化轮）
 
-`admin.ts` 的 `tick()`（[admin.ts:2958-2992](../../src/admin.ts)）每 2 秒无条件调用
-`fetchRequests()`/`fetchIpStats()`/`fetchAudit()`（`:2973-2975`），这三个请求渲染的
+`admin.ts` 的 `tick()` 每 2 秒无条件调用
+`fetchRequests()`/`fetchIpStats()`/`fetchAudit()`，这三个请求渲染的
 全是 `view-usage`（用量 tab）内容。`curView` 在非 `usage` 视图（总览/账户/密钥等）
 时，每次 tick 都白打 3 个请求，只更新隐藏 DOM，无人可见。
 
-- 审计 P2 确认（不涉及正确性，纯浪费；慢网络下还在 2s 无 in-flight 防护叠加，见 I-12）
-- 修法一行：tick 里 `if (curView === 'usage')` 才发这三个请求
+- 修法：tick 里 `if (curView === 'usage')` 才发这三个请求（admin.ts:4165-4168），
+  切到 usage 后下个 tick 自然补拉（2s 延迟可接受）。已随深度优化轮上线。
 
 ### I-12 面板 2s tick 无 in-flight 防护，慢网络请求叠加 — 确认（未修）
 
 `admin.ts` 的 `tick()` 与 `dashboard.ts` 每 2s 发一批请求，没有 in-flight 去重。
 慢网络下上一轮请求未返回，下一轮又发出，积压可叠加（与 I-11 同一批 tick 调用）。
 审计 P2 确认，建议给 tick 请求组加 in-flight 门（进行中跳过本轮）。
+2026-08-16 核对：tick 仍只有 `document.hidden` 早退，无 in-flight 去重，未修。
 
 ### I-13 flush() 整批丢弃面宽：transient 写失败连坐丢整批 — 确认（未修）
 
@@ -231,6 +267,7 @@ transient 失败（如 SQLite busy/lock）都连坐丢掉整个批（最多 50 �
 
 - 比文档宣称的「崩溃最多丢最后一批」更宽：transient 错误也丢
 - 修法：失败时把该批放回队首重试 1 次（仍失败再丢），避免无限重试拖住事件循环
+- 2026-08-16 核对：usagedb.ts:1039 注释仍写「不再重试这一批」，未修（在待办）
 
 ### I-14 早期错误（401/415）不消费 body 不关连接 → keep-alive 污染 — 确认（未修）
 
@@ -245,6 +282,9 @@ transient 失败（如 SQLite busy/lock）都连坐丢掉整个批（最多 50 �
 
 - 审计 F7 确认；修法与限流路径对齐：`req.resume()` + `connection: close`
 - 行号以源码为准（server.ts 频繁改动，此处不再钉死）
+- 2026-08-16 核对：并发门 503 / RPM 429 / 配额 403·429 / CSRF 403 等 readBody 前早退
+  路径都已有 `req.resume()` + `connection: close`；但纯鉴权 401（server.ts:3763）与
+  415（server.ts:3771/3784/3798）与 404（:3816）三条仍裸 `sendJson` 早退，未修
 
 ### I-15 history/trend/ipStats 缓存返回内部引用 — 已修（2026-08-15 深度挖掘轮）
 
@@ -272,21 +312,27 @@ transient 失败（如 SQLite busy/lock）都连坐丢掉整个批（最多 50 �
   回归测试 test/admin.test.ts「A-P2-1：多值 Origin 数组头 fail-closed」断言数组头拒绝
 - 状态：已修（admin.ts `originAllowed` 与 server.ts `adminOriginAllowed` 两处都是 fail-closed）
 
-### I-17 生产 MAX_BODY_BYTES=0（无上限）— 确认（部署配置问题，代码已安全）
+### I-17 生产 MAX_BODY_BYTES=0（无上限）— 已修（2026-08-15 去盾轮）
 
-代码默认 `maxBodyBytes = 64MB`（[config.ts:264](../../src/config.ts)），但线上
+代码默认 `maxBodyBytes = 64MB`（[config.ts:264](../../src/config.ts)），原线上
 `fuckopencode.env` 设了 `MAX_BODY_BYTES=0`（无上限）。大 body 整读进堆 +
 注入扫描/count_tokens 放大 = 认证客户端的内存/CPU DoS 面（配合 OOM 史）。
-审计 P1-E 确认，代码默认值已是 64MB，**待办是改线上 env**：`0 → 33554432`。
+2026-08-15 去盾轮已把线上 env 改为 **32MB（33554432）**，代码默认 64MB 不变，
+线上核验确认。
 
-### I-18 注入检测围栏降权吞 ignore-instr — 确认（未修）
+### I-18 注入检测围栏降权吞 ignore-instr — 确认（部分进展，围栏内仍不检测）
 
-`injection.ts` 的 `CODE_FENCE_SIGNAL_IDS`（[injection.ts:88-94](../../src/security/injection.ts)）
+`injection.ts` 的 `CODE_FENCE_SIGNAL_IDS`（[injection.ts:137-143](../../src/security/injection.ts)）
 只含 `fake-system-tag`/`role-takeover`/`leak-prompt` 等高危标记，**不含**
-`ignore-instr`/`ignore-instr-zh`（`:27/:32` 定义）。带语言标签的代码围栏整体降权、
+`ignore-instr`/`ignore-instr-zh`。带语言标签的代码围栏整体降权、
 只查这 5 个标记 —— 围栏内的「忽略以上指令」句式检测不到。定位是「降噪」不是
 安全边界（设计取舍区内已注明），但 ignore-instr 正是注入句式里最常用的，降权后
 基本失效。
+
+- 2026-08-15 进展：`ignore-instr`/`ignore-instr-zh` 已进 `STRONG_SIGNAL_IDS`
+  （普通文本命中即可与其他信号组合升级 high），`ignore-instr-zh` 正则「的」字
+  已修（review 波 2 M3）；但围栏降权清单 `CODE_FENCE_SIGNAL_IDS` 仍不含这两条，
+  **带语言标签围栏内的 ignore-instr 依旧检测不到** —— 记录为设计取舍，不动。
 
 ### I-19 文档漂移：DEEPSEEK-QUIRKS 行号过期 + 模型白名单零文档 — 已修（2026-08-14）
 

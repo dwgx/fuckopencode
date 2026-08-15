@@ -364,3 +364,186 @@ OpenAI ↔ Anthropic 协议转换网关（上游 opencode Zen 订阅 + DeepSeek�
   2. **「启用中国区模型」显示错**：zen API 无开关字段 → chinaModels 恒 false（用户实际启用）。修复：legacy go 端点**合并数据源**（Promise.all：zen 窗口 + cookie HTML 开关，mergeLegacyGoStatus）+ 测试 309 绿
   3. **smoke test 对照官网增强**：面板 Go 结构与官网 zen 直调对比（±5%，实测 Δ0）+ 开关与 cookie 页一致（抓到过真实 bug）+ 错误如实传递（400 + 模型名 + not allowed）
 - **验证**：全量 1511/1511 + typecheck + 部署 + smoke **19/19**（账号 6/7 chinaModels=true 正确、billing 恢复、Go 用量与官网一致）
+
+### 二十三、模型授权可添加任意模型 + 分发密钥刷新（用户实测）
+- **模型授权（agent 实现，1519 全绿）**：allowedModelsMeta 校验从「限硬底线」放宽为「任意合法模型名」（/^[a-z0-9._-]+$/ ≤100 ≤50）；**关键发现：resolveModel 原查硬常量 ALLOWED_MODELS 而非 globalAllowedModels**——加了 allowedModels 参数 + server 三处接线（checkModelGate/prepareOpenAIUpstreamRequest/handleMessagesPassThrough）传 effectiveGlobalModels(cfg)；目录门只对代码默认模型生效；前端全局白名单加「添加模型」输入 + datalist 补全（62 模型）+ chip 移除 + 重置回默认；默认行为不变（不配置 = deepseek 两模型）；e2e 3 处断言调整（glm-5 从拒绝变可扩展）
+- **分发密钥「没同步」**：tokenFingerprint 已含用量（非 fp 问题）；两个 token 用量不同是真实的（dwgxnbnb 5 请求 814 tokens，kirostudioapi 0——真没用过）；改进：进密钥页 loadTokens(true) 强制刷新（用量实时，60s TTL 仅限 tick）
+- **已部署**（v0.3.0 之后的工作树改动，未提交——下个版本 v0.3.1 或 v0.4.0）
+
+---
+
+## 二十四、配额计费系统对抗审查修复（2026-08-15，B1+M1+M2+M3+MINOR）
+
+对抗审查实锤 1 BLOCKER + 3 MAJOR + 3 MINOR，全部修复（详见 .claude/docs/QUOTA.md §8）：
+- **B1（$ 配额单位错配 1e8 倍，一用即满）**：quota_usd 存美元、used 累加 microCents、比较直接对上。
+  修复：存储层统一 microCents —— TokensStore create/update 入参美元 ×1e8（tokens.ts
+  usdToMicroCents/microCentsToUsd），view ÷1e8 回美元；admin.ts quotaParts 比较 ×1e8 对齐；
+  e2e「quotaUsd=5 + $1 → 不超限；跨 $5 → 429」。
+- **M1（流式断开 usage 不更新 → settle 扣 0）**：chat/messages 两流式路径累计已回显文本
+  字符数，断开时 Math.max(已记 outputTokens, textChars/4) 兜底（server.ts applyStreamedOutputEstimate）。
+- **M2（messages 缓存读免计 + 双路径 input 不一致）**：cache_read_input_tokens 入 settle ——
+  $ 定价补 read 价、tokens 口径补回 cacheRead；chat 路径 cacheRead=0（input 已含缓存不双算）。
+- **M3（verify 10s 缓存 + 无条件累加 = 并发 N 倍超额）**：settle 改逐口径条件 UPDATE
+  （已超限口径不扣，其余正常扣）+ 跳过日志。
+- **MINOR**：m1 model_prices 放行 '*' 通配；m2 cycle 值变化无条件刷新 quota_reset_at；
+  m3/m4 QUOTA.md 文档（pricing key 用上游模型名 / 上游故障照实结算消耗配额）。
+
+验证：`npx tsc --noEmit` 干净 + `vitest run test/{tokens,usagedb,e2e,admin,settings}.test.ts`
+656/656 全绿（另跑 toAnthropic/stream 87 绿）。未部署线上（工作树）。**B1 旧数据风险**：
+上线前 quota_usd 是美元语义会被按 microCents 解读（生产无存量配额 key，未迁移）。
+
+### 二十四、分发密钥配额计费系统 + UI 重构（2026-08-15）
+- **研究（2 agent）**：opencode 计费文档（cost_micro_cents=上游真实成本但订阅端点恒 0，需定价表兜底；上游 per-key 配额形态=member budgets）+ sub2api/new-api 配额架构（sub2api 完成时结算原子 UPDATE vs new-api 预扣→结算→退款）
+- **设计定稿 QUOTA.md**：完成时同步条件 UPDATE（不走 flush）+ verify 校验（expires 403 / 配额满 429 / model_limits 复用四级链）+ 三种配额（$ / tokens / requests）+ 周期重置（daily/monthly）+ 定价表（settings model_prices，上游模型名 key）+ count_tokens/probe 不消耗
+- **实现（2 agent + 修复 agent）**：tokens 表 9 配额列迁移 + settleQuota（条件 UPDATE + 滚窗）+ quotaCheck + server 数据面接线（429/403 形状）+ $ 口径（cost>0 用成本、=0 定价表）+ 面板配额 UI（编辑弹层/列表徽章/指纹）+ 详情页 5 组 tab（订阅&Keys/工作区&模型/财务/组织/定价，load* 全保留）
+- **对抗 review（1 agent）→ 1 BLOCKER + 3 MAJOR 已修**：
+  - B1 $ 单位错配 1e8 倍（quota_usd 美元 vs used microCents 直接比 → 一用即满）→ 存储边界统一 microCents + UI 语义 e2e
+  - M1 流式断开扣 0（usage 在尾 chunk）→ 断开按已回显文本估算 output（textChars/4）
+  - M2 messages 缓存读免费（input 减缓存）→ settle 补 cacheRead（read 价）+ 双路径总输入一致
+  - M3 并发 N 倍超额（10s 缓存 + 无条件累加）→ settle 逐口径条件 UPDATE（超限不扣）
+  - MINOR：`*` 通配定价放行、cycle 切换刷窗口起点、文档（上游模型名/上游故障消耗配额）
+- **验证**：全量 1563+ 全绿（修复后），typecheck + 部署上线
+
+### 二十五、quota-exhausted key 反复被选 + max_tokens 400（用户实测）
+- **问题**：① 0osU（gmail 周额度 100%）重启后冷却丢失重新被选（14:35 禁→重启→15:13 再撞 429）——keypool 冷却是进程内态 ② 客户端 max_tokens 超上限（如 500000）→ 上游 400 "Invalid max_tokens [1,393216]" 风暴（面板 15:14 一堆 400）
+- **根因**：keypool 冷却不持久化（重启即丢）；池 key（OPENSEA_KEYS 挂 env 账号）探活被「有真实流量活着」跳过（kirostudio 持续打）→ 只靠真实流量撞
+- **修复**：
+  1. **max_tokens 上限钳制**：deepseek.ts DEEPSEEK_MAX_MAX_TOKENS=390000（留余量），直通 + chat 两路径钳制（实测 500000 → 200）
+  2. **keypool quota-exhausted 长冷却持久化**：KeyPoolOptions.persistDisabled（load/save）+ 构造恢复（重启加载禁用）+ disableUntil 写入（quota-exhausted 才持久化）+ reapRecovered/reset 清除；main.ts 接线 data/pool-disabled.json 原子写
+  3. **keyprobe 启动即探**（startKeyProbe void tick()——重启立即发现坏 key，不等 interval）
+- **验证**：全量测试 + 部署 + 线上实测（500000→200；4 请求 1 个 429 撞 0osU → 禁 24h → pool-disabled.json 写入 {"****0osU":...} → 后续 200 走 7qpF；重启后从持久化恢复禁用）
+- **7qpF transient 286s**（15:14 池空）= 上游瞬时波动短冷却自动恢复（非持久问题，当前健康）
+
+### 二十六、面板 UI 重构轮（2026-08-15，只改 admin.ts + admin.test.ts）
+- **账号列表卡片网格**：`#accounts` → `grid repeat(auto-fill, minmax(min(100%,400px),1fr))`，一排 2-3 张紧凑卡；空态 `grid-column:1/-1`；≤40rem 单列。`.stats .stat, .d-stats .stat` KPI 卡化。
+- **设置页分组卡片**：4 组 `.settings-group`（服务=语言+模型映射 / 安全=管理员+API 密钥 / 运行=实验+OTA / 关于），全部 section id 保留（测试钉住）。
+- **Key 详情丰富**：keyRow 加「用量」弹层（GET /__admin/api/keys/usage?rangeDays=7，按 accountId+fingerprint 双条件匹配 data.keys[]，显示 requests/tokens/costMicroCents/lastAt）+「禁用/恢复」（POST /__admin/api/keys/:fp/disable|reset，掩码指纹）+ 卡片 keys 头「密钥」引导按钮（data-action=goto-tokens → switchView('tokens')）。
+- **go 开关接线**：change 委托改 `PUT /__admin/api/legacy/account/:id/go-toggle`，body 只带被切换键 `{useBalance?}|{chinaModels?}`（**服务端待并行 agent 实现，旧 POST /go/use-balance 已弃用**；失败回滚+sticky 保留）。
+- **控件体系**：全量 oc-*（oc-select/oc-check/oc-switch/oc-chip/oc-dot/oc-modal 已齐）；新写 `oc-tooltip`（纯 CSS data-tip 气泡）。触屏 `@media(hover:none)` 下 key-row 行内按钮常显。
+- **契约对齐**：keyUsage/toggleKeyState 原按任务草稿写 `/accounts/:id/keys/...`，review 发现服务端（并行 agent）实现是 `/keys/usage` + `/keys/:fp/disable|reset` → 已对齐到真实服务端契约。
+- **验证**：typecheck 干净；`npx vitest run test/admin.test.ts` 259/259；全量 1593/1593（34 文件）。新增 4 条 contract-guard 测试（keys 端点路径/掩码、PUT go-toggle、settings 分组、#accounts grid）。
+- **接口约定（给并行服务端 agent）**：① `PUT /__admin/api/legacy/account/:id/go-toggle`（body 单键）待实现；② keys/usage + disable/reset 已实现勿改路径；③ 手动 disable 为内存态（重启失效）——是否要持久化由服务端决策。
+
+### 二十六、UI 全面重构 + 全面 review（2026-08-15）
+- **UI 重构（agent）**：账号列表卡片网格（一排 2-3 张紧凑卡，≤40rem 单列）、总览 KPI 卡化、设置页分组（服务/安全/运行/关于 + 侧边导航）、key 行加「用量」弹层 + 禁用/恢复 + 「密钥」引导按钮、详情页 5 tab 保留、oc-tooltip 新控件、触屏可达
+- **transient 逻辑简化（用户明确）**：markFailure transient 分支去掉禁用（5xx/超时不禁用不显示，仅 failCount 累计）；policy 移除 transient 规则；auth/rate-limit/quota-exhausted 不变。面板不再出现「transient · 1m02s」
+- **0osU 突然健康核实**：代码无误清路径（reapRecovered/持久化加载/disableUntil 正确）；顺手修 removeKey 不移除持久化条目（面板移除重加后重启仍禁——来回跳的根因）
+- **go 开关 checkbox**：服务端链路已存在（setLegacyGoToggle + POST /legacy/account/:id/go/use-balance|china-models，测试覆盖）——之前「没做」是旧部署；前端已接线
+- **key 详情服务端**：keyUsageAll 聚合（usagedb）+ keypool disable/reset（manual reason）+ GET /keys/usage + POST /keys/:fp/disable|reset 端点 + 审计
+- **全面 review（主控浏览器逐页逐元素）**：总览/账号（卡片网格 + 新功能）/详情（5 tab）/用量（Key 池 transient 消失 + 0osU 持久化冷却 + 请求明细无新 400）/密钥/模型授权/设置（分组）——**console 零 error、Failed to fetch 消失、i18n 全对**（用户看到的 key 原文 = 旧 dist 缓存错配，新部署解决）
+- **验证**：全量测试（UI 重构 agent 1593 + 服务端 496 + 主控全量）+ 部署 + 浏览器逐页 review
+
+### 二十七、模型授权全局白名单可选模型网格（用户实测）
+- **问题**：全局白名单区块只显示已选的 2 个模型 + 手动「添加」输入（datalist 依赖详情页 pricing 缓存，跨视图不共享）——用户要「列出所有可以选择白名单的模型」
+- **实现**：服务端 GET /model-access 响应加 `pricing`（62 个上游模型名，从第一个有 console 凭据账号的 v2/config pricing 解析，失败空数组）；前端全局白名单区块加「可选模型（上游全部）」网格（已选高亮带 × / 未选点击添加 / 搜索过滤 / 缺失时回退 datalist）
+- **验证**：typecheck + 259 测试 + 部署 + 浏览器确认（62 模型全列出，deepseek 已选高亮，搜索可用）
+
+### 二十八、前端适配服务端新契约（2026-08-15，只改 admin.ts + 测试）
+- **quotaParts/quotaBadge 适配**（admin.ts ~4088-4128）：usedUsd 现在是美元（B1 后视图统一），直接 `'$'+toFixed(2)`，不再过 money()（会压成 $0.00）；删掉 `uUsd >= qUsd * 1e8` 手写比较，改读服务端算好的 `t.quota.exhausted/expired/remainingUsd`（跨周期窗口服务端按校验口径算好，前端推导会误报）；徽章过期红/耗尽 amber 直接读服务端字段；`t.quota || {}` 兜底保留。
+- **settings source 三元组**（admin.ts ~4851/4882）：SETTINGS_SRC 加 `'code-default': 'codeDefault'`，srcOf 改为 `T(SETTINGS_SRC[src] || 'sourceEnv')`——code-default 不再吞成 env。i18n 新增 codeDefault（'code default'/'代码默认'）en/zh 对称。
+- **money() 收敛**：内联 JS 无法 import TS 模块（零构建约束），保留独立 money()，注释标注「与 src/money.ts microCentsToUsd 同口径，勿改系数」；测试已断言 `/ 1e8` + money(4218000000)==='$42.18'。
+- **死词条清理**：8 个（previewBalance/legacyCount/cookieClear/otaConfirmBody/hFp/hUa/amount/tokenSaved）确认只在测试断言里引用（页面无 T()/data-i18n/间接引用），从 en/zh 字典删除 + 测试断言同步移除 → check-i18n 0 死词条 exit 0。
+- **验证**：typecheck 干净、`npx vitest run test/admin.test.ts` 259/259、`node scripts/check-i18n.mjs` exit 0（en/zh 534 对称）。
+
+### 二十八、绊脚石修复批（一批修复 + 一批 review + 真实测试，2026-08-15）
+- **架构审计（6 agent）**：六大绊脚石——状态管理分散重启丢、双路径镜像、单位口径散落、巨型单文件无构建、测试盲区、语义纠缠（详见对话报告）
+- **修复批（7 agent 并行）**：
+  - F1：gatewayPoolUsage 补 count_tokens / settings source 三元组（db/env/code-default）/ 429 X-Error-Scope 头（client-rpm/client-quota）/ revokedSessions 文件持久化（data/revoked-sessions.json 原子写）
+  - F2：新建 src/money.ts 单一换算（MICROCENTS_PER_DOLLAR + microCentsToUsd/usdToMicroCents）+ 5 文件收敛 + TokenQuotaView 全美元输出 + exhausted/expired/remainingUsd 服务端算好（B1 复发面根治）
+  - F3：persistDisabled 结构扩展 {fp:{until,reason}}（旧格式兼容迁移）+ auth/manual 持久化 + modelBlocks 持久化（data/model-blocks.json）
+  - F4：前端 quota 读 exhausted/expired（删 ×1e8 手写比较）+ settings source 三元组显示 + 死词条清理 8 个
+  - F5：EXCLUDE_OBSERVED 单一常量（10 处 SQL 收敛 + JS 谓词）+ tokenUsageAll 补 probe
+  - F6：scripts/check-i18n.mjs（vm 真执行核对 data-i18n/T()/en==zh/LOGIN_HTML）+ package.json verify script
+  - M 批：quotaView 跨周期 used 三口径归零（M-1）/ revokedSessions 加载单次写盘（M-2）/ client-quota retry-after = 距重置秒数（M-3）/ keyprobe 跳过 manual 禁用 key（m-1）/ persisted reason 枚举校验（m-3）
+- **review 批（1 agent）**：无 BLOCKER；3 MAJOR + V-1 全处理（V-1 确认生产无存量配额 key）
+- **真实测试批**：全量 1610+ 测试 + typecheck + check-i18n 0 warning + 部署 + **smoke 19/19**（对照官网 Go 用量 Δ0 + 开关一致 + 错误如实传递）+ 浏览器逐页（模型授权 62 网格 + 密钥页美元配额格式 + 设置分组 + 账号卡片）
+
+### 二十九、收尾核查修复（用户「最高质量」批准全修）
+- **3 个核查 agent + 主线**：点出 11 项（无 BLOCKER/MAJOR；无幻觉）
+- **修复（2 agent + 主线）**：
+  - P1 持久化键指纹碰撞 → **sha256 全量哈希**（旧 ****XXXX 键加载兼容 + 写入迁移 + drop 双删）
+  - MINOR manual 365 天复活 → **哨兵 until（MAX_SAFE_INTEGER）**，只有 reset 恢复；manual 显示「永久停用」（admin ×2 + dashboard ×1 + i18n）——修掉 9e15 超大地狱副作用
+  - modelBlocks 持久化**回退**（过度工程，恢复纯内存态，删 persistModelBlocks + 测试）
+  - X-Error-Scope **删除**（无消费者，含 CSRF 第三处死头）；M-3 retry-after 保留
+  - money.ts 收敛补全（server.ts:5128 改 import microCentsToUsd）
+  - P2 写失败 warn（diskStore + revoked catch）+ P3 tmp 唯一后缀（pid+时间戳）+ 路径统一（persistDir 参数，三文件同目录）
+- **验证**：全量 1618+ 测试 + typecheck + check-i18n 0 warning + 部署 + **smoke 19/19** + 线上旧格式迁移验证（0osU 冷却保留）
+
+### 三十、性能实测 + 性能面板 + i18n 全面清理 + ja 语言（2026-08-15）
+- **nbus 性能实测（agent 服务器实测）**：RSS 93MB（36% of 256M）、cgroup 44MB、**24h 零 OOM 零崩溃**（优化前白天 693 次 OOM）；load 0.03；healthz p50 0.47ms / models 0.58ms / 面板 2.05ms / 数据面 1.3s（网关本地 <1ms）；吞吐 healthz 935 rps / models 1250 rps 0 错误；**13/13 功能回归 PASS**（性能优化未破坏功能）。**docs/PERFORMANCE.md 落盘 + README 性能章节 + 复测命令**（开源展示）
+- **性能面板（总览 + 设置开关）**：GET /__admin/api/performance（进程 RSS/CPU/负载/并发门/延迟分位/池状态 + 10s TTL 缓存 + 延迟查询 LIMIT 1000 防扫描）→ 总览「性能」区块（仪表盘卡：内存条/CPU/负载 3 条/并发 bar/延迟 P50-P99/池健康）+ 设置「性能面板」开关（localStorage fc-perf 默认开）+ 侧边「性能」锚点 + i18n 15 词条
+- **i18n 全面清理（agent 审计 + 修复）**：A1 静态 10 处（kind 下拉/placeholder/title/key 前缀/登录页 title）；A2 字典 zh 值 15 条中文化（tokens→令牌/KEY→密钥/API key→API 密钥/旧版 API key→旧版 API 密钥等）；A3 服务端映射（disabledReason 枚举→中文（额度耗尽/凭据无效/限流/手动停用）、friendlyQuota resets in X days→X 天、表单校验 8 条高频）；**浏览器验证全部生效**（额度耗尽 · 10h17m06s / resets in 3 天 / 订阅下拉 / 令牌 / 密钥）
+- **ja 语言全量**：admin 572 词条 + LOGIN 8 + dashboard 94 + 三处接线（lang 检测/navigator/三态切换 zh→en→ja→zh + langJa 词条）；check-i18n.mjs 扩展三语言对称核对（en==zh==ja 572==572==572，0 warning）+ 修了 die 未定义 + IS_MAIN 符号链接 bug
+- **验证**：全量测试（+1 修正 LOGIN_HTML 三态断言）+ typecheck + check-i18n 0 warning + 部署 + smoke 19/19 + 浏览器（性能面板数据正确 + i18n 中文干净）
+- **遗留标注**：DEPLOY.md 的 MemoryMax=400M 是文档漂移（线上实际 320M）；表单校验其余 ~30 条英文待后续轮次
+
+---
+
+## 三十一、文档同步轮（2026-08-16，主控）
+
+**依据**：R1 排查报告（测试 1637/1637、typecheck 干净、工作树 38 文件未提交、
+67 commits、tag v0.2.0/v0.3.0、线上 0.0.0.0:8787 去盾后）+ `.claude/docs/*` 逐文档核对。
+只改文档，未动代码。
+
+- **ARCHITECTURE.md**：补去盾拓扑（FurCDN → 0.0.0.0:8787 直连无盾）；模块表补
+  money.ts（单一换算权威）/ modelaccess.ts（四级授权 store）；管理面补新端点
+  （model-access/performance/keys usage+disable+reset/legacy-key plain/go-toggle/update）；
+  数据层 tokens 配额列 + model_access 表 + pool-disabled/revoked-sessions 持久化文件；
+  面板 i18n 三语标注。
+- **ISSUES.md**：I-11 改已修（admin.ts:4165 `curView==='usage'` 门）；I-17 改已修
+  （线上 MAX_BODY_BYTES=32MB）；I-18 补部分进展（STRONG_SIGNAL 含 ignore-instr，但
+  围栏降权 CODE_FENCE_SIGNAL_IDS 仍不含，保持设计取舍）；I-12/I-13/I-14 源码实证仍未修
+  （各补 2026-08-16 核对行）；新增「配额 BLOCKER/MAJOR + 绊脚石 + 收尾核查」已修段。
+- **PLAN.md**：整体重写为当前待办（38 文件 commit+发版 v0.3.1/0.4.0 / ZOBb / OTA 真机
+  验收 / claude-fable-5 / TPM+IP 白名单 / a11y / 表单校验英文 / I-12·13·14）。
+- **DEPLOY.md**：MemoryMax 400M→**320M**（文档漂移修正，2 处）+ 版本行；MAX_BODY_BYTES
+  改已设 32MB；OPENSEA_KEYS 0osU/7qpF（ZOBb 移除）。
+- **QUOTA.md**：§9 补状态与 go-toggle 契约（PUT /legacy/account/:id/go-toggle，body 只带
+  被切换键 {useBalance?}|{chinaModels?}）。
+- **MULTI-ACCOUNT.md**：§11 legacy 补 go-toggle 契约（同批 UI 重构落地）。
+- **MODEL-ACCESS.md**：顶部补实现状态；§6 补 62 模型「可选模型」网格；步骤 7 测试基线去硬编码。
+- **OTA.md**：MemoryMax 修正（2 处）+ v0.3.0 已上线 + rollback 守卫 shell 4 场景实测全对
+  + 真机端到端验收待做。
+- **README.md**：特性补配额计费/模型授权/性能面板/懒人式 zen API/i18n 三语/OTA；
+  模型白名单改四级授权链（可扩展任意模型）；端点表补新端点；架构树补 money/modelaccess。
+- **CURRENT.md**：重写（v0.3.0 已发 + 工作树 38 文件待提交清单 + 待办 + 去盾后拓扑）。
+- **SHIELD.md**：已退役标注核对无误，未改；**docs/PERFORMANCE.md**：刚建、实测值准确，未改。
+
+---
+
+## 二十五、RPM 整体保护 + TPM + IP 白名单 + 过期确认（2026-08-16，主控直做）
+
+任务（对标 new-api 扩展，CURRENT.md 待办 5）：全局 RPM / per-token TPM / per-token IP 白名单 / token 过期时间确认。全部完成，验证全绿。
+
+### 交付
+1. **全局 RPM**（大量 RPM 不冲垮后端）：settings `globalRpmLimit`（默认 0 = 关闭，env GLOBAL_RPM_LIMIT 启动默认，面板热配）+ config.ts 可选字段。数据面 chat/messages 请求共用 RpmLimiter 的 `__global__` 滑窗（server.ts `checkGlobalRpmLimit`，GLOBAL_RPM_KEY=server.ts:2085），超限 429 rate_limit_error + Retry-After。count_tokens/healthz/静态不计入。与并发门（400）互补：并发门防同时堆积、RPM 防单位时间洪峰。
+2. **TPM**（per token 每分钟 token 上限）：tokens 表 `quota_tpm`（0=无限）+ ratelimit.ts `TpmLimiter`（固定自然分钟窗口）。**取舍：请求前检查已用（used>=limit→429），不做 max_tokens+input 预估预扣**（完成时累加真实用量零误差，与 settle 配额同哲学）；settle 时累加 input+output+cacheRead（与 tokens 配额口径一致）。TokenQuotaView + `quotaTpm/usedTpm`（usedTpm 是内存窗口，server 端点层填，store 视图恒 0）。
+3. **IP 白名单**（per token）：tokens 表 `ip_whitelist`（逗号分隔 IP/CIDR）+ tokens.ts `ipInList`（手写位运算 CIDR：IPv4/8、IPv6、`::ffff:` 映射归一）。**IP 来源 = remoteAddress（网关直连对端），不是转发头**——转发头可伪造；FurCDN 场景白名单填 CDN 边缘段。未命中 403 `ip not allowed`（Anthropic authentication_error / OpenAI invalid_request_error）。TokenQuotaView + `ipWhitelist`（数组）；create/patch 接受逗号分隔字符串。
+4. **token 过期**：**已有**（expires_at 列 + TokenQuotaInput/View/Update.expiresAt + quotaCheck expired→403 + 测试 `expires_at 过期：数据面 403`）。未改，确认跳过。
+
+### 契约（前端 agent 对接）
+- TokenQuotaView 新增：`quotaTpm`（0=无限）、`usedTpm`（当前分钟，内存窗口）、`ipWhitelist`（数组）、`expiresAt`（已有）。
+- POST/PATCH /__admin/api/tokens 新增接受：`quotaTpm`（非负整数）、`ipWhitelist`（逗号分隔字符串或 null/''=清除）、`expiresAt`（已有）。
+- settings 新增：`globalRpmLimit`（0=关闭默认）。
+- verify 顺序：status → quota(expires/exhausted) → TPM → IP → token RPM → 全局 RPM。
+
+### 文件
+src/tokens.ts（字段/视图/quotaCheck 扩展 + ipInList）、src/server.ts（三个 check 函数 + 接线 + 端点 + usedTpm）、src/ratelimit.ts（TpmLimiter）、src/usagedb.ts（quota_tpm/ip_whitelist 列）、src/settings.ts + src/config.ts（globalRpmLimit）。
+
+### 验证
+typecheck 干净；`tokens+ratelimit+server+settings+e2e` 395/395 绿 + usagedb+admin 358/358 绿（schema/settings 安全网）。
+**环境注记**：vitest 在本机并行 transform 偶发 admin.ts PARSE_ERROR（oxc 内存压力，非代码问题）——跑测试用 `--maxWorkers=1 --no-file-parallelism`。
+
+### 三十二、UI 优化 + RPM 保护 + 待办推进 + 深度研究修复（2026-08-16）
+- **UI（agent）**：收起状态卡片显示「在飞 n」徽章（就地刷新不重建）+ 标准 3 行额度压缩到右侧两栏 + a11y 22 处表单 label + 表单校验英文 47 条映射 + secret.key 备份提示（高亮警告）+ TPM/IP 白名单配置 UI
+- **RPM 后端保护 + 对标扩展（agent）**：全局 RPM（GLOBAL_RPM_LIMIT 默认关 + settings 热配，滑窗复用）+ **TPM**（quota_tpm + TpmLimiter 自然分钟窗口 + settle 累加真实用量）+ **IP 白名单**（ipInList 精确/CIDR/IPv6/::ffff: 归一，匹配 remoteAddress——FurCDN 语义已注明）+ 过期时间确认已有
+- **深度研究（explore）→ 最高价值修复**：
+  - **B1 上游熔断（默认开）**：连续 5 次头超时/网络错 → open 30s → 直接 502+Retry-After（不占并发槽不发上游）→ 半开放探测（60s 看门狗）→ 成功 close；上游 4xx/5xx 不计入
+  - F3 count_tokens 门（10 在飞并发门 + body 8MB）
+  - I-14 401/415/404 早退加 resume+connection:close（keep-alive 不污染）
+  - FurCDN-OriginRecovery 探针归观测口径（失败率不再 32% 吓人）
+  - **B2 聚合下探**：queryIpStats/tokenUsageAll 加 retention 窗口 + INDEXED BY 强制 at 索引（10 万行 86ms/79ms，对齐 history 修复）
+  - **I-13 flush 失败重试 1 次**（放回队首 + 200ms 重试，仍失败才丢）
+- **待办推进**：ZOBb 已彻底移除（env 0 + 7 天零请求）✓；OTA 验收（守卫 3 场景真实环境对 + 检查链 latest=v0.3.0 已最新，真实 OTA 更新待 v0.3.1 发版后触发）；claude-fable-5 无流量（客户端已切走，保持现状）
+- **验证**：全量 **1700/1700** + typecheck + 部署 + smoke 19/19（性能回归阈值 500ms 容并行负载）
+- **遗留**：key_events 缺口待验证（下次真实 disable 核对落行）；verifyCache 惰性清理（tokens 侧）；settings PATCH 校验消息 ~8 条英文；a11y 部分

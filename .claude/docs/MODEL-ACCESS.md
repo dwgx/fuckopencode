@@ -1,5 +1,11 @@
 # 密钥-模型授权（Key-Model Authorization）设计文档
 
+> **实现状态（2026-08-16 同步）**：已全部落地并部署（v0.3.0 内 + 后续工作树）。
+> 四级授权链（密钥自定义 > 账号级 > 全局默认 settings allowedModels > 代码硬底线），
+> 全局白名单**可添加任意合法模型名**（含 claude-*/gpt-* 等上游模型，`src/settings.ts:128-153`
+> 校验），「添加模型」透传上游、上游 400/404 如实回传。Model Access tab + 62 模型
+> 可选网格已上线。本文档含实现细节，改相关代码前必读。
+
 > 面向 windsurf 参考实现的「模型白名单 + 密钥授权」逻辑，语义对齐：
 > `windsurf/src/dashboard/model-access.js`（全局 allowlist/blocklist + defaultModel）、
 > `windsurf/src/auth.js isModelAllowedForAccount`（账号层过滤）、
@@ -20,13 +26,15 @@
 
 模型门现状（两条路径共用前置链，见 `ARCHITECTURE.md` §两条独立路径）：
 
-- 硬底线 = 代码常量 `ALLOWED_MODELS`（`src/deepseek.ts:37-40`，仅 flash/free 两个）。
-  `resolveModel`（`src/deepseek.ts:93-120`）做别名映射 + 白名单门 + 目录门（fail-open），
-  白名单外明确返回 `not-allowed`。
-- 全局门 `checkModelGate`（`src/server.ts:1687-1704`）：白名单/目录外统一 400
-  `sendModelNotAllowed`（`src/server.ts:1670-1678`），message 列出 `ALLOWED_MODELS`。
-  两个 handler 都调它：chat `src/server.ts:2551`、messages `src/server.ts:2894`。
-  池空时跳过（503 优先，`src/server.ts:1694-1697`）。
+- 代码默认 `ALLOWED_MODELS`（`src/deepseek.ts:37-42`，仅 flash/free 两个）= 默认值 +
+  重置基准（可扩展）。
+  `resolveModel`（`src/deepseek.ts:93-129`）做别名映射 + 白名单门 + 目录门（fail-open），
+  白名单外明确返回 `not-allowed`；白名单门按 `allowedModels` 参数（server 传
+  `effectiveGlobalModels(cfg)`），目录门只对代码默认模型生效。
+- 全局门 `checkModelGate`（`src/server.ts:2198-2229`）：白名单/目录外统一 400
+  `sendModelNotAllowed`（`src/server.ts:2166-2188`），message 列出生效白名单。
+  两个 handler 都调它：chat `src/server.ts:3276`、messages `src/server.ts:3704`。
+  池空时跳过（503 优先，`src/server.ts:2210`）。
 - 账号级过滤：`accounts.allowedModelsOf`（`src/accounts.ts:443-449`，缓存懒加载），
   PATCH 时同步缓存（`src/accounts.ts:456-466`、`update` `src/accounts.ts:269-281`）。
   消费点在选号闭包 `eligible`（`src/upstream.ts:105-111`）：
@@ -91,17 +99,24 @@ CREATE TABLE IF NOT EXISTS model_access (
 
 - 存在 `settings` 表（`src/usagedb.ts:611-615`），加入 `SETTINGS_META`：
   `allowedModels: { default: [...ALLOWED_MODELS], validate: allowedModelsMeta }`。
-  值 = JSON 数组（null/空数组 = 清键回代码默认）。**实现收紧（审查 MAJOR-1 同步）**：
-  校验层（allowedModelsMeta）对**硬底线外的模型直接拒绝**（400），对**空数组归一为
-  null**（= 清键回默认，绝不产生「全锁」的空集合）——与专用端点 handlePutModelAccessGlobal
-  语义一致，通用 settings PATCH 与专用端点共用同一校验，无分叉。
-- `applySettingsToConfig`（`src/settings.ts:157-166`）加一行：命中时设置
+  值 = JSON 数组（null/空数组 = 清键回代码默认）。**校验 = 任意合法模型名**
+  （`/^[a-z0-9._-]+$/`、≤100 字符、≤50 项、trim 去重）——**可添加 claude-*/gpt-*
+   等上游任意模型**，不再限硬底线（`src/settings.ts:128-153`）。空数组归一为
+   null（= 清键回默认，绝不产生「全锁」的空集合）——通用 settings PATCH 与专用
+   端点 handlePutModelAccessGlobal 共用同一校验，无分叉。
+- `applySettingsToConfig`（`src/settings.ts:203`）加一行：命中时设置
   `cfg.globalAllowedModels: ReadonlySet<string>`（AppConfig 新字段），默认 = `ALLOWED_MODELS`。
 - 启动合并、运行时 PATCH 走 settings 既有机制，无需新装配（`src/main.ts` 已 apply，
   见 settings.ts 文件头哲学 `src/settings.ts:4`）。
-- **硬底线不变**：`ALLOWED_MODELS` 代码常量仍是绝对上限（`checkModelGate` 原样跑）。
-  全局白名单只能收窄、不能放宽到常量之外——**常量外的模型在校验层就被拒绝**，
-  加了也存不进去（比「存了但过不了门」更省排查）。
+- **代码默认值不变**：`ALLOWED_MODELS` 常量（deepseek 两个）是**代码默认值 + 重置
+  基准**，可扩展。数据面 `resolveModel`（`src/deepseek.ts:99-129`）白名单门按
+  `allowedModels` 参数（server 传 `effectiveGlobalModels(cfg)` = settings 配置或默认）
+  放行；**目录门只对代码默认模型生效**（`∉ ALLOWED_MODELS` 的添加模型跳过
+  catalog gate），添加的模型直接透传上游，由上游裁决是否支持——上游 400/404
+  如实透传（「有什么错误给什么错误」）。
+- 数据面其他层：密钥级门 `clientKeyGate`（`src/server.ts:2344`）与上游选号
+  `eligible`（`src/upstream.ts:124`）本就读 `effectiveGlobalModels(cfg)`，添加的
+  模型在这些层自然放行，无需改动。
 
 ### 2.4 requests 表加列 `api_key_fp`（审计用）
 
@@ -126,11 +141,14 @@ ModelAccessStore {
 
 ## 3. 优先级链（授权语义，核心决策）
 
-**推荐：最具体的已配置层生效（替换语义），逐层回退；硬底线 `ALLOWED_MODELS` 恒在最外层。**
+**推荐：最具体的已配置层生效（替换语义），逐层回退；代码默认 `ALLOWED_MODELS`
+恒是最外层兜底（未配置时生效）。**
 
 ```
 客户端请求模型名
-  → resolveModel（别名→真名，src/deepseek.ts:93-120）→ 硬门：∉ ALLOWED_MODELS 或目录外 → 400（现有）
+  → resolveModel（别名→真名，src/deepseek.ts:93-129）→ 白名单门：
+      生效集 = effectiveGlobalModels(cfg)（settings 配置或代码默认）→ 外 → 400（现有）
+      目录门仅对代码默认模型生效；添加模型跳过 → 透传上游，由上游裁决
   → 客户端密钥授权：自定义(token/api-key) ?? 全局默认            [数据面入口 A]
   → 上游选号过滤（keypool acquire）：
       上游 key 自定义 ?? 账号级 allowedModels ?? 全局默认          [数据面入口 B]
@@ -139,13 +157,14 @@ ModelAccessStore {
 
 理由：
 
-- 与需求 4 一致：「自定义覆盖全局」= 配置了就用配置的（**可以比全局更宽**，只要在硬底线内）。
+- 与需求 4 一致：「自定义覆盖全局」= 配置了就用配置的（**可以比全局更宽**，只要
+  在生效白名单内）。
 - 与现有账号级语义一致：账号配了 `allowedModels` 就是该账号 key 的默认（`src/upstream.ts:108-109`
   当前即替换而非交集），密钥级是更细一层、盖过账号级。
 - **账号级位置**：作为上游 key 的**中位默认**（`key ?? account ?? global`），
   `PATCH accounts/:id allowedModels`（`src/admin.ts:224-227`）完全保留，不冲突。
-- 硬底线不变 → 默认情况下（全局=ALLOWED_MODELS、无任何 key 自定义）行为与现状逐字节一致，
-  迁移零风险。
+- 默认情况下（全局=ALLOWED_MODELS、无任何 key 自定义）行为与现状逐字节一致，
+  迁移零风险；配置了扩展白名单则添加的模型在数据面各层放行。
 
 替代方案（不推荐，记档）：每层取交集。会让「自定义比全局更宽」失效，违背需求 4。
 
@@ -204,8 +223,8 @@ ModelAccessStore {
 
 | 方法 | 路径 | 请求体 | 响应 | 说明 |
 |---|---|---|---|---|
-| GET | `/__admin/api/model-access` | — | `{ok, data:{global:{models,source:'settings'\|'code',core}, models:[可选项], keys:{tokens:[...], apiKeys:[...], upstreamKeys:[...]}}}` | 面板全量数据。`models` = `[...Object.keys(cfg.modelMap), ...ALLOWED_MODELS]`（与 `/v1/models` 同源，`src/server.ts:2383`）。每 key 带 `custom: string[]\|null`（null=跟随全局/账号） |
-| PUT | `/__admin/api/model-access/global` | `{models: string[]\|null}` | `{ok, data:{global}}` | null/空 = 删 settings 键回代码默认；否则校验（复用 `validateAllowedModels` 规则：≤50、非空项、trim 去重，`src/admin.ts:250-263`）后写 `settings['allowedModels']` + 应用 `cfg.globalAllowedModels` + 审计 |
+| GET | `/__admin/api/model-access` | — | `{ok, data:{global:{models,source:'settings'\|'code',core}, models:[可选项], keys:{tokens:[...], apiKeys:[...], upstreamKeys:[...]}}}` | 面板全量数据。`models` = `[...Object.keys(cfg.modelMap), ...ALLOWED_MODELS, ...effectiveGlobalModels(cfg)]`（自动补全候选；与 `/v1/models` 同源）。每 key 带 `custom: string[]\|null`（null=跟随全局/账号） |
+| PUT | `/__admin/api/model-access/global` | `{models: string[]\|null}` | `{ok, data:{global}}` | null/空 = 删 settings 键回代码默认；否则校验（`allowedModelsMeta`：≤50、trim 去重、**任意合法模型名**可含 claude-*/gpt-*，`src/settings.ts:126-153`）后写 `settings['allowedModels']` + 应用 `cfg.globalAllowedModels` + 审计 |
 | PUT | `/__admin/api/model-access/keys/:type/:subject` | `{models: string[]\|null}` | `{ok, data:{...}}` / 404 | `type ∈ {token, api-key, upstream-key}`；`models:null` = 删行清除自定义。校验 subject 真实存在：token 查 tokens 表、api-key 对 `cfg.apiKeys` 逐 sha256 比对、upstream-key 经新加的 `KeyPool.hasKeyWithHash(hash)`（池内 sha256 比对，不外泄原文）。审计 + 缓存失效 |
 
 - 面板侧掩码显示：token 用 `maskOf`（`src/tokens.ts:106-109`）、API key 用 `****XXXX` 格式、
@@ -223,11 +242,16 @@ ModelAccessStore {
 - **列表**：四段——全局白名单编辑器 + 上游 key 授权 + 分发 token 授权 + API key 授权。
   每 key 行显示：身份（掩码/名称/昵称）、所属账号（上游 key，来自 `store.list()`）、
   token 状态徽章（active/disabled）、当前生效模式徽章。
-- **全局白名单编辑区**：windsurf 式 chip 编辑（`windsurf/index.html:7468-7510` 同款：
-  chip 点击 toggle、search + provider 过滤、已选项单独一排带 ×）。附「重置为代码默认」
-  按钮与硬底线提示（ALLOWED_MODELS 中不可移除项灰显）。
+- **全局白名单编辑区**：chip 编辑 + **「添加模型」输入框**（逗号分隔，可添加任意
+   合法模型名，含 claude-*/gpt-* 等上游模型；自动补全来自 console pricing 模型名，
+   未加载时手动输入）。**「可选模型（上游全部）」网格（2026-08-15）**：GET
+   /model-access 响应加 `pricing`（62 个上游模型名，从第一个有 console 凭据账号的
+   v2/config pricing 解析，失败空数组），网格已选高亮带 ×、未选点击添加、搜索过滤、
+   缺失时回退 datalist。已选模型带 × 移除；「重置为代码默认」按钮保留（清键回
+   deepseek 两个）。提示行标注**代码默认值（重置基准）**，不再是「不可移除的硬底线」。
 - **密钥级编辑**：每行「编辑」→ modal（复用 `openConfirm` + chip 面板，同账号详情
-  `src/admin.ts:4531-4552` 的交互），含「跟随全局/跟随账号」清除按钮。
+  `src/admin.ts:4531-4552` 的交互），含「跟随全局/跟随账号」清除按钮。可授模型 =
+  全局白名单内模型（`maData.global.models`），不再限硬底线。
 - **搜索/筛选**：按名称/昵称/指纹搜索；按类型、按「已自定义/跟随默认」、按账号、按 token 状态筛选。
 - **状态徽章**：`自定义` / `跟随账号`（仅上游 key）/ `跟随全局`；token active/disabled。
 - **复制/导入导出/批量**：P2。导出/导入 = 整个 `model_access` + 全局的 JSON（当前
@@ -245,8 +269,10 @@ ModelAccessStore {
 
 1. **账号级 allowedModels 保留**：`PATCH accounts/:id`（`src/admin.ts:224-227`）不动；
    成为上游 key 的中位默认（§3）。密钥级自定义只盖住单 key。无 schema/语义冲突。
-2. **全局白名单 vs ALLOWED_MODELS 常量**：常量是硬底线（不迁移、不可放宽）；
-   settings 白名单是可变默认。设 null 即回常量 → 行为与现状一致。
+2. **全局白名单 vs ALLOWED_MODELS 常量**：常量是**代码默认值 + 重置基准**（可扩展）；
+   settings 白名单是可变默认，可含 claude-*/gpt-* 等任意合法模型名。设 null 即回
+   常量 → 行为与现状一致。添加的模型过模型门透传上游，由上游裁决支持与否
+   （上游 400/404 如实透传）。
 3. **双入口编辑同一密钥**（token 既在 Keys tab 管 RPM，又在 Model Access 管模型）：
    互不干扰，RPM 在 `tokens.rpm_limit`（`src/usagedb.ts:629`），模型在 `model_access`。
 4. **审计归因**：模型拒绝此前只能看到 status=400 + 全局 message；本次加 `api_key_fp` 列 +
@@ -301,13 +327,15 @@ ModelAccessStore {
 - **回归**：tab 按钮缺失 → 检查红。
 
 ### 步骤 7：全量
-`npm test`（1297 基线 + 新增全绿）、`npm run typecheck`、`npm run build`。
+`npm test` 全绿（新增 model-access 用例）、`npm run typecheck`、`npm run build`。
 CURRENT.md 更新（新功能 + 端点 + 表结构）。
 
 ## 9. 明确决策点（已拍板，实现时别回退）
 
 1. 授权是**替换语义**（配置层覆盖低层），不是交集。
-2. 硬底线 `ALLOWED_MODELS` 不可被任何配置放宽；全局白名单只收窄。
+2. 代码默认 `ALLOWED_MODELS` 是**默认值 + 重置基准**（可扩展）；settings 全局
+   白名单可添加任意合法模型名（claude-*/gpt-* 等）。添加的模型过模型门透传
+   上游，由上游裁决（上游 400/404 如实透传）。
 3. 客户端密钥门在**选号之前**（入口 A 前置，400 语义与现有全局门一致）。
 4. `count_tokens`、`/v1/models` **不设门**（P1）；`/v1/models` 按密钥过滤列为 P2。
 5. 上游 key / API key 的 subject = sha256 全 hex；token 复用现有指纹。
