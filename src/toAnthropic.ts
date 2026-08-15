@@ -465,6 +465,10 @@ export async function* openAIStreamToAnthropic(
   }
 
   const anthropicUsage = openAIUsageToAnthropic(usage, options.scale);
+  // 真实 input_tokens（未缩放）与 cache_read_input_tokens（M2）：与 output 不同源
+  // 传递 —— output 走 scale（SCALE_CLIENT_TOKENS 是给客户端看的失真值），input/
+  // cacheRead 保持真实，否则实验开关污染网关自身记账。
+  const rawUsage = openAIUsageToAnthropic(usage, undefined);
   yield {
     type: 'message_delta',
     delta: {
@@ -480,9 +484,11 @@ export async function* openAIStreamToAnthropic(
     // thinking（F1）：reasoning_tokens 由 anthropicUsage 折进 output_tokens_details
     // （与 output_tokens 同源同 scale，非流式已记账、流式此前漏掉恒 0）。不放
     // 这里 server 直通流式路径取不到 thinking 用量。
+    // M2：cache_read_input_tokens 一并传给 server，settle 侧 $/tokens 口径补计。
     usage: {
       output_tokens: anthropicUsage.output_tokens,
-      input_tokens: openAIUsageToAnthropic(usage, undefined).input_tokens,
+      input_tokens: rawUsage.input_tokens,
+      ...(rawUsage.cache_read_input_tokens != null ? { cache_read_input_tokens: rawUsage.cache_read_input_tokens } : {}),
       ...(anthropicUsage.output_tokens_details != null
         ? { output_tokens_details: anthropicUsage.output_tokens_details }
         : {}),

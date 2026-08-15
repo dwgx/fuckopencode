@@ -18,6 +18,7 @@ import type { KeyPool, PoolKeySnapshot, UpstreamFailureKind } from './keypool.js
 import type { SecretKey } from './secrets.js';
 import type { AccountRow, AccountUpdate, UsageDb } from './usagedb.js';
 import type { AppConfig } from './config.js';
+import { MICROCENTS_PER_DOLLAR } from './money.js';
 
 /** 账户类型。`unknown` 时探针默认打订阅端点（MULTI-ACCOUNT.md §4.4）。 */
 export type AccountKind = 'subscription' | 'payg' | 'unknown';
@@ -107,6 +108,11 @@ export interface AccountSectionItem {
   lastBillingAt: number;
   /** 账号级模型白名单；null = 未配置（用全局白名单）。 */
   allowedModels: string[] | null;
+  /** 该账号 legacyKey 指纹与池 key 或其他账号 legacyKey 相同（同 key 共用检测）。
+   *  如账号 6 legacyKey=7qpF 与 env 池 key 同源 → true。 */
+  duplicateKey: boolean;
+  /** 共用的归属账号名（池 key 未入账户表时为 'env'）；未重复 null。 */
+  duplicateKeyWith: string | null;
   /** 该账户的 key 卡片（来自 pool 快照，服务端组装，不解密任何东西）。 */
   keys: AccountKeyView[];
 }
@@ -677,9 +683,41 @@ export function buildAccountsSection(store: AccountsStore, pool: KeyPool, now: n
     return { degraded: store.disabledReason, list: [] };
   }
   const snap = pool.snapshot();
-  const list: AccountSectionItem[] = store.list().map((acc) => {
+  const accounts = store.list();
+  // 同 key 共用检测：指纹 → 归属账户 id 集合（池 key 的 accountId 0 = env 未入表，
+  // 用 -1 占位；各账户 legacyKey 也计入）。同一指纹被多个归属持有 → 重复。
+  const fpOwners = new Map<string, Set<number>>();
+  const addOwner = (fp: string, id: number) => {
+    let s = fpOwners.get(fp);
+    if (!s) { s = new Set(); fpOwners.set(fp, s); }
+    s.add(id);
+  };
+  for (const k of snap) addOwner(k.fingerprint, k.accountId === 0 ? -1 : k.accountId);
+  for (const a of accounts) {
+    const lk = store.legacyKeyOf(a.id);
+    if (lk) addOwner(keyFingerprint(lk), a.id);
+  }
+  const ownerName = (id: number): string =>
+    id === -1 ? 'env' : (accounts.find((a) => a.id === id)?.name ?? 'env');
+  const list: AccountSectionItem[] = accounts.map((acc) => {
     // nickname 由 store 解密映射（fingerprint → nickname），不外发明文 key。
     const nicknames = store.keyNicknameMap(acc.id);
+    // 本账户 legacyKey 的指纹归属集合里，存在非本账户的归属 → 同 key 共用。
+    let duplicateKey = false;
+    let duplicateKeyWith: string | null = null;
+    const lk = store.legacyKeyOf(acc.id);
+    if (lk) {
+      const owners = fpOwners.get(keyFingerprint(lk));
+      if (owners) {
+        for (const o of owners) {
+          if (o !== acc.id) {
+            duplicateKey = true;
+            duplicateKeyWith = ownerName(o);
+            break;
+          }
+        }
+      }
+    }
     return {
       id: acc.id,
       name: acc.name,
@@ -696,16 +734,18 @@ export function buildAccountsSection(store: AccountsStore, pool: KeyPool, now: n
       // 控制台凭据是否存在（cookie 或 OAuth refresh）——前端用它区分
       // 「未接入（无凭据）」vs「已连接待同步（有凭据但余额还没抓到）」。
       hasConsole: store.cookieOf(acc.id) != null || store.getOauthRefresh(acc.id) != null,
-      // 库内全程整数 units（1e8 = $1），API 层以美元两位小数呈现（§6.2）。
-      balance: acc.balanceUnits == null ? null : Number((acc.balanceUnits / 1e8).toFixed(2)),
-      monthlyLimit: acc.monthlyLimitUnits == null ? null : Number((acc.monthlyLimitUnits / 1e8).toFixed(2)),
-      monthlyUsage: acc.monthlyUsageUnits == null ? null : Number((acc.monthlyUsageUnits / 1e8).toFixed(2)),
+      // 库内全程整数 units（1e8 = $1，money.ts），API 层以美元两位小数呈现（§6.2）。
+      balance: acc.balanceUnits == null ? null : Number((acc.balanceUnits / MICROCENTS_PER_DOLLAR).toFixed(2)),
+      monthlyLimit: acc.monthlyLimitUnits == null ? null : Number((acc.monthlyLimitUnits / MICROCENTS_PER_DOLLAR).toFixed(2)),
+      monthlyUsage: acc.monthlyUsageUnits == null ? null : Number((acc.monthlyUsageUnits / MICROCENTS_PER_DOLLAR).toFixed(2)),
       monthlyPercent:
         acc.monthlyLimitUnits == null || acc.monthlyLimitUnits <= 0 || acc.monthlyUsageUnits == null
           ? null
           : Number(((acc.monthlyUsageUnits / acc.monthlyLimitUnits) * 100).toFixed(1)),
       lastBillingAt: acc.lastBillingAt,
       allowedModels: acc.allowedModels,
+      duplicateKey,
+      duplicateKeyWith,
       keys: snap
         .filter((k) => k.accountId === acc.id)
         .map((k) => ({

@@ -46,6 +46,16 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { parseUserAgent } from './metrics.js';
 
+/** 聚合口径统一的「观测流量」排除（probe=探活、count_tokens=Claude Code 计数）——所有聚合共用。 */
+const EXCLUDE_OBSERVED = `endpoint NOT IN ('probe','count_tokens')`;
+
+/** JS 侧判断一行是否属「观测流量」（不计入聚合），与 EXCLUDE_OBSERVED 同口径。
+ *  额外处理 NULL endpoint（旧库行）：SQL `NOT IN` 天然排除 NULL，JS 侧必须显式
+ *  对齐，否则 rebuild（SQL）与增量（JS）双口径漂移，同批行数字不一致。 */
+function isObservedEndpoint(endpoint: unknown): boolean {
+  return endpoint == null || endpoint === 'probe' || endpoint === 'count_tokens';
+}
+
 /** 单条请求记录（写入用）。字段与 `metrics.RequestEvent` 对齐，但只保留可长期留存的部分。 */
 export interface UsageRow {
   at: number;
@@ -140,6 +150,25 @@ export interface KeyFingerprintUsage {
   inputTokens: number;
   outputTokens: number;
   costMicroCents: number;
+}
+
+/**
+ * 单个 key 指纹在窗口内的用量聚合（GET /__admin/api/keys/usage 的数据源）。
+ * ok/failed 口径与 history().byKey / queryTrend 一致：ok: 200<=status<300，
+ * failed: status>=400 或 status=0；tokens = inputTokens + outputTokens。
+ * 只含 DB 侧统计 —— 账号归属/昵称/健康态由端点层按 pool 快照 + store 合并。
+ */
+export interface KeyUsageAggregate {
+  fingerprint: string;
+  requests: number;
+  ok: number;
+  failed: number;
+  inputTokens: number;
+  outputTokens: number;
+  tokens: number;
+  costMicroCents: number;
+  /** 窗口内最后一次请求时刻；无请求为 0。 */
+  lastAt: number;
 }
 
 /**
@@ -357,6 +386,9 @@ const IP_STATS_CACHE_MS = 10_000;
 /** 分发 token 用量聚合的缓存时长（tokenUsageAll，同 statsByIp 承重设计）。 */
 const TOKEN_USAGE_CACHE_MS = 10_000;
 
+/** 全 key 用量聚合的缓存时长（keyUsageAll，同 statsByIp 承重设计）。 */
+const KEY_USAGE_CACHE_MS = 10_000;
+
 /** 趋势聚合的缓存时长（usageTrend，同 statsByIp 承重设计）。 */
 const TREND_CACHE_MS = 10_000;
 
@@ -366,6 +398,15 @@ const TREND_CACHE_MS = 10_000;
  */
 const REQUEST_BATCH_MS = 100;
 const REQUEST_BATCH_MAX = 50;
+
+/**
+ * flush 失败重试（I-13）：写入事务 transient 失败（SQLite busy/lock，部署重叠
+ * 或长查询期间常见）时，把该批放回队首等这么久后重试一次 —— 不再整批连坐丢
+ * 掉最多 50 条真实请求记录。重试仍失败才丢弃（见 flush()）。
+ */
+const FLUSH_RETRY_MS = 200;
+/** 单批最多重试次数。1 = 首次失败放回队首重试一次，仍失败丢弃。 */
+const FLUSH_RETRY_MAX = 1;
 
 /**
  * 首次清理的宽限期。进程启动后等这么久才允许惰性清理跑第一次，
@@ -424,6 +465,8 @@ export class UsageDb {
   private pendingRows: Array<{ at: number; args: unknown[] }> = [];
   private pendingTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingLastAt = 0;
+  /** flush 连续失败次数（I-13）：首次失败放回队首重试，仍失败才丢弃；成功清零。 */
+  private flushRetries = 0;
   private retentionMs: number;
   /**
    * 下次允许清理的最早时刻。
@@ -448,6 +491,8 @@ export class UsageDb {
   /** 分发 token 用量聚合缓存（10s TTL，tokenUsageAll）。 */
   private tokenUsageCache: Map<string, KeyFingerprintUsage> | null = null;
   private tokenUsageCacheAt = 0;
+  /** 全 key 用量聚合缓存（10s TTL，按 rangeDays 分桶存，keyUsageAll）。 */
+  private keyUsageCache = new Map<number, { at: number; data: KeyUsageAggregate[] | null }>();
   /** 趋势聚合缓存（10s TTL，按 rangeDays 分桶存，usageTrend）。 */
   private trendCache = new Map<number, { at: number; data: UsageTrend | null }>();
   /** 降级原因（面板可显示，便于知道「为什么没有历史数据」）。 */
@@ -674,6 +719,17 @@ export class UsageDb {
         note TEXT,
         prefix TEXT NOT NULL DEFAULT 'tk',
         rpm_limit INTEGER NOT NULL DEFAULT 0,  -- 每分发 key 的 RPM（0 = 不限流，见 ratelimit.ts）
+        quota_usd REAL NOT NULL DEFAULT 0,          -- $ 配额（0 = 无限，QUOTA.md §1）
+        quota_tokens INTEGER NOT NULL DEFAULT 0,    -- token 配额（0 = 无限，input+output）
+        quota_requests INTEGER NOT NULL DEFAULT 0,  -- 请求数配额（0 = 无限）
+        quota_used_usd REAL NOT NULL DEFAULT 0,     -- 已用（microCents，与 cost_micro_cents 同单位）
+        quota_used_tokens INTEGER NOT NULL DEFAULT 0,
+        quota_used_requests INTEGER NOT NULL DEFAULT 0,
+        quota_cycle TEXT NOT NULL DEFAULT 'none',   -- none | daily | monthly（周期重置）
+        quota_reset_at INTEGER NOT NULL DEFAULT 0,  -- 周期窗口起点（跨周期结算归零 used + 刷新起点）
+        expires_at INTEGER NOT NULL DEFAULT 0,      -- 过期时间（0 = 永不过期）
+        quota_tpm INTEGER NOT NULL DEFAULT 0,       -- 每分钟 token 上限（0 = 无限；ratelimit.ts TpmLimiter 软预算）
+        ip_whitelist TEXT NOT NULL DEFAULT '',      -- 逗号分隔 IP/CIDR 白名单（空 = 不限；tokens.ts ipInList）
         created_at INTEGER NOT NULL
       );
 
@@ -721,6 +777,7 @@ export class UsageDb {
     this.ensureRequestsColumns();
     this.ensureTokensPrefixColumn();
     this.ensureTokensRpmColumn();
+    this.ensureTokensQuotaColumns();
     // 旧库升级：admin_audit 表补 ip 列（面板审计视图展示「谁」）。失败只记
     // 日志 —— 审计是观测设施，缺 ip 只是那列恒 null，不影响其他列。
     this.ensureAdminAuditIpColumn();
@@ -772,6 +829,41 @@ export class UsageDb {
       }
     } catch (err) {
       this.log(`[usagedb] tokens rpm_limit 列补列失败（降级：该分发 key 不限流）: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 旧库升级：tokens 表补配额计费列（QUOTA.md §1）。每列单独补（D-I4 先例：
+   *  一列 ALTER 失败不连坐其余列），失败只记日志 —— 缺列时该口径配额不可用，
+   *  settle/quotaCheck 读缺列会失败并静默跳过（settle 失败不阻断请求链路），
+   *  不影响其余列与代理链路。 */
+  private ensureTokensQuotaColumns(): void {
+    try {
+      const cols = this.db.prepare("SELECT name FROM pragma_table_info('tokens')").all() as Array<{ name: string }>;
+      const names = new Set(cols.map((c) => c.name));
+      const adds: Array<[string, string]> = [
+        ['quota_usd', 'REAL NOT NULL DEFAULT 0'],
+        ['quota_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+        ['quota_requests', 'INTEGER NOT NULL DEFAULT 0'],
+        ['quota_used_usd', 'REAL NOT NULL DEFAULT 0'],
+        ['quota_used_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+        ['quota_used_requests', 'INTEGER NOT NULL DEFAULT 0'],
+        ['quota_cycle', "TEXT NOT NULL DEFAULT 'none'"],
+        ['quota_reset_at', 'INTEGER NOT NULL DEFAULT 0'],
+        ['expires_at', 'INTEGER NOT NULL DEFAULT 0'],
+        ['quota_tpm', 'INTEGER NOT NULL DEFAULT 0'],
+        ['ip_whitelist', "TEXT NOT NULL DEFAULT ''"],
+      ];
+      for (const [col, ddl] of adds) {
+        if (!names.has(col)) {
+          try {
+            this.db.exec(`ALTER TABLE tokens ADD COLUMN ${col} ${ddl}`);
+          } catch (err) {
+            this.log(`[usagedb] tokens 表 ${col} 补列失败（该配额口径不可用）: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      }
+    } catch (err) {
+      this.log(`[usagedb] tokens 表配额列补列失败: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -958,8 +1050,10 @@ export class UsageDb {
    *
    * 触发点：攒满 50 条 / 100ms 定时器 / 读 requests 表的方法先 flush（保证读到的
    * 是已落库数据，批量延迟上限 ~100ms，面板 2s 轮询不受影响）/ `close()` 收尾。
-   * 写失败整批回滚并记日志 —— 丢的是观测数据，符合「崩溃最多丢最后一批」口径，
-   * 后续积压照常（队列已清空，不再重试这一批，避免无限重试拖住事件循环）。
+   * 写失败把该批放回队首等 200ms 重试一次（I-13），仍失败才丢弃并记日志 ——
+   * 丢的是观测数据，符合「崩溃最多丢最后一批」口径；最多重试一次，避免无限
+   * 重试拖住事件循环。重试期间 recordRequest 新到的行照常 append 到队尾，
+   * 重试 flush 时与放回的原批一起写（顺序保持）。
    */
   flush(): void {
     if (this.pendingTimer != null) {
@@ -986,9 +1080,27 @@ export class UsageDb {
         throw err;
       }
     } catch (err) {
-      this.log(`[usagedb] 批量写入请求记录失败（已忽略，丢 ${rows.length} 条）: ${err instanceof Error ? err.message : err}`);
+      // I-13：transient 写失败（部署重叠/长查询撞 SQLite busy）时整批丢弃会连坐
+      // 丢掉最多 50 条真实请求记录。改放回队首等 200ms 重试一次；期间攒批继续，
+      // 重试 flush 一并写掉。
+      if (this.flushRetries < FLUSH_RETRY_MAX) {
+        this.flushRetries += 1;
+        // unshift 保留原批相对顺序；期间 recordRequest 新到的行 append 到队尾。
+        this.pendingRows.unshift(...rows);
+        if (lastAt > this.pendingLastAt) this.pendingLastAt = lastAt;
+        this.pendingTimer = setTimeout(() => {
+          this.pendingTimer = null;
+          this.flush();
+        }, FLUSH_RETRY_MS);
+        this.pendingTimer.unref?.();
+        this.log(`[usagedb] 批量写入请求记录失败，${rows.length} 条放回队首，${FLUSH_RETRY_MS}ms 后重试: ${err instanceof Error ? err.message : err}`);
+        return;
+      }
+      this.flushRetries = 0;
+      this.log(`[usagedb] 批量写入请求记录失败（重试 ${FLUSH_RETRY_MAX} 次后仍失败，已忽略，丢 ${rows.length} 条）: ${err instanceof Error ? err.message : err}`);
       return;
     }
+    this.flushRetries = 0;
     this.maybePrune(lastAt);
     this.maybeCheckpoint(lastAt);
   }
@@ -1007,9 +1119,8 @@ export class UsageDb {
       const fp = args[1];
       const endpoint = args[4];
       if (typeof fp !== 'string' || fp === '-' || fp === '') continue;
-      // endpoint 为 null（旧库行）时 SQL 语义 `NOT IN` 是排除的，JS 侧必须
-      // 对齐（否则 rebuild（SQL）与增量（JS）双口径漂移，同批行数字不一致）。
-      if (endpoint == null || endpoint === 'probe' || endpoint === 'count_tokens') continue;
+      // 与 EXCLUDE_OBSERVED 同口径（含 NULL endpoint 的旧库行语义，见 isObservedEndpoint）。
+      if (isObservedEndpoint(endpoint)) continue;
       const at = Number(args[0]) || 0;
       const st = args[5];
       const status = typeof st === 'number' ? st : -1;
@@ -1057,7 +1168,7 @@ export class UsageDb {
                COALESCE(SUM(output_tokens), 0),
                MAX(at), MIN(at)
           FROM requests
-         WHERE key_fp != '-' AND endpoint NOT IN ('probe', 'count_tokens')
+         WHERE key_fp != '-' AND ${EXCLUDE_OBSERVED}
          GROUP BY key_fp
       `);
       this.db.exec('COMMIT');
@@ -1090,10 +1201,10 @@ export class UsageDb {
     this.flush();
     const offset = Math.max(0, (page - 1) * pageSize);
     // 噪音排除（important 默认）：探活 probe、记账 count_tokens、健康检查 /（FurCDN 之类）。
-    // all 模式只排除探活（保留 count_tokens/健康检查供排查）。
+    // all 模式只排除探活（保留 count_tokens/健康检查供排查）——有意的例外，不走 EXCLUDE_OBSERVED。
     const noise = filter === 'all'
       ? `endpoint != 'probe'`
-      : `endpoint NOT IN ('probe', 'count_tokens') AND path != '/'`;
+      : `${EXCLUDE_OBSERVED} AND path != '/'`;
     // LIKE 的 %/_/\ 是模式字符；用户输入是字面关键词，先转义再包 %（ESCAPE '\'）。
     const like = escapeLike(q ?? '');
     const where = like
@@ -1182,6 +1293,16 @@ export class UsageDb {
   /** statsByIp 的真查询（聚合全量，分页由调用方切片）。失败返回 null。 */
   private queryIpStats(): IpStatRow[] | null {
     try {
+      // B2：加 at 窗口（retention 内）。prune 只留 retention 内的行，面板的
+      // 「全部」≈ retention 窗口 —— 加了窗口语义不变，但 WHERE 能走
+      // idx_requests_at 范围扫，聚合行数从全表降到窗口内（GROUP_CONCAT 的
+      // 拼接范围同步缩小）。retention=0（永不清理）时保持全量，语义仍是「全部」。
+      const args: unknown[] = [];
+      let atClause = '';
+      if (this.retentionMs > 0) {
+        atClause = 'AND at >= ?';
+        args.push(Date.now() - this.retentionMs);
+      }
       const rows = this.db
         .prepare(
           `SELECT ip,
@@ -1191,11 +1312,11 @@ export class UsageDb {
                   COALESCE(GROUP_CONCAT(DISTINCT client), '') AS clients,
                   MAX(at)                                    AS lastAt
              FROM requests
-            WHERE endpoint NOT IN ('probe', 'count_tokens') AND ip IS NOT NULL AND ip != ''
+            WHERE ${EXCLUDE_OBSERVED} AND ip IS NOT NULL AND ip != '' ${atClause}
             GROUP BY ip
             ORDER BY requests DESC, ip ASC`,
         )
-        .all() as Array<Record<string, unknown>>;
+        .all(...args) as Array<Record<string, unknown>>;
       return rows.map((r) => ({
         ip: String(r.ip),
         requests: Number(r.requests) || 0,
@@ -1237,7 +1358,7 @@ export class UsageDb {
                   COALESCE(SUM(output_tokens), 0)  AS outputTokens,
                   COALESCE(SUM(cost_micro_cents), 0) AS costMicroCents
              FROM requests
-            WHERE at >= ? AND endpoint NOT IN ('probe', 'count_tokens') AND (${placeholders})`,
+            WHERE at >= ? AND ${EXCLUDE_OBSERVED} AND (${placeholders})`,
         )
         .get(sinceMs, ...tails.map((t) => `%${t}`)) as Record<string, number>;
       return {
@@ -1253,9 +1374,80 @@ export class UsageDb {
   }
 
   /**
+   * 全部 key 指纹的窗口用量聚合（GET /__admin/api/keys/usage 的数据源）。
+   *
+   * 与 history().byKey 同口径：排除探活与 count_tokens（`endpoint NOT IN
+   * ('probe', 'count_tokens')`）、排除未归属（key_fp '-'/''）。按 key_fp
+   * GROUP BY —— 库里 key_fp 已是 `****XXXX` 脱敏指纹（与 keyFingerprint 同源）。
+   * 每个指纹一行；窗口内无请求的指纹不出现（端点层按 pool/账号合并补零）。
+   *
+   * **带 10 秒缓存（同 statsByIp/tokenUsageAll 承重设计）**：底层是带 WHERE 的
+   * GROUP BY 聚合，node:sqlite 同步 API，面板轮询不能每次全表扫。按 rangeDays
+   * 分桶缓存（面板只用 7/90 两档，各自最多 10s 一次真查询）。返回副本（I-15）。
+   * 失败/不可用返回 null（端点 200 补零），不抛 —— 观测设施降级哲学。
+   *
+   * @param now 时间源（测试注入固定时刻；生产走 Date.now()）。
+   */
+  keyUsageAll(rangeDays: number, now?: number): KeyUsageAggregate[] | null {
+    if (!this.enabled) return null;
+    // 批量写入是异步的：读前先把积压 flush，保证聚合读到已落库数据。
+    this.flush();
+    const nowMs = now ?? Date.now();
+    const days = Number.isFinite(rangeDays) ? Math.max(1, Math.floor(rangeDays)) : 7;
+    const cached = this.keyUsageCache.get(days);
+    if (cached && nowMs - cached.at < KEY_USAGE_CACHE_MS) {
+      return cached.data ? cached.data.map((r) => ({ ...r })) : null;
+    }
+    const since = nowMs - days * 86_400_000;
+    let out: KeyUsageAggregate[] | null;
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT key_fp                                             AS fingerprint,
+                  COUNT(*)                                             AS requests,
+                  SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END) AS ok,
+                  SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END)    AS failed,
+                  COALESCE(SUM(input_tokens), 0)       AS inputTokens,
+                  COALESCE(SUM(output_tokens), 0)      AS outputTokens,
+                  COALESCE(SUM(cost_micro_cents), 0)   AS costMicroCents,
+                  MAX(at)                               AS lastAt
+             FROM requests
+            WHERE at >= ? AND key_fp != '-' AND key_fp != ''
+              AND ${EXCLUDE_OBSERVED}
+            GROUP BY key_fp
+            ORDER BY requests DESC`,
+        )
+        .all(since) as Array<Record<string, number>>;
+      out = rows.map((r) => {
+        const inputTokens = Number(r.inputTokens) || 0;
+        const outputTokens = Number(r.outputTokens) || 0;
+        return {
+          fingerprint: String(r.fingerprint),
+          requests: Number(r.requests) || 0,
+          ok: Number(r.ok) || 0,
+          failed: Number(r.failed) || 0,
+          inputTokens,
+          outputTokens,
+          tokens: inputTokens + outputTokens,
+          costMicroCents: Number(r.costMicroCents) || 0,
+          lastAt: Number(r.lastAt) || 0,
+        };
+      });
+    } catch (err) {
+      this.log(`[usagedb] 全 key 用量聚合失败: ${err instanceof Error ? err.message : err}`);
+      out = null;
+    }
+    // 失败不写缓存（下次重试），成功才缓存。
+    if (out !== null) this.keyUsageCache.set(days, { at: nowMs, data: out });
+    return out ? out.map((r) => ({ ...r })) : null;
+  }
+
+  /**
    * 按分发 token 指纹聚合用量（GET /__admin/api/tokens 与 /tokens/stats 的数据源）。
-   * 精确匹配完整指纹（sha256 前 24 hex），不排除探活——探针请求不经过 verifyAuth，
-   * token_fp 恒为 null，天然不在结果里。失败/不可用返回空 Map（观测降级，不抛）。
+   * 精确匹配完整指纹（sha256 前 24 hex）。排除观测流量（EXCLUDE_OBSERVED）：
+   * probe 探活与 count_tokens 记账都不计（探针请求不走 verifyAuth，token_fp 恒
+   * null 本就排除，但显式排除对齐聚合口径——未来 probe 路径若带 token_fp 不混入）。
+   * 失败/不可用返回空 Map（观测降级，不抛）。
    *
    * 带 10 秒缓存（与 statsByIp 同款承重设计）：底层是 GROUP BY 聚合，
    * node:sqlite 同步 API，面板轮询不能每次全表扫。
@@ -1272,6 +1464,21 @@ export class UsageDb {
       return new Map([...this.tokenUsageCache].map(([fp, u]) => [fp, { ...u }]));
     }
     try {
+      // B2：加 at 窗口（retention 内）——prune 只留 retention 内的行，「全部」
+      // ≈ retention 窗口，语义不变；过滤后聚合行数从全表降到窗口内（面板 tokens
+      // 列表的 usage 列是全部口径，与 history() 的保留期口径一致）。
+      // 有窗口时用 INDEXED BY 强制走 idx_requests_at 范围扫：SQLite 默认会选
+      // idx_requests_token_fp（覆盖 GROUP BY 键、免排序）做全索引扫描，at 过滤
+      // 退化成逐行 lookup —— 窗口完全没起到削减扫描量的作用（实测 10 万行
+      // 202ms vs 72ms）。
+      const args: unknown[] = [];
+      let fromClause = 'FROM requests';
+      let atClause = '';
+      if (this.retentionMs > 0) {
+        fromClause = 'FROM requests INDEXED BY idx_requests_at';
+        atClause = 'AND at >= ?';
+        args.push(Date.now() - this.retentionMs);
+      }
       const rows = this.db
         .prepare(
           `SELECT token_fp AS fingerprint,
@@ -1279,12 +1486,12 @@ export class UsageDb {
                   COALESCE(SUM(input_tokens), 0)          AS inputTokens,
                   COALESCE(SUM(output_tokens), 0)         AS outputTokens,
                   COALESCE(SUM(cost_micro_cents), 0)      AS costMicroCents
-             FROM requests
-            WHERE token_fp IS NOT NULL AND token_fp != '' AND endpoint != 'count_tokens'
+             ${fromClause}
+            WHERE token_fp IS NOT NULL AND token_fp != '' AND ${EXCLUDE_OBSERVED} ${atClause}
             GROUP BY token_fp
             ORDER BY requests DESC`,
         )
-        .all() as Array<Record<string, unknown>>;
+        .all(...args) as Array<Record<string, unknown>>;
       const map = new Map<string, KeyFingerprintUsage>();
       for (const r of rows) {
         map.set(String(r.fingerprint), {
@@ -1359,7 +1566,7 @@ export class UsageDb {
                   COALESCE(SUM(output_tokens), 0)        AS outputTokens,
                   COALESCE(SUM(cost_micro_cents), 0)     AS costMicroCents
              FROM requests
-            WHERE at >= ? AND at < ? AND endpoint NOT IN ('probe', 'count_tokens')
+            WHERE at >= ? AND at < ? AND ${EXCLUDE_OBSERVED}
             GROUP BY b`,
         )
         .all(bucketMs, since, until) as Array<Record<string, number>>;
@@ -1548,7 +1755,7 @@ export class UsageDb {
         .prepare(
           `SELECT COUNT(*) AS requests,
                   SUM(CASE WHEN status >= 400 OR status = 0 THEN 1 ELSE 0 END) AS failed
-             FROM requests WHERE key_fp = '-' AND (endpoint IS NULL OR endpoint NOT IN ('probe', 'count_tokens'))`,
+             FROM requests WHERE key_fp = '-' AND (endpoint IS NULL OR ${EXCLUDE_OBSERVED})`,
         )
         .get() as { requests: number; failed: number };
 
@@ -1559,9 +1766,9 @@ export class UsageDb {
           `SELECT COALESCE((SELECT SUM(requests) FROM key_totals), 0)            AS totals,
                   COALESCE((SELECT MIN(min_at) FROM key_totals), 0)             AS totalsMinAt,
                   COALESCE((SELECT COUNT(*) FROM requests
-                             WHERE key_fp = '-' AND (endpoint IS NULL OR endpoint NOT IN ('probe', 'count_tokens'))), 0) AS unattrib,
+                             WHERE key_fp = '-' AND (endpoint IS NULL OR ${EXCLUDE_OBSERVED})), 0) AS unattrib,
                   COALESCE((SELECT MIN(at) FROM requests
-                             WHERE key_fp = '-' AND (endpoint IS NULL OR endpoint NOT IN ('probe', 'count_tokens'))), 0) AS unattribMinAt`,
+                             WHERE key_fp = '-' AND (endpoint IS NULL OR ${EXCLUDE_OBSERVED})), 0) AS unattribMinAt`,
         )
         .get() as { totals: number; totalsMinAt: number; unattrib: number; unattribMinAt: number };
 
@@ -1685,7 +1892,7 @@ export class UsageDb {
                 WHERE r.key_fp = key_totals.fingerprint
                   AND r.at >= ?
                   AND r.endpoint IS NOT NULL
-                  AND r.endpoint NOT IN ('probe', 'count_tokens')
+                  AND ${EXCLUDE_OBSERVED}
              )`,
           )
           .run(cutoff);

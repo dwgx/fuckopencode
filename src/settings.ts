@@ -118,11 +118,13 @@ export function apiKeysMeta(value: unknown): SettingValidation {
 }
 
 /**
- * 全局模型白名单数组（MODEL-ACCESS）：≤50 项、trim 去重、非空；每项必须在
- * 硬底线 ALLOWED_MODELS 内 —— 硬底线不可放宽，常量外的模型加了也过不了
- * resolveModel，明确拒绝比「存了但永远 400」省排查。null/空数组 = 清键回
- * 代码默认（= 硬底线）。
+ * 全局模型白名单数组（MODEL-ACCESS）：≤50 项、trim 去重、非空；每项是
+ * **任意合法模型名**（/^[a-z0-9._-]+$/，≤100 字符）。不再限硬底线
+ * ALLOWED_MODELS —— 那是**代码默认值 + 重置基准**（可扩展），允许添加
+ * claude-* 系、gpt-* 系等上游模型；模型是否真的支持由上游裁决（网关透传
+ * 上游错误）。null/空数组 = 清键回代码默认（= 默认 deepseek 两个）。
  */
+const MODEL_NAME_RE = /^[a-z0-9._-]+$/;
 export function allowedModelsMeta(value: unknown): SettingValidation {
   if (value == null) return { ok: true, value: null };
   if (!Array.isArray(value)) return { ok: false, error: 'must be an array of strings' };
@@ -133,7 +135,8 @@ export function allowedModelsMeta(value: unknown): SettingValidation {
     if (typeof item !== 'string') return { ok: false, error: 'must be an array of strings' };
     const m = item.trim();
     if (m.length === 0) continue;
-    if (!ALLOWED_MODELS.has(m)) return { ok: false, error: `model not in hard allowlist: ${m}` };
+    if (m.length > 100) return { ok: false, error: `model name too long: ${m}` };
+    if (!MODEL_NAME_RE.test(m)) return { ok: false, error: `invalid model name: ${m}` };
     if (!seen.has(m)) {
       seen.add(m);
       models.push(m);
@@ -147,6 +150,52 @@ export function allowedModelsMeta(value: unknown): SettingValidation {
   return { ok: true, value: models };
 }
 
+/** 模型定价（$/1M tokens，QUOTA.md §4 的 $ 配额兜底口径）。read/write = 缓存读写。
+ *  settle 当前只按 input/output 计价（上游用量不区分缓存读写，见 QUOTA.md 偏离记录）。 */
+export interface ModelPrice {
+  input: number;
+  output: number;
+  read: number;
+  write: number;
+}
+
+/**
+ * model_prices 定价表校验：`{模型名: {input?, output?, read?, write?}}`，$/1M tokens。
+ * 可选字段，缺省 0；非负有限数。模型名走任意合法模型名（与 allowedModels 同规则），
+ * 另放行 `'*'` 通配键（MINOR m1：定价表通配，QUOTA.md §4 —— resolveModelPrice 已
+ * 有 `modelPricesCache['*']` 兜底，校验却曾拒绝 '*' 落库，通配分支不可配）。
+ * 通配 key 的 key 必须是上游模型名（非客户端别名，见 QUOTA.md m3 文档提示）。
+ * null = 清键（回 fallback：无则 0 —— 只记 token/requests 配额）。
+ */
+export function modelPricesMeta(value: unknown): SettingValidation {
+  if (value == null) return { ok: true, value: null };
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, error: 'modelPrices must be an object mapping model names to price objects' };
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > 200) return { ok: false, error: 'modelPrices must have at most 200 entries' };
+  const out: Record<string, ModelPrice> = {};
+  for (const [model, raw] of entries) {
+    const m = model.trim();
+    if (m.length === 0 || m.length > 100) return { ok: false, error: `invalid model name: ${model}` };
+    // '*' 通配键（resolveModelPrice 的兜底分支）单独放行，其余走模型名规则。
+    if (m !== '*' && !MODEL_NAME_RE.test(m)) return { ok: false, error: `invalid model name: ${model}` };
+    if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: `price for ${m} must be an object` };
+    }
+    const price: ModelPrice = { input: 0, output: 0, read: 0, write: 0 };
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (!(k in price)) return { ok: false, error: `unknown price field for ${m}: ${k}` };
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+        return { ok: false, error: `${m}.${k} must be a non-negative number` };
+      }
+      price[k as keyof ModelPrice] = v;
+    }
+    out[m] = price;
+  }
+  return { ok: true, value: out };
+}
+
 /**
  * 可热改字段清单。**默认值必须与 config.ts 的 loadConfig 对齐**
  * （adminUser/adminPass/实验开关那组；apiKeys 的 env 默认是空数组）。
@@ -155,13 +204,20 @@ export const SETTINGS_META: Readonly<Record<string, SettingMeta>> = {
   adminUser: { default: 'admin', validate: stringMeta(1, 100) },
   adminPass: { default: DEFAULT_ADMIN_PASS, validate: passwordMeta(8, 200) },
   apiKeys: { default: [], validate: apiKeysMeta },
-  // 全局默认模型白名单（MODEL-ACCESS）：默认 = 硬底线 ALLOWED_MODELS（可收窄）。
+  // 全局默认模型白名单（MODEL-ACCESS）：默认 = 代码默认 ALLOWED_MODELS
+  // （deepseek 两个），可扩展到任意合法模型名（claude-*/gpt-* 等）。
   allowedModels: { default: [...ALLOWED_MODELS], validate: allowedModelsMeta },
   scaleClientTokens: { default: false, validate: boolMeta },
   clientTokenScale: { default: 0.6657, validate: floatMeta(0.001, 1) },
   compactEnabled: { default: false, validate: boolMeta },
   compactTriggerBytes: { default: 4 * 1024 * 1024, validate: intMeta(1) },
   compactMaxMessageChars: { default: 8_000, validate: intMeta(1) },
+  // 全局 RPM（数据面整体保护）：0 = 关闭（默认，不改变现状行为）。所有数据面
+  // 真实请求共享一个滑窗，超限 429。启动默认来自 env GLOBAL_RPM_LIMIT，热配置覆盖。
+  globalRpmLimit: { default: 0, validate: intMeta(0) },
+  // $ 配额定价表（QUOTA.md §4）：模型 → {input,output,read,write} $/1M tokens。
+  // 可选；不配则 $ 配额不扣（只记 token/requests 配额，cost=0 时按 0 计）。
+  modelPrices: { default: {}, validate: modelPricesMeta },
 };
 
 /** 校验 + 规范化一个字段值（PATCH 端点与 db 解析共用）。未知键一律失败。 */
@@ -211,6 +267,7 @@ export function applySettingsToConfig(cfg: AppConfig, values: Record<string, unk
   if (typeof values.compactEnabled === 'boolean') cfg.compactEnabled = values.compactEnabled;
   if (typeof values.compactTriggerBytes === 'number') cfg.compactTriggerBytes = values.compactTriggerBytes;
   if (typeof values.compactMaxMessageChars === 'number') cfg.compactMaxMessageChars = values.compactMaxMessageChars;
+  if (typeof values.globalRpmLimit === 'number') cfg.globalRpmLimit = values.globalRpmLimit;
 }
 
 /**

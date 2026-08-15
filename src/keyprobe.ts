@@ -166,7 +166,8 @@ export async function probeKey(
   } catch (err) {
     const durationMs = Date.now() - started;
     // 网络层失败（超时、连不上）算 transient：可能是本机网络抖动而非 key 的问题，
-    // 让它累计到阈值再禁用，不要因为一次探活失败就误杀一个好 key。
+    // 不禁用（2026-08-15 起瞬时波动不再禁 key），只记失败供观测——探活失败不
+    // 该因为一次网络抖动把一个好 key 标成 disabled。
     pool.markFailure(key, 'transient');
     const msg = err instanceof Error ? err.message : String(err);
     return {
@@ -253,7 +254,14 @@ export async function runProbeRound(
     let firstFail: ProbeResult | null = null;
     let lastOk: ProbeResult | null = null;
     for (const key of keys) {
-      const r = await probeKey(cfg, pool, key, keyFingerprint(key), cfg.keyProbeTimeoutMs, baseUrl, model);
+      const fingerprint = keyFingerprint(key);
+      // manual 禁用的 key 跳过探活（m-1 对抗审查）：manual 是操作员显式停用
+      // （365 天 horizon，reset() 才恢复），探活对它是纯白打上游调用 —— 一轮探活
+      // 打一个 manual 禁用 key 上游就要接 ~1 次无效请求，全池几万个白打。探活不会
+      // 让它恢复，也不会改变它的状态。quota-exhausted / auth 冷却的 key **保留**
+      // 探活：那是「到期前确认恢复」的主力手段（重报同类错误不延长 pool 冷却，§4.3）。
+      if (pool.isManuallyDisabled(fingerprint)) continue;
+      const r = await probeKey(cfg, pool, key, fingerprint, cfg.keyProbeTimeoutMs, baseUrl, model);
       results.push(r);
       if (r.ok) lastOk = r;
       else if (firstFail === null) firstFail = r;
@@ -350,6 +358,11 @@ export function startKeyProbe(
     }
   };
 
+  // 启动立即探一轮（不等第一个 interval）：重启后 keypool 冷却/禁用是进程内态，
+  // 全丢——quota-exhausted 的 key（周额度 100% 用尽）若不立即探，空窗期内真实
+  // 流量会撞上它白打一次 429（实测 2026-08-15：0osU 24h 冷却重启后丢失，14:35
+  // 禁 → 重启 → 15:13 又被选再禁）。立即探：坏 key 马上被禁用，好 key 确认健康。
+  void tick();
   const timer = setInterval(tick, cfg.keyProbeIntervalMs);
   if (typeof timer.unref === 'function') timer.unref();
   return () => clearInterval(timer);

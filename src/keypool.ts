@@ -5,12 +5,12 @@ import { createHash } from 'node:crypto';
  *
  * 目标：
  * - 多个上游 key 分摊并发（least-loaded），避免单 key 吃满限流。
- * - 失效 key（401/403 凭据无效、连续失败超阈值）自动禁用，冷却后恢复。
+ * - 失效 key（401/403 凭据无效）自动禁用，冷却后恢复。
  * - 请求失败时换下一个可用 key 重试一次，避免单 key 故障拖垮所有请求。
  * - key 可归属账户（accountId），供面板按账户聚合；增删 key 热生效（不重启）。
  *
  * 状态机（每个 key）：
- * - `disabledUntil`：禁用截止时间戳（0 = 未禁用）。由失败计数/凭据错误触发。
+ * - `disabledUntil`：禁用截止时间戳（0 = 未禁用）。由额度耗尽/凭据错误/限流触发。
  * - `failCount`：连续失败次数（距上次成功清零；距上次失败超过冷却期也清零）。
  * - `inFlight`：当前活跃请求数。least-loaded 选择依据，body 读完/中断后释放。
  * - `lastFailAt`：最后一次失败时间戳（-1 = 从未失败），用于滑动窗口近似。
@@ -78,6 +78,21 @@ export interface KeyPoolOptions {
   /** 时间源，可注入以便测试。 */
   now?: () => number;
   /**
+   * 长冷却持久化（2026-08-15 扩展）：quota-exhausted / auth / manual 的禁用写入
+   * 磁盘，重启恢复——否则重启后冷却丢失，额度耗尽的 key 被重新选号、每个请求
+   * 先撞一次 429 再换号（实测 0osU 14:35 禁 → 重启 → 15:13 又被选再禁），auth
+   * 坏 key 回池再撞 401，manual 操作员停用的 key 复活（与 0osU 事故同构）。
+   * rate-limit/transient 短冷却不持久化（本就该重启即过）。
+   * map: sha256(key) 全 hex → `{until, reason}`（2026-08-16 P1 从末 4 位指纹改全量
+   * 哈希——两把同尾 key 会互踩条目）。**旧格式兼容**：load 可能返回旧版 `{fp: until}`
+   * （纯 number）或旧键 `****XXXX`（指纹），构造与每次写入时按 reason='quota-exhausted'
+   * 归一，指纹键按 keyFingerprint 匹配迁移到 sha256 键。load/save 失败静默（不阻断）。
+   */
+  persistDisabled?: {
+    load(): Record<string, number | PersistedDisable>;
+    save(m: Record<string, PersistedDisable>): void;
+  };
+  /**
    * key 状态变更回调（禁用/恢复），用于日志与可观测性。
    *
    * 为什么需要：2026-08-09 线上出过 295 个 503（整池被禁 ~3 分钟），但日志里
@@ -102,7 +117,18 @@ export interface KeyStateEvent {
   poolSize: number;
 }
 
-export type UpstreamFailureKind = 'auth' | 'rate-limit' | 'quota-exhausted' | 'transient';
+export type UpstreamFailureKind = 'auth' | 'rate-limit' | 'quota-exhausted' | 'transient' | 'manual';
+
+/**
+ * 持久化禁用的磁盘结构（pool-disabled.json 条目）：until + 原因。
+ * 2026-08-15 扩展：旧版只存 quota-exhausted（值即 until 数字）；现把 auth/manual
+ * 一并持久化，值改对象以便重启后按原因恢复 disabledReason（auth 坏 key 不回池
+ * 撞 401、manual 操作员停用不复活）。
+ */
+export interface PersistedDisable {
+  until: number;
+  reason: 'quota-exhausted' | 'auth' | 'manual';
+}
 
 /**
  * 额度耗尽但解析不出重置时间时的默认冷却：24 小时（2026-08-14 从 1h 提升）。
@@ -131,7 +157,7 @@ const QUOTA_FALLBACK_COOLDOWN_MS = 24 * 3_600_000;
 export interface PoolPolicy {
   /** 基础冷却（毫秒），即 `COOLDOWN_MS` 配置值。 */
   cooldownMs: number;
-  /** 连续失败多少次触发禁用（transient 类）。 */
+  /** 连续失败多少次触发禁用（历史 transient 类阈值；2026-08-15 起瞬时波动不再禁用，保留供面板展示）。 */
   failThreshold: number;
   /** 选路算法的稳定标识，面板据此显示对应说明。 */
   strategy: 'least-loaded';
@@ -180,6 +206,28 @@ export function keyFingerprint(key: string): string {
   return `****${key.slice(-4)}`;
 }
 
+/**
+ * 归一持久化禁用结构：旧格式 `{fp: number}`（2026-08-15 前的 pool-disabled.json）
+ * → `{fp: {until, reason}}`。新格式非法条目丢弃。构造加载与每次写入都过这里，
+ * 保证写入永远是新结构（旧文件自愈）。
+ *
+ * m-3（对抗审查）：reason 也校验枚举 —— 手改/损坏的 `reason:'xxx'` 若直接进
+ * disabledReason，面板会显示脏值；校验不过的条目整体丢弃（宁可不恢复禁用，
+ * 也不把未知原因的 key 悄悄冻起来 —— 原因错比没禁更误导排查）。
+ */
+const PERSISTED_DISABLE_REASONS: ReadonlySet<string> = new Set(['quota-exhausted', 'auth', 'manual']);
+
+function normalizePersistedDisabled(
+  m: Record<string, number | PersistedDisable>,
+): Record<string, PersistedDisable> {
+  const out: Record<string, PersistedDisable> = {};
+  for (const [fp, v] of Object.entries(m)) {
+    if (typeof v === 'number') out[fp] = { until: v, reason: 'quota-exhausted' };
+    else if (v != null && typeof v.until === 'number' && PERSISTED_DISABLE_REASONS.has(v.reason)) out[fp] = v;
+  }
+  return out;
+}
+
 export class KeyPool {
   private keys: PooledKey[];
   private readonly opts: Required<KeyPoolOptions>;
@@ -194,6 +242,8 @@ export class KeyPool {
    * 被动学习：上游对某账号某模型判定「永久不可用」（401 ModelError / not
    * supported，见 errors.isModelUnsupported）后，记 (accountId, model) blocked，
    * 选号时排除该组合。TTL 到期自动失效（探测豁免，见 blockModel）。
+   * **纯内存态**（2026-08-16 回退：原持久化重启恢复被判定过度工程——1h TTL 的
+   * 被动学习组合重启后重撞一次成本可忽略，不值得磁盘文件）。
    */
   private modelBlocks = new Map<string, number>();
 
@@ -205,8 +255,13 @@ export class KeyPool {
    */
   private readonly sha256ByKey = new Map<string, string>();
 
+  /** sha256(key) 全 hex。持久化键与预计算索引共用的同一哈希口径。 */
+  private sha256Hex(key: string): string {
+    return createHash('sha256').update(key, 'utf8').digest('hex');
+  }
+
   private indexSha256(key: string): void {
-    this.sha256ByKey.set(createHash('sha256').update(key, 'utf8').digest('hex'), key);
+    this.sha256ByKey.set(this.sha256Hex(key), key);
   }
 
   constructor(
@@ -239,7 +294,44 @@ export class KeyPool {
       failThreshold: options.failThreshold,
       now: options.now ?? Date.now,
       onStateChange: options.onStateChange ?? (() => {}),
+      persistDisabled: options.persistDisabled ?? { load: () => ({}), save: () => {} },
     };
+    // 重启恢复持久化的长冷却：quota-exhausted / auth / manual 禁用的 key 不参与
+    // 选号，直到冷却到期（避免重启后坏 key 回池撞 429/401、操作员停用复活）。
+    // 旧格式（{fp: until}）在此归一为 {until, reason}，reason 按 quota-exhausted。
+    if (this.opts.persistDisabled) {
+      try {
+        const persisted = normalizePersistedDisabled(this.opts.persistDisabled.load());
+        const now = this.now();
+        // 新格式：键 = sha256(key) 全 hex，按 key 精确命中（P1：末 4 位会碰撞，
+        // 两把同尾 key 互踩条目，已改全量哈希）。
+        for (const k of this.keys) {
+          const entry = persisted[this.sha256Hex(k.key)];
+          if (entry != null && entry.until > now) {
+            k.disabledUntil = entry.until;
+            k.disabledReason = entry.reason;
+            k.lastFailAt = now;
+          }
+        }
+        // 旧格式迁移：键 = ****XXXX 指纹（线上 pool-disabled.json 是 ****0osU 形态）。
+        // 按 keyFingerprint 匹配到池内 key 恢复冷却；写入时才归一为新格式键
+        // （见 setPersistedDisabled/dropPersistedDisabled 的双键清理）。
+        for (const [oldFp, entry] of Object.entries(persisted)) {
+          if (!oldFp.startsWith('****') || entry == null || entry.until <= now) continue;
+          for (const k of this.keys) {
+            if (keyFingerprint(k.key) !== oldFp) continue;
+            // 只延长不缩短：新格式已应用更长冷却时不覆盖。
+            if (entry.until > k.disabledUntil) {
+              k.disabledUntil = entry.until;
+              k.disabledReason = entry.reason;
+              k.lastFailAt = now;
+            }
+          }
+        }
+      } catch {
+        // 持久化加载失败不阻断（池照常构建，代价是冷却丢失一次）。
+      }
+    }
   }
 
   /**
@@ -296,7 +388,7 @@ export class KeyPool {
    * 池空且**所有**禁用 key 的原因都是额度耗尽时，返回要透传的上游错误；
    * 否则返回 null（调用方回通用 503）。
    *
-   * 只透传「纯额度耗尽」的场景 —— 混着 auth/transient 禁用的池空不该伪装成
+   * 只透传「纯额度耗尽」的场景 —— 混着 auth/rate-limit 禁用的池空不该伪装成
    * 额度问题，否则下游会误以为重置时间到了就恢复，实际可能另有故障。
    */
   get quotaEmptyError(): { status: number; body: unknown } | null {
@@ -315,20 +407,23 @@ export class KeyPool {
    *
    * 调用方在 `isModelUnsupported(status, body)` 判定后调 —— 此时**不**调
    * markFailure（那是 key 的问题，这里 key 是好的，只是该账号端点不带这个
-   * 模型）。TTL 由调用方传（默认 MODEL_BLOCK_TTL_MS 1h），内存态重启清零。
+   * 模型）。TTL 由调用方传（默认 MODEL_BLOCK_TTL_MS 1h），到期/clear 时移除。
+   * 纯内存态（TTL 短，重启后重撞一次成本可忽略，不持久化）。
    */
   blockModel(accountId: number, model: string, ttlMs: number = MODEL_BLOCK_TTL_MS): void {
     if (!model) return;
-    this.modelBlocks.set(`${accountId}:${model}`, this.now() + ttlMs);
+    const until = this.now() + ttlMs;
+    this.modelBlocks.set(`${accountId}:${model}`, until);
   }
 
-  /** (accountId, model) 是否处于被动学习 blocked 期。 */
+  /** (accountId, model) 是否处于被动学习 blocked 期。到期自动失效。 */
   isModelBlocked(accountId: number, model: string): boolean {
     if (!model) return false;
-    const until = this.modelBlocks.get(`${accountId}:${model}`);
+    const key = `${accountId}:${model}`;
+    const until = this.modelBlocks.get(key);
     if (until == null) return false;
     if (until <= this.now()) {
-      this.modelBlocks.delete(`${accountId}:${model}`);
+      this.modelBlocks.delete(key);
       return false;
     }
     return true;
@@ -345,7 +440,7 @@ export class KeyPool {
    *
    * 每个 `ms` 都用和 `markFailure` **同一套算式**从当前配置算出来，
    * 而不是另抄一份常量 —— 否则改了冷却规则面板会继续显示旧数字。
-   * transient 给的是首次触发禁用时的时长（退避基数，之后按 2 的幂增长）。
+   * transient 不在规则里（2026-08-15 起瞬时波动不禁用，面板不显示该说明）。
    */
   policy(): PoolPolicy {
     const base = this.opts.cooldownMs;
@@ -358,7 +453,6 @@ export class KeyPool {
         { kind: 'quota-exhausted', ms: null, countsToThreshold: false, fallbackMs: QUOTA_FALLBACK_COOLDOWN_MS },
         { kind: 'auth', ms: base * 12, countsToThreshold: false },
         { kind: 'rate-limit', ms: Math.min(3000, Math.max(500, Math.floor(base / 100))), countsToThreshold: false },
-        { kind: 'transient', ms: base, countsToThreshold: true },
       ],
     };
   }
@@ -492,7 +586,8 @@ export class KeyPool {
    * 记录一次失败。按类型分级：
    * - auth（401/403）：立即禁用 + 超长冷却（12 × cooldownMs），冷却后可自动恢复。
    * - rate-limit（429）：不计入禁用计数，只打一个短冷却（避免账号级 429 打爆全池）。
-   * - transient（网络错误/超时/5xx）：计入连续失败，达到阈值禁用；冷却指数退避。
+   * - transient（网络错误/超时/5xx）：不禁用（2026-08-15 起瞬时波动不再禁 key、
+   *   面板不显示 transient 状态），只累计 failCount 供观测。
    */
   markFailure(key: string, kind: UpstreamFailureKind, resetDelayMs?: number): void {
     const k = this.keys.find((p) => p.key === key);
@@ -544,15 +639,11 @@ export class KeyPool {
       return;
     }
 
-    // transient：累计连续失败，达到阈值禁用 + 指数退避冷却。
+    // transient：网络错误/超时/5xx 瞬时波动。不禁用、不设冷却、不显示状态
+    // （2026-08-15 用户决定：面板显示「transient · 1m02s」让使用不佳，瞬时波动
+    // 不该禁 key；换 key 重试已由 acquire(excludeKey) 承担）。只累计 failCount
+    // 供观测（面板「连续失败」列），永不触发禁用。
     k.failCount += 1;
-    if (k.failCount >= this.opts.failThreshold) {
-      const backoff = this.opts.cooldownMs * 2 ** Math.min(k.failCount - this.opts.failThreshold, 4);
-      // 加 ±20% 抖动，避免整池冷却同时到期后 thundering herd。
-      const jittered = Math.floor(backoff * (0.8 + Math.random() * 0.4));
-      k.failCount = 0;
-      this.disableUntil(k, kind, now, now + jittered);
-    }
   }
 
   /**
@@ -580,7 +671,50 @@ export class KeyPool {
     }
     k.disabledUntil = until;
     k.disabledReason = kind;
+    // 长冷却（quota-exhausted / auth / manual）落盘，重启恢复；rate-limit/transient
+    // 短冷却不持久化（本就该重启即过）。
+    if (kind === 'quota-exhausted' || kind === 'auth' || kind === 'manual') {
+      this.setPersistedDisabled(k, kind, until);
+    }
     this.emitDisabled(k, kind, until - now);
+  }
+
+  /** 持久化长冷却禁用（sha256 键 → {until, reason}），写入前归一旧格式并迁移旧指纹键。 */
+  private setPersistedDisabled(k: PooledKey, kind: PersistedDisable['reason'], until: number): void {
+    if (!this.opts.persistDisabled) return;
+    try {
+      const m = normalizePersistedDisabled(this.opts.persistDisabled.load());
+      // 迁移：同 key 的旧格式指纹条目（****XXXX）一并移除，写入后文件只含 sha256 键
+      //（P1：末 4 位会碰撞，持久化键统一用 sha256 全 hex）。
+      delete m[keyFingerprint(k.key)];
+      m[this.sha256Hex(k.key)] = { until, reason: kind };
+      this.opts.persistDisabled.save(m);
+    } catch {
+      // 持久化失败不阻断（代价：重启后冷却丢失一次）。
+    }
+  }
+
+  /** 从持久化移除已恢复的 key（冷却到期/显式 reset）。新键 sha256 + 旧指纹键一并清。 */
+  private dropPersistedDisabled(k: PooledKey): void {
+    if (!this.opts.persistDisabled) return;
+    try {
+      const m = normalizePersistedDisabled(this.opts.persistDisabled.load());
+      const hash = this.sha256Hex(k.key);
+      const fp = keyFingerprint(k.key);
+      let changed = false;
+      if (m[hash] != null) {
+        delete m[hash];
+        changed = true;
+      }
+      // 旧格式残留（****XXXX 键）一并清：否则 reset/移除后重启又被旧条目复活禁用。
+      if (m[fp] != null) {
+        delete m[fp];
+        changed = true;
+      }
+      if (changed) this.opts.persistDisabled.save(m);
+    } catch {
+      // 忽略。
+    }
   }
 
   /** 显式恢复一个 key（测试/运维用）。 */
@@ -591,6 +725,67 @@ export class KeyPool {
     k.failCount = 0;
     k.lastFailAt = -1;
     delete k.disabledReason;
+    this.dropPersistedDisabled(k);
+  }
+
+  /**
+   * 手动禁用（面板「禁用」按钮）：无论当前冷却状态，直接把该 key 置为停用
+   * 至 `until`（默认**哨兵** `Number.MAX_SAFE_INTEGER`，即永不过期、只有 reset 恢复）。
+   *
+   * 为什么用哨兵而不是 365 天（MINOR）：`MANUAL_DISABLE_HORIZON_MS` 让 manual
+   * 一年后自动回池复活——操作员显式停用不该有「自动到期」。哨兵令 isAvailable
+   * （disabledUntil <= now）恒 false、reapRecovered（<= now）永不触发；且哨兵是
+   * 任意自动冷却的上界，disableUntil 的「只延长不缩短」守卫在它之后不会把 manual
+   * 覆盖成更短的自动冷却。`until` 显式传值时按传值停用（可做限时停用）。
+   *
+   * 与失败冷却的关系：统一走 disableUntil（2026-08-15 起）——其「只延长不缩短」
+   * 守卫在 manual 哨兵下正常不会触发，操作员显式停用照样生效；reason='manual'，
+   * 面板据此显示「manual」。**持久化**：manual 与其他长冷却一样写入磁盘（until 存
+   * MAX_SAFE_INTEGER 大数，JSON 无损），重启后仍停用——否则操作员停用的 key 重启
+   * 复活，探活/流量把它拉起烧额度（0osU 事故同构）。返回是否找到该 key。
+   */
+  disable(key: string, until?: number): boolean {
+    const k = this.keys.find((p) => p.key === key);
+    if (!k) return false;
+    const now = this.now();
+    const horizon = until ?? Number.MAX_SAFE_INTEGER;
+    // 操作员显式停用：接管状态，清空失败累计（与旧行为一致），统一走
+    // disableUntil 获得持久化 + 原因标记 + 事件上报。
+    k.failCount = 0;
+    k.lastFailAt = -1;
+    this.disableUntil(k, 'manual', now, horizon);
+    return true;
+  }
+
+  /**
+   * 指纹（****XXXX）→ 明文 key 的解析（管理面手动启停端点用）。返回的明文
+   * **只在进程内流转**（立即用于 disable/reset），绝不进响应/日志/落库 ——
+   * 与 snapshot/disabledFingerprints 同一不泄明文约束。多个 key 共享同指纹
+   * （末 4 位碰撞）时取池内第一个；未命中返回 null。
+   */
+  keyByFingerprint(fp: string): string | null {
+    const target = fp.trim();
+    for (const k of this.keys) {
+      if (keyFingerprint(k.key) === target) return k.key;
+    }
+    return null;
+  }
+
+  /**
+   * 指纹（****XXXX）→ 该 key 是否处于「操作员手动停用」（reason='manual'）。
+   *
+   * keyprobe 探活前用（m-1 对抗审查）：manual 是操作员显式停用（哨兵 until，
+   * 只有 reset() 恢复），探活去撞它纯属白打上游调用 —— 它不会因探活恢复，
+   * 也不会因上游响应改变状态。quota-exhausted / auth 冷却的 key 探活是「到期前
+   * 确认恢复」的主力手段（保留），**只跳过 manual**。未命中指纹返回 false。
+   */
+  isManuallyDisabled(fingerprint: string): boolean {
+    const target = fingerprint.trim();
+    for (const k of this.keys) {
+      if (keyFingerprint(k.key) !== target) continue;
+      return k.disabledReason === 'manual' && k.disabledUntil > this.now();
+    }
+    return false;
   }
 
   /**
@@ -622,8 +817,13 @@ export class KeyPool {
   removeKey(key: string): boolean {
     const idx = this.keys.findIndex((p) => p.key === key.trim());
     if (idx === -1) return false;
-    this.sha256ByKey.delete(createHash('sha256').update(key.trim(), 'utf8').digest('hex'));
+    const removed = this.keys[idx]!;
+    this.sha256ByKey.delete(this.sha256Hex(key.trim()));
     this.keys.splice(idx, 1);
+    // 移除时清掉持久化禁用（2026-08-15）：否则该指纹的 quota-exhausted 条目留在
+    // pool-disabled.json，重加同一把 key 时本进程内健康、重启后又恢复禁用——
+    // 面板会看到「突然都健康 / 重启后变禁用」的来回跳。
+    this.dropPersistedDisabled(removed);
     return true;
   }
 
@@ -655,6 +855,7 @@ export class KeyPool {
         k.failCount = 0;
         k.lastFailAt = -1;
         delete k.disabledReason;
+        this.dropPersistedDisabled(k);
         this.opts.onStateChange({
           type: 'recovered',
           fingerprint: keyFingerprint(k.key),

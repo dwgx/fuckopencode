@@ -21,9 +21,11 @@
  */
 
 import type { AppConfig } from './config.js';
+import { MICROCENTS_PER_DOLLAR } from './money.js';
 
-/** 换算口径：100,000,000 units = $1（§5.3）。库内全程整数 units，防浮点漂移。 */
-export const UNITS_PER_DOLLAR = 100_000_000;
+/** 换算口径：100,000,000 units = $1（§5.3）。库内全程整数 units，防浮点漂移。
+ *  数值等价 money.ts 的 MICROCENTS_PER_DOLLAR（单一权威常量，B1 根因收敛）。 */
+export const UNITS_PER_DOLLAR = MICROCENTS_PER_DOLLAR;
 
 /** 调度 tick 粒度：每 15min 一次，复用探针 tick（§5.4，不新开定时器密度）。 */
 export const BILLING_TICK_MS = 15 * 60_000;

@@ -20,6 +20,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/write-version.mjs",
     "typecheck": "tsc --noEmit",
+    "check:i18n": "node scripts/check-i18n.mjs",
+    "verify": "npm run typecheck && npm run check:i18n && npm test",
     "test": "vitest run",
     "test:live": "node scripts/live-probe.mjs",
     "serve": "npm run build && node dist/main.js",

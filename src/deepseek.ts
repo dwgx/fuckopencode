@@ -25,14 +25,19 @@ export const DEFAULT_FALLBACK_MODEL = 'deepseek-v4-flash';
  * 无 text；4096 正常出正文）。上游接受大 max_tokens（实测 4096 OK）。
  */
 export const DEEPSEEK_MIN_MAX_TOKENS = 4096;
+/** max_tokens 上限钳制值（上游合法范围 [1, 393216]，留余量避免边缘 400）。 */
+export const DEEPSEEK_MAX_MAX_TOKENS = 390000;
 
 /**
  * 允许对外提供的模型白名单。
  *
- * 上游 `/zen/v1/models` 列了 61 个模型（claude 系、gpt 系、glm 系等），但本网关
- * 只放行 DeepSeek V4 两个变体：不带后缀的走订阅端点（cost=0），`-free` 走按量。
- * 白名单之外的模型名一律回落到 fallback，不透传给上游 —— 公网暴露时这一层
- * 决定了别人拿到 key 也只能用这两个模型，烧不到别的额度。
+ * 上游 `/zen/v1/models` 列了 61 个模型（claude 系、gpt 系、glm 系等）。这是
+ * **代码默认值 + 重置基准**（MODEL-ACCESS 可扩展）：不配置时只放行 DeepSeek
+ * V4 两个变体（不带后缀走订阅端点 cost=0，`-free` 走按量）；配置了 settings
+ * `allowedModels` 后由 cfg.globalAllowedModels 接管（任意合法模型名，claude-*
+ * 系 / gpt-* 系等），此常量成为「重置回默认」的基准。白名单之外由 resolveModel
+ * 明确拒绝（400），不透传；添加的模型是否被上游支持由上游裁决（网关透传上游
+ * 错误）。
  */
 export const ALLOWED_MODELS: ReadonlySet<string> = new Set([
   'deepseek-v4-flash',
@@ -68,13 +73,14 @@ export function resolveModelName(
   modelMap: Record<string, string>,
   fallbackModel: string,
   knownModels?: ReadonlySet<string>,
+  allowedModels: ReadonlySet<string> = ALLOWED_MODELS,
 ): string {
   // 兼容封装：旧调用点（normalizeAnthropicRequest / 库用户）保持「白名单外回落
   // fallback」的旧行为；白名单外的**明确拒绝**由 server 层改用 resolveModel 做。
-  const d = resolveModel(model, modelMap, fallbackModel, knownModels);
+  const d = resolveModel(model, modelMap, fallbackModel, knownModels, allowedModels);
   if (d.ok) return d.model;
   // fallback 本身非法时强制到 flash（与旧实现一致）。
-  return ALLOWED_MODELS.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL;
+  return allowedModels.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL;
 }
 
 /**
@@ -84,8 +90,10 @@ export function resolveModelName(
  * 1. **缺省/空** → 用 fallback（fallback 是唯一允许的回落场景 —— 客户端没给
  *    模型名时不该拒绝，落到默认模型即可）。
  * 2. **alias 映射**（MODEL_MAP，env + 后台运行时映射合并）→ 最终上游名；映射
- *    结果必须本身在 ALLOWED_MODELS 里（防配错把白名单外值引入）。
- * 3. **白名单门**：最终名 ∉ ALLOWED_MODELS → `not-allowed`（**不再静默回落**）。
+ *    结果必须本身在 allowedModels 里（防配错把白名单外值引入）。
+ * 3. **白名单门**：最终名 ∉ allowedModels → `not-allowed`（**不再静默回落**）。
+ *    allowedModels 默认 = 代码默认 ALLOWED_MODELS；server 数据面传
+ *    effectiveGlobalModels(cfg)（= settings 配置或默认），让添加的模型放行。
  * 4. **目录门**：knownModels 非空且最终名 ∉ knownModels 且不 endsWith('-free')
  *    → `not-in-catalog`（`-free` 是按量变体，订阅端点目录里没有，刻意豁免；
  *    目录空 = 未加载，跳过此门 fail-open）。
@@ -95,20 +103,24 @@ export function resolveModel(
   modelMap: Record<string, string>,
   fallbackModel: string,
   knownModels?: ReadonlySet<string>,
+  allowedModels: ReadonlySet<string> = ALLOWED_MODELS,
 ): ModelDecision {
   // 1. 缺省/空 → fallback（唯一允许的回落场景；fallback 非法则强制 flash）。
   if (model == null || model.trim() === '') {
-    return { ok: true, model: ALLOWED_MODELS.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL };
+    return { ok: true, model: allowedModels.has(fallbackModel) ? fallbackModel : DEFAULT_FALLBACK_MODEL };
   }
   // 2+3. 别名映射 → 最终上游名 → 白名单门。
   const mapped = modelMap[model];
   const finalName =
-    mapped != null && ALLOWED_MODELS.has(mapped) ? mapped : ALLOWED_MODELS.has(model) ? model : null;
+    mapped != null && allowedModels.has(mapped) ? mapped : allowedModels.has(model) ? model : null;
   if (finalName === null) {
     return { ok: false, reason: 'not-allowed' };
   }
-  // 4. 目录门（fail-open：knownModels 空/未加载跳过；-free 豁免）。
+  // 4. 目录门（fail-open：knownModels 空/未加载跳过；-free 豁免）。只对**代码
+  //    默认**的模型生效 —— 用户显式添加的模型（∉ ALLOWED_MODELS）跳过目录门，
+  //    直接透传上游，由上游裁决是否支持（「有什么错误给什么错误」）。
   if (
+    ALLOWED_MODELS.has(finalName) &&
     knownModels != null &&
     knownModels.size > 0 &&
     !knownModels.has(finalName) &&
@@ -147,6 +159,7 @@ export function normalizeAnthropicRequest(
   modelMap: Record<string, string>,
   fallbackModel: string,
   compact?: CompactOptions | null,
+  allowedModels: ReadonlySet<string> = ALLOWED_MODELS,
 ): Record<string, unknown> {
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('invalid anthropic request body');
@@ -181,7 +194,7 @@ export function normalizeAnthropicRequest(
 
   // 1. 模型名映射。
   if (typeof body.model === 'string') {
-    body.model = resolveModelName(body.model, modelMap, fallbackModel);
+    body.model = resolveModelName(body.model, modelMap, fallbackModel, undefined, allowedModels);
   }
 
   // 2. thinking 归一化：adaptive→enabled，删 budget_tokens，未知类型删除。
@@ -275,10 +288,15 @@ export function normalizeAnthropicRequest(
   // 8. max_tokens 下限保护：deepseek 的 thinking 计入 max_tokens 预算，客户端小预算
   //    （如 200）会被 thinking 吃光导致正文空。thinking 非 disabled 时把 < 下限的抬到
   //    下限、缺失补下限；≥ 下限保持；thinking disabled 不调（尊重客户端意图）。
+  //    同时钳制上限（实测上游 max_tokens 合法范围 [1, 393216]，超上限直接 400：
+  //    "Invalid max_tokens value, the valid range of max_tokens is [1, 393216]"——
+  //    客户端发 500000 这类超限值会白撞一次 400）。钳到 390000 留余量。
   if (!thinkingDisabled) {
     const current = typeof body.max_tokens === 'number' ? body.max_tokens : undefined;
     if (current == null || current < DEEPSEEK_MIN_MAX_TOKENS) {
       body.max_tokens = DEEPSEEK_MIN_MAX_TOKENS;
+    } else if (current > DEEPSEEK_MAX_MAX_TOKENS) {
+      body.max_tokens = DEEPSEEK_MAX_MAX_TOKENS;
     }
   }
 

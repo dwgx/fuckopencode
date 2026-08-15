@@ -1,12 +1,32 @@
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { KeyPool, ModelNotAllowedError, PoolEmptyError, keyFingerprint } from '../src/keypool.js';
+import { KeyPool, ModelNotAllowedError, PoolEmptyError, keyFingerprint, type PersistedDisable } from '../src/keypool.js';
 import { classifyUpstreamFailure } from '../src/errors.js';
 
 /** 可控时间源，避免测试依赖真实时钟。 */
 function fakeClock(start = 1_000_000): { now: () => number; advance: (ms: number) => void } {
   let t = start;
   return { now: () => t, advance: (ms: number) => { t += ms; } };
+}
+
+/** sha256(key) 全 hex —— 持久化条目键（P1 改全量哈希，末 4 位会碰撞）。 */
+function sha256Hex(k: string): string {
+  return createHash('sha256').update(k, 'utf8').digest('hex');
+}
+
+/** 内存版持久化 harness（新结构：指纹 → {until, reason}，2026-08-15 扩展）。 */
+function memPersist() {
+  const persisted: Record<string, PersistedDisable> = {};
+  return {
+    persisted,
+    persistDisabled: {
+      load: () => ({ ...persisted }),
+      save: (m: Record<string, PersistedDisable>) => {
+        Object.keys(persisted).forEach((k) => delete persisted[k]);
+        Object.assign(persisted, m);
+      },
+    },
+  };
 }
 
 const OPTS = { cooldownMs: 60_000, failThreshold: 3 };
@@ -141,36 +161,43 @@ describe('KeyPool 失败分级与禁用', () => {
     expect(pool.healthyCount).toBe(2);
   });
 
-  it('transient 达到阈值才禁用', () => {
+  it('transient 失败不禁用（瞬时波动不该禁 key，2026-08-15）', () => {
     const clock = fakeClock();
     const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
-    pool.markFailure('a', 'transient');
-    pool.markFailure('a', 'transient');
-    // 未达 failThreshold=3，仍健康。
+    // 远超 failThreshold 的连续 transient 也不禁用、不设冷却、不显示状态。
+    for (let i = 0; i < OPTS.failThreshold * 5; i++) pool.markFailure('a', 'transient');
     expect(pool.healthyCount).toBe(2);
-    pool.markFailure('a', 'transient');
-    expect(pool.healthyCount).toBe(1);
+    const s = pool.snapshot()[0]!;
+    expect(s.healthy).toBe(true);
+    expect(s.disabledReason).toBeUndefined();
+    expect(s.disabledUntil).toBe(0);
+    expect(s.recoverInMs).toBe(0);
   });
 
   it('markSuccess 清零连续失败计数', () => {
     const pool = new KeyPool(['a', 'b'], OPTS);
     pool.markFailure('a', 'transient');
     pool.markFailure('a', 'transient');
+    expect(pool.snapshot()[0]!.failCount).toBe(2);
     pool.markSuccess('a');
-    // 计数已清零，再失败 2 次不该触发禁用。
+    expect(pool.snapshot()[0]!.failCount).toBe(0);
+    // 计数已清零，再失败 2 次只累计、不触发禁用。
     pool.markFailure('a', 'transient');
     pool.markFailure('a', 'transient');
+    expect(pool.snapshot()[0]!.failCount).toBe(2);
     expect(pool.healthyCount).toBe(2);
   });
 
-  it('距上次失败超冷却期视为新一轮，计数清零', () => {
+  it('距上次失败超冷却期视为新一轮，failCount 清零', () => {
     const clock = fakeClock();
     const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
     pool.markFailure('a', 'transient');
     pool.markFailure('a', 'transient');
+    expect(pool.snapshot()[0]!.failCount).toBe(2);
     // 隔了超过 cooldownMs，滑动窗口重置。
     clock.advance(OPTS.cooldownMs + 1);
     pool.markFailure('a', 'transient');
+    expect(pool.snapshot()[0]!.failCount).toBe(1);
     expect(pool.healthyCount).toBe(2);
   });
 
@@ -238,6 +265,67 @@ describe('KeyPool.quotaEmptyError（池空透传 GoUsageLimitError）', () => {
     expect(pool.snapshot()[0]!.recoverInMs).toBe(3 * 86_400_000 + 60_000);
   });
 
+  it('quota-exhausted 长冷却持久化：禁用写入 + 重启恢复 + 到期清除（2026-08-15）', () => {
+    // 重启后冷却丢失是真实事故：0osU 14:35 禁（24h）→ 网关重启 → 15:13 又被选
+    // 再撞 429。持久化 quota-exhausted 到磁盘，重启恢复禁用直到冷却到期。
+    const clock = fakeClock();
+    const { persisted, persistDisabled } = memPersist();
+    // ① markFailure quota-exhausted → 写入持久化（新结构 {until, reason}，sha256 键）
+    const poolA = new KeyPool(['a'], { ...OPTS, now: clock.now, persistDisabled });
+    poolA.markFailure('a', 'quota-exhausted', 3 * 86_400_000);
+    expect(persisted[sha256Hex('a')]).toEqual({
+      until: 3 * 86_400_000 + 60_000 + clock.now(),
+      reason: 'quota-exhausted',
+    });
+    // ② 模拟重启：新池构造时加载持久化 → key 恢复禁用（quota-exhausted）
+    const poolB = new KeyPool(['a'], { ...OPTS, now: clock.now, persistDisabled });
+    const snap = poolB.snapshot()[0]!;
+    expect(snap.healthy).toBe(false);
+    expect(snap.disabledReason).toBe('quota-exhausted');
+    // ③ 冷却到期（推进时间）→ acquire 触发 reapRecovered → 从持久化清除
+    clock.advance(3 * 86_400_000 + 61_000);
+    poolB.acquire();
+    expect(poolB.snapshot()[0]!.healthy).toBe(true);
+    expect(persisted[sha256Hex('a')]).toBeUndefined();
+    // ④ 短冷却（rate-limit）不持久化
+    poolB.markFailure('a', 'rate-limit');
+    expect(persisted[sha256Hex('a')]).toBeUndefined();
+  });
+
+  it('持久化恢复的禁用不被 reapRecovered 提前清（时间未到，2026-08-15）', () => {
+    // 回归（任务 2）：重启后从 pool-disabled.json 恢复的 quota-exhausted 禁用，
+    // 冷却未到期时 acquire 触发的 reapRecovered 不得把它清掉——否则 0osU（周额度
+    // 100%）重启后又会被重新选号、每个请求先撞一次 429 再换号。
+    const clock = fakeClock();
+    const { persisted, persistDisabled } = memPersist();
+    const FP_0OSU = keyFingerprint('sk-key-0osU');
+    // ① 原进程：0osU 额度耗尽 → 24h 兜底冷却写入持久化（sha256 键）。
+    const poolA = new KeyPool(['sk-key-0osU'], { ...OPTS, now: clock.now, persistDisabled });
+    poolA.markFailure('sk-key-0osU', 'quota-exhausted');
+    expect(persisted[sha256Hex('sk-key-0osU')]).toEqual({
+      until: clock.now() + 24 * 3_600_000,
+      reason: 'quota-exhausted',
+    });
+    // ② 模拟重启：新池构造加载持久化 → 0osU 恢复禁用（配额 key + 一把健康 key）。
+    const poolB = new KeyPool(['sk-key-0osU', 'sk-key-ok'], { ...OPTS, now: clock.now, persistDisabled });
+    // ③ 冷却远未到期：多次 acquire 触发 reapRecovered，0osU 必须保持禁用。
+    for (let i = 0; i < 3; i++) {
+      poolB.acquire(); // 走 'sk-key-ok'，同时触发 reapRecovered
+      const s = poolB.snapshot().find((x) => x.fingerprint === FP_0OSU)!;
+      expect(s.healthy, `第 ${i + 1} 次 acquire 后 0osU 应保持禁用`).toBe(false);
+      expect(s.disabledReason).toBe('quota-exhausted');
+      expect(s.disabledUntil).toBe(clock.now() + 24 * 3_600_000);
+    }
+    expect(persisted[sha256Hex('sk-key-0osU')]).toBeDefined(); // 持久化条目也未被提前清
+    // ④ 冷却到期 + acquire 触发 reapRecovered → 才恢复，并从持久化清除。
+    clock.advance(24 * 3_600_000 + 1_000);
+    poolB.acquire();
+    const rec = poolB.snapshot().find((x) => x.fingerprint === FP_0OSU)!;
+    expect(rec.healthy).toBe(true);
+    expect(rec.disabledReason).toBeUndefined();
+    expect(persisted[sha256Hex('sk-key-0osU')]).toBeUndefined();
+  });
+
   it('禁用原因混着非额度（auth/transient）→ 不伪装成额度问题，返回 null', () => {
     const clock = fakeClock();
     const pool = new KeyPool(['a', 'b'], { ...OPTS, now: clock.now });
@@ -258,6 +346,141 @@ describe('KeyPool.quotaEmptyError（池空透传 GoUsageLimitError）', () => {
     pool.noteQuotaError(429, QUOTA_BODY);
     pool.markFailure('a', 'quota-exhausted', 3 * 86_400_000);
     expect(pool.quotaEmptyError).toBeNull();
+  });
+});
+
+describe('KeyPool 长冷却持久化扩展（auth/manual/modelBlocks/旧格式迁移，2026-08-15）', () => {
+  it('auth 禁用持久化：重启恢复，坏 key 不回池撞 401', () => {
+    const clock = fakeClock();
+    const { persisted, persistDisabled } = memPersist();
+    // ① auth 失败 → 写入持久化（reason='auth'，12×cooldown，sha256 键）
+    const poolA = new KeyPool(['sk-key-auth1'], { ...OPTS, now: clock.now, persistDisabled });
+    poolA.markFailure('sk-key-auth1', 'auth');
+    expect(persisted[sha256Hex('sk-key-auth1')]).toEqual({
+      until: clock.now() + OPTS.cooldownMs * 12,
+      reason: 'auth',
+    });
+    // ② 模拟重启：新池构造加载 → key 恢复禁用（auth），不会回池撞 401
+    const poolB = new KeyPool(['sk-key-auth1', 'sk-key-ok'], { ...OPTS, now: clock.now, persistDisabled });
+    const snap = poolB.snapshot().find((s) => s.fingerprint === keyFingerprint('sk-key-auth1'))!;
+    expect(snap.healthy).toBe(false);
+    expect(snap.disabledReason).toBe('auth');
+    expect(snap.recoverInMs).toBe(OPTS.cooldownMs * 12);
+    // ③ 冷却到期 + acquire → 恢复并从持久化清除
+    clock.advance(OPTS.cooldownMs * 12 + 1);
+    poolB.acquire();
+    const rec = poolB.snapshot().find((s) => s.fingerprint === keyFingerprint('sk-key-auth1'))!;
+    expect(rec.healthy).toBe(true);
+    expect(rec.disabledReason).toBeUndefined();
+    expect(persisted[sha256Hex('sk-key-auth1')]).toBeUndefined();
+  });
+
+  it('manual 禁用持久化：操作员停用跨重启生效，reset 清除', () => {
+    const clock = fakeClock();
+    const { persisted, persistDisabled } = memPersist();
+    const poolA = new KeyPool(['sk-key-manual1'], { ...OPTS, now: clock.now, persistDisabled });
+    expect(poolA.disable('sk-key-manual1')).toBe(true);
+    expect(persisted[sha256Hex('sk-key-manual1')]).toEqual({
+      until: Number.MAX_SAFE_INTEGER,
+      reason: 'manual',
+    });
+    // 模拟重启：新池构造加载 → key 恢复禁用（manual），探活不拉起它（staleKeys 跳过禁用中）
+    const poolB = new KeyPool(['sk-key-manual1', 'sk-key-ok'], { ...OPTS, now: clock.now, persistDisabled });
+    const snap = poolB.snapshot().find((s) => s.fingerprint === keyFingerprint('sk-key-manual1'))!;
+    expect(snap.healthy).toBe(false);
+    expect(snap.disabledReason).toBe('manual');
+    expect(snap.disabledUntil).toBe(Number.MAX_SAFE_INTEGER);
+    expect(poolB.staleKeys(0).map((s) => s.fingerprint)).not.toContain(keyFingerprint('sk-key-manual1'));
+    // reset 显式恢复 + 清持久化
+    poolB.reset('sk-key-manual1');
+    const rec = poolB.snapshot().find((s) => s.fingerprint === keyFingerprint('sk-key-manual1'))!;
+    expect(rec.healthy).toBe(true);
+    expect(rec.disabledReason).toBeUndefined();
+    expect(persisted[sha256Hex('sk-key-manual1')]).toBeUndefined();
+  });
+
+  it('P1：末 4 位相同的两把 key 持久化条目互不干扰（sha256 键，不再指纹碰撞）', () => {
+    // 两把 key 末 4 位都是 1111 → keyFingerprint 都是 ****1111。旧实现用指纹做
+    // 持久化键，禁用一把会互踩另一把的条目；sha256 全量哈希键互不干扰。
+    const clock = fakeClock();
+    const { persisted, persistDisabled } = memPersist();
+    const ka = 'sk-key-aaaa1111';
+    const kb = 'sk-key-bbbb1111';
+    const pool = new KeyPool([ka, kb], { ...OPTS, now: clock.now, persistDisabled });
+    // 只禁用 ka（quota-exhausted）：持久化只写 ka 的 sha256 条目。
+    pool.markFailure(ka, 'quota-exhausted', 24 * 3_600_000);
+    expect(persisted[sha256Hex(ka)]).toBeDefined();
+    expect(persisted[sha256Hex(kb)]).toBeUndefined();
+    // 模拟重启：只有 ka 恢复禁用，kb 仍健康（acquire 只可能选中 kb）。
+    const poolB = new KeyPool([ka, kb], { ...OPTS, now: clock.now, persistDisabled });
+    expect(poolB.healthyCount).toBe(1);
+    expect(poolB.acquire()).toBe(kb);
+    // 恢复 ka 的冷却后（reapRecovered）只清 ka 的条目，kb 条目从头到尾没出现过。
+    clock.advance(24 * 3_600_000 + 60_000 + 1_000); // quota 冷却含 60s 余量
+    poolB.acquire();
+    expect(persisted[sha256Hex(ka)]).toBeUndefined();
+  });
+
+  it('旧格式 ****XXXX 键迁移：加载按指纹恢复冷却，写入后归一为 sha256 键（2026-08-16 P1）', () => {
+    // 线上 pool-disabled.json 是旧格式：键 = 末 4 位指纹（****0osU），值 = 纯数字
+    // until。加载时按 keyFingerprint 匹配恢复冷却（0osU 冷却保留），写入时归一为
+    // sha256 键（旧指纹键移除）。
+    const clock = fakeClock();
+    const fp = keyFingerprint('sk-key-0osU'); // ****0osU
+    const file: Record<string, number | PersistedDisable> = {
+      [fp]: clock.now() + 24 * 3_600_000,
+    };
+    const persistDisabled = {
+      load: () => ({ ...file }),
+      save: (m: Record<string, PersistedDisable>) => {
+        Object.keys(file).forEach((k) => delete file[k]);
+        Object.assign(file, m);
+      },
+    };
+    // ① 旧格式加载：0osU 冷却保留（reason 归为 quota-exhausted）。
+    const pool = new KeyPool(['sk-key-0osU', 'sk-key-ok'], { ...OPTS, now: clock.now, persistDisabled });
+    const osu = pool.snapshot().find((s) => s.fingerprint === fp)!;
+    expect(osu.healthy).toBe(false);
+    expect(osu.disabledReason).toBe('quota-exhausted');
+    expect(pool.healthyCount).toBe(1);
+    // ② 一次更长的写入触发归一：文件键迁移为 sha256，旧指纹键移除，冷却值保留。
+    pool.markFailure('sk-key-0osU', 'quota-exhausted', 30 * 24 * 3_600_000);
+    expect(file[sha256Hex('sk-key-0osU')]).toEqual({
+      until: clock.now() + 30 * 24 * 3_600_000 + 60_000,
+      reason: 'quota-exhausted',
+    });
+    expect(file[fp]).toBeUndefined();
+    // ③ 再重启：新格式（sha256 键）加载 → 冷却仍保留。
+    const poolC = new KeyPool(['sk-key-0osU', 'sk-key-ok'], { ...OPTS, now: clock.now, persistDisabled });
+    const osu2 = poolC.snapshot().find((s) => s.fingerprint === fp)!;
+    expect(osu2.healthy).toBe(false);
+    expect(poolC.healthyCount).toBe(1);
+  });
+
+  it('m-3：非法 reason 条目丢弃（手改/损坏的 reason 不恢复禁用、面板不显示脏值）', () => {
+    const clock = fakeClock();
+    const badHash = sha256Hex('sk-key-badx');
+    const okHash = sha256Hex('sk-key-okok');
+    const file: Record<string, number | PersistedDisable> = {
+      [badHash]: { until: clock.now() + 24 * 3_600_000, reason: 'xxx' as unknown as PersistedDisable['reason'] },
+      [okHash]: { until: clock.now() + 24 * 3_600_000, reason: 'auth' },
+    };
+    const persistDisabled = {
+      load: () => ({ ...file }),
+      save: (m: Record<string, PersistedDisable>) => {
+        Object.keys(file).forEach((k) => delete file[k]);
+        Object.assign(file, m);
+      },
+    };
+    const pool = new KeyPool(['sk-key-badx', 'sk-key-okok'], { ...OPTS, now: clock.now, persistDisabled });
+    // 非法 reason 条目整体丢弃 → 该 key 不恢复禁用（宁可不禁，也不让脏原因冻住 key）。
+    const bad = pool.snapshot().find((s) => s.fingerprint === keyFingerprint('sk-key-badx'))!;
+    expect(bad.healthy).toBe(true);
+    expect(bad.disabledReason).toBeUndefined();
+    // 合法条目照常恢复。
+    const ok = pool.snapshot().find((s) => s.fingerprint === keyFingerprint('sk-key-okok'))!;
+    expect(ok.healthy).toBe(false);
+    expect(ok.disabledReason).toBe('auth');
   });
 });
 
@@ -291,14 +514,10 @@ describe('KeyPool 状态变更回调（禁用/恢复可观测性）', () => {
     expect(ev.poolSize).toBe(2);
   });
 
-  it('禁用上报：transient 达到阈值也上报，且不泄露原文', () => {
+  it('禁用上报：transient 不触发禁用事件（不禁用所以无事件，2026-08-15）', () => {
     const pool = makePool(['sk-secret-tail1234', 'b']);
-    pool.markFailure('sk-secret-tail1234', 'transient');
-    pool.markFailure('sk-secret-tail1234', 'transient');
-    pool.markFailure('sk-secret-tail1234', 'transient');
-    expect(events).toHaveLength(1);
-    expect(events[0]).toContain('****1234');
-    expect(events[0]).not.toContain('secret');
+    for (let i = 0; i < OPTS.failThreshold * 3; i++) pool.markFailure('sk-secret-tail1234', 'transient');
+    expect(events).toHaveLength(0);
   });
 
   it('禁用上报：quota-exhausted 带真实重置冷却', () => {
@@ -535,12 +754,12 @@ describe('KeyPool.snapshot（面板可观测面）', () => {
     const pool = new KeyPool([ka!, kb!, kc!], { ...OPTS, now: clock.now });
     pool.markFailure(ka!, 'auth');
     pool.markFailure(kb!, 'rate-limit');
-    for (let i = 0; i < 3; i++) pool.markFailure(kc!, 'transient'); // 达阈值才禁
+    pool.markFailure(kc!, 'quota-exhausted', 1000); // 额度耗尽（短重置），恢复后清空原因
 
     const reasons = new Map(pool.snapshot().map((s) => [s.fingerprint, s.disabledReason]));
     expect(reasons.get(keyFingerprint(ka!))).toBe('auth');
     expect(reasons.get(keyFingerprint(kb!))).toBe('rate-limit');
-    expect(reasons.get(keyFingerprint(kc!))).toBe('transient');
+    expect(reasons.get(keyFingerprint(kc!))).toBe('quota-exhausted');
 
     // 冷却全部到期 + acquire 触发 reapRecovered → 原因清空，不留「healthy 但带原因」
     clock.advance(OPTS.cooldownMs * 100);
@@ -586,7 +805,7 @@ describe('KeyPool.policy（面板要能解释「为什么恢复时刻是这个�
     expect(p.failThreshold).toBe(OPTS.failThreshold);
     expect(p.strategy).toBe('least-loaded');
     expect(p.rules.map((r) => r.kind).sort()).toEqual(
-      ['auth', 'quota-exhausted', 'rate-limit', 'transient'],
+      ['auth', 'quota-exhausted', 'rate-limit'],
     );
   });
 
@@ -617,20 +836,16 @@ describe('KeyPool.policy（面板要能解释「为什么恢复时刻是这个�
     expect(pool.snapshot()[0]!.recoverInMs).toBe(declared);
   });
 
-  it('transient 声明「累计到阈值才禁用」，行为确实如此', () => {
+  it('policy 不再声明 transient 规则：瞬时波动不禁用、不显示（2026-08-15）', () => {
     const clock = fakeClock();
     const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
-    const rule = pool.policy().rules.find((r) => r.kind === 'transient')!;
-    expect(rule.countsToThreshold).toBe(true);
-    // 差一次不该被禁用。
-    for (let i = 0; i < OPTS.failThreshold - 1; i++) pool.markFailure(KEY, 'transient');
-    expect(pool.snapshot()[0]!.healthy).toBe(true);
-    pool.markFailure(KEY, 'transient');
-    expect(pool.snapshot()[0]!.healthy).toBe(false);
-    // 首次触发的退避基数就是声明的 ms（抖动 ±20%）。
-    const actual = pool.snapshot()[0]!.recoverInMs;
-    expect(actual).toBeGreaterThanOrEqual(Math.floor(rule.ms! * 0.8));
-    expect(actual).toBeLessThanOrEqual(Math.ceil(rule.ms! * 1.2));
+    expect(pool.policy().rules.map((r) => r.kind)).not.toContain('transient');
+    // 行为与声明一致：连续 transient 从不触发禁用、不设冷却。
+    for (let i = 0; i < OPTS.failThreshold * 3; i++) pool.markFailure(KEY, 'transient');
+    const s = pool.snapshot()[0]!;
+    expect(s.healthy).toBe(true);
+    expect(s.disabledUntil).toBe(0);
+    expect(s.disabledReason).toBeUndefined();
   });
 
   it('quota-exhausted 声明「时长由上游决定」+ 兜底值，行为确实如此', () => {
@@ -666,7 +881,7 @@ describe('KeyPool.policy（面板要能解释「为什么恢复时刻是这个�
 describe('markFailure 只延长冷却，不缩短（迟到的失败上报不能冲掉长冷却）', () => {
   const KEY = 'sk-key-aaaa';
 
-  it('额度耗尽后收到迟到的 transient：19h 冷却不被 4 分钟冲掉，原因也不改', () => {
+  it('额度耗尽后收到迟到的 transient：19h 冷却不被冲掉，原因也不改', () => {
     const clock = fakeClock();
     const pool = new KeyPool([KEY], { ...OPTS, now: clock.now });
     // 19 小时的周额度冷却（上游给的重置时间 + 60s 余量）。
@@ -674,8 +889,9 @@ describe('markFailure 只延长冷却，不缩短（迟到的失败上报不能�
     const long = pool.snapshot()[0]!.recoverInMs;
     expect(long).toBeGreaterThan(18 * 3_600_000);
 
-    // 同一 key 上早于禁用就已 acquire 的流中途断掉，连续上报 transient 直到达阈值。
-    for (let i = 0; i < OPTS.failThreshold; i++) pool.markFailure(KEY, 'transient');
+    // 同一 key 上早于禁用就已 acquire 的流中途断掉，上报 transient（瞬时波动
+    // 不禁用、不动冷却——连 failThreshold 次的旧语义都已移除）。
+    for (let i = 0; i < OPTS.failThreshold * 2; i++) pool.markFailure(KEY, 'transient');
 
     const s = pool.snapshot()[0]!;
     expect(s.disabledReason).toBe('quota-exhausted');
@@ -798,6 +1014,19 @@ describe('KeyPool 账户归属（多账号面板）', () => {
     expect(pool.healthyCount).toBe(1);
     // 剩余 key 正常工作。
     expect(pool.acquire()).toBe('sk-bbb-2');
+  });
+
+  it('removeKey 清掉持久化禁用条目（重加同一 key 不再重启后复活禁用，2026-08-15）', () => {
+    const clock = fakeClock();
+    const { persisted, persistDisabled } = memPersist();
+    const pool = new KeyPool(['sk-key-0osU'], { ...OPTS, now: clock.now, persistDisabled });
+    pool.markFailure('sk-key-0osU', 'quota-exhausted', 24 * 3_600_000);
+    expect(persisted[sha256Hex('sk-key-0osU')]).toBeDefined();
+    expect(pool.removeKey('sk-key-0osU')).toBe(true);
+    // 移除即清持久化：重加同一 key 从干净状态开始，重启后不会被旧条目复活禁用。
+    expect(persisted[sha256Hex('sk-key-0osU')]).toBeUndefined();
+    expect(pool.addKey('sk-key-0osU', 1)).toBe(true);
+    expect(pool.snapshot().find((s) => s.fingerprint === keyFingerprint('sk-key-0osU'))!.healthy).toBe(true);
   });
 });
 
@@ -971,5 +1200,78 @@ describe('KeyPool sha256 指纹预计算索引（P2-4）', () => {
     // 删除未知 key 不改索引。
     expect(pool.removeKey('sk-nope')).toBe(false);
     expect(pool.hasKeyWithHash(sha256('sk-nope'))).toBe(false);
+  });
+});
+
+describe('KeyPool 手动禁用（面板 disable / reset）', () => {
+  it('disable 健康 key：立即禁用，reason=manual，acquire 抛 PoolEmptyError，reset 恢复', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['sk-manual-tail'], { ...OPTS, now: clock.now });
+    expect(pool.healthyCount).toBe(1);
+    expect(pool.disable('sk-manual-tail')).toBe(true);
+    expect(pool.healthyCount).toBe(0);
+    const snap = pool.snapshot()[0]!;
+    expect(snap.healthy).toBe(false);
+    expect(snap.disabledReason).toBe('manual');
+    // 默认停用「直到手动恢复」（一年量级），不会自动恢复。
+    expect(snap.recoverInMs).toBeGreaterThan(300 * 24 * 3_600_000);
+    expect(() => pool.acquire()).toThrow(PoolEmptyError);
+    pool.reset('sk-manual-tail');
+    expect(pool.healthyCount).toBe(1);
+    expect(pool.snapshot()[0]!.disabledReason).toBeUndefined();
+  });
+
+  it('manual 哨兵 until：永不自动到期，reset 才恢复（MINOR 365 天复活修复）', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['sk-manual-tail'], { ...OPTS, now: clock.now });
+    expect(pool.disable('sk-manual-tail')).toBe(true);
+    expect(pool.snapshot()[0]!.disabledUntil).toBe(Number.MAX_SAFE_INTEGER);
+    // 越过任何现实冷却量级（远超原 365 天 horizon）：manual 必须仍禁用。
+    clock.advance(400 * 24 * 3_600_000);
+    expect(pool.healthyCount).toBe(0);
+    expect(pool.snapshot()[0]!.disabledReason).toBe('manual');
+    // 自动冷却（rate-limit）无法覆盖 manual：哨兵是「只延长不缩短」守卫的上界。
+    pool.markFailure('sk-manual-tail', 'rate-limit');
+    expect(pool.healthyCount).toBe(0);
+    expect(pool.snapshot()[0]!.disabledReason).toBe('manual');
+    // reset 显式恢复。
+    pool.reset('sk-manual-tail');
+    expect(pool.healthyCount).toBe(1);
+  });
+
+  it('disable 未知 key → false，池不受影响', () => {
+    const pool = new KeyPool(['a'], OPTS);
+    expect(pool.disable('nope')).toBe(false);
+    expect(pool.healthyCount).toBe(1);
+  });
+
+  it('disable 盖过失败冷却（操作员显式停用优先），reset 一并清掉', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['a'], { ...OPTS, now: clock.now });
+    pool.markFailure('a', 'auth');
+    expect(pool.snapshot()[0]!.disabledReason).toBe('auth');
+    expect(pool.disable('a')).toBe(true);
+    expect(pool.snapshot()[0]!.disabledReason).toBe('manual');
+    pool.reset('a');
+    expect(pool.healthyCount).toBe(1);
+  });
+
+  it('手动禁用计入 disabledFingerprints 但不冒充额度耗尽（quotaEmptyError=null）', () => {
+    const clock = fakeClock();
+    const pool = new KeyPool(['sk-x-1234', 'sk-x-5678'], { ...OPTS, now: clock.now });
+    pool.noteQuotaError(429, { error: { type: 'GoUsageLimitError', message: 'Resets in 3 days.' } });
+    pool.markFailure('sk-x-1234', 'quota-exhausted', 3 * 86_400_000);
+    pool.disable('sk-x-5678'); // 手动禁用：池空但不全是额度耗尽
+    expect(pool.healthyCount).toBe(0);
+    expect(pool.quotaEmptyError).toBeNull(); // 不该伪装成额度问题透传 429
+    expect(pool.disabledFingerprints().sort()).toEqual(['****1234', '****5678'].sort());
+  });
+
+  it('keyByFingerprint：按 ****XXXX 找明文（进程内），未命中返回 null', () => {
+    const pool = new KeyPool(['sk-a-1234', 'sk-b-5678'], OPTS);
+    expect(pool.keyByFingerprint('****1234')).toBe('sk-a-1234');
+    expect(pool.keyByFingerprint('****5678')).toBe('sk-b-5678');
+    expect(pool.keyByFingerprint('****nope')).toBeNull();
+    expect(pool.keyByFingerprint('1234')).toBeNull(); // 必须带 **** 前缀
   });
 });

@@ -58,7 +58,7 @@
  *    monthlyLimit:null / monthlyUsage:0 / timeMonthlyUsageUpdated:
  *    new Date(...) / reloadError / subscription / lite / liteSubscriptionID`。
  *    金额口径分两种：**balance / monthlyLimit / payment.amount 是整数 units**
- *    （1e8 = $1，与 billing.ts 的 UNITS_PER_DOLLAR 一致；实测余额 0、
+ *    （1e8 = $1，与 money.ts 的 MICROCENTS_PER_DOLLAR 一致；实测余额 0、
  *    $5.00 支付 = 500000000）；**reloadAmount / reloadTrigger 是美元整数**
  *    （form 表单值，min 值 10/5 只能是美元不是 units）。
  * 2. `payment.list["wrk_..."]` 槽位 resolve 数组，元素实测字段：
@@ -69,7 +69,8 @@
  *    解析按对象 `{amount,trigger}` 防御式处理，兜底读顶层字段。
  */
 
-import { UNITS_PER_DOLLAR, type FetchLike } from './billing.js';
+import type { FetchLike } from './billing.js';
+import { MICROCENTS_PER_DOLLAR } from './money.js';
 
 /** 单次上游调用超时（与 console.ts 同款）。 */
 export const LEGACY_TIMEOUT_MS = 15_000;
@@ -681,7 +682,7 @@ export interface LegacyBillingReload {
 
 /** 一条支付记录（payment.list 水合元素）。 */
 export interface LegacyBillingPayment {
-  /** 金额（美元；水合 amount 是整数 units，UNITS_PER_DOLLAR = $1）。 */
+  /** 金额（美元；水合 amount 是整数 units，MICROCENTS_PER_DOLLAR = $1）。 */
   amount: number;
   /** 支付时间（timeCreated 的 Date 字符串，ISO；缺失为 null）。 */
   date: string | null;
@@ -783,7 +784,7 @@ export function parseLegacyBillingHtml(html: string, workspaceId: string): Legac
       const coupon = enr && enr !== 'null' ? /couponID:"([^"]+)"/.exec(enr)?.[1] ?? null : null;
       const description = [enrType, coupon].filter((x): x is string => x !== null).join(' · ') || null;
       payments.push({
-        amount: num(/amount:(\d+)/.exec(seg)?.[1], 0) / UNITS_PER_DOLLAR,
+        amount: num(/amount:(\d+)/.exec(seg)?.[1], 0) / MICROCENTS_PER_DOLLAR,
         date: /timeCreated:(?:\$R\[\d+\]=)?new Date\("([^"]+)"\)/.exec(seg)?.[1] ?? null,
         description,
       });
@@ -792,10 +793,10 @@ export function parseLegacyBillingHtml(html: string, workspaceId: string): Legac
 
   const monthly = /monthlyLimit:(null|\d+)/.exec(billingRaw)?.[1];
   return {
-    balanceDollars: num(/balance:(\d+)/.exec(billingRaw)?.[1], 0) / UNITS_PER_DOLLAR,
+    balanceDollars: num(/balance:(\d+)/.exec(billingRaw)?.[1], 0) / MICROCENTS_PER_DOLLAR,
     reload,
     payments,
-    monthlyLimitDollars: monthly === 'null' || monthly === undefined ? null : Number(monthly) / UNITS_PER_DOLLAR,
+    monthlyLimitDollars: monthly === 'null' || monthly === undefined ? null : Number(monthly) / MICROCENTS_PER_DOLLAR,
   };
 }
 

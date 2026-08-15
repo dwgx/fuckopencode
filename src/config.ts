@@ -97,12 +97,31 @@ export interface AppConfig {
    */
   maxConcurrentRequests?: number;
   /**
+   * 全局 RPM 上限（数据面整体保护）：所有数据面真实请求（/v1/chat/completions
+   * + /v1/messages）共享一个滑窗计数（ratelimit.ts，key='__global__'），超限
+   * 429 + Retry-After —— 补上「N 个 token 各打满 RPM → 总请求爆炸」的缺口
+   * （并发门 400 只防同时堆积，不防单位时间洪峰）。count_tokens/healthz/
+   * 静态路径不计入。**0 = 关闭（默认，不改变现状行为）**。settings 热配置
+   * globalRpmLimit 运行时覆盖（env GLOBAL_RPM_LIMIT 是启动默认）。
+   */
+  globalRpmLimit?: number;
+  /**
    * 全局默认模型白名单（MODEL-ACCESS.md）：settings 热配置 `allowedModels`
    * 应用后的运行时值。默认 = ALLOWED_MODELS 硬底线（代码常量，不可放宽——
    * 任何配置层都只能收窄）。config.ts 总是生成；数据面读取用
    * `effectiveGlobalModels(cfg)`（可选字段，测试字面量可省略）。
    */
   globalAllowedModels?: ReadonlySet<string>;
+  /**
+   * 上游级熔断（B1）：连续 UPSTREAM_CIRCUIT 阈值次「头超时/网络错误」→ 熔断，
+   * 熔断期内数据面请求直接 502 + Retry-After（不占并发槽、不发上游）。
+   * 状态进程内（重启清零），阈值/熔断期见 upstream.ts 模块常量。
+   * **默认开**（保护性：只在连续超时时触发，正常流量不受影响）；0 关闭。
+   * 区别于 keypool 的 key 级 transient（短瞬 5xx 由 key 级处理，熔断不管）。
+   * 可选字段：config.ts 总是生成；server/upstream 侧兜底 `?? true`（默认开），
+   * 测试字面量可省略。
+   */
+  upstreamCircuitBreaker?: boolean;
   /** 单条消息文本字符上限 */
   maxMessageChars: number;
   /** messages 条数上限（防超长列表遍历 DoS；0 = 不限）。 */
@@ -257,8 +276,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // data/secret.key（不存在自动生成 0600）。用于加密账户 key 与 billing cookie。
     gatewaySecret: env.GATEWAY_SECRET ? String(env.GATEWAY_SECRET) : null,
     secretFilePath: env.SECRET_FILE || 'data/secret.key',
-    // 全局默认模型白名单：默认 = ALLOWED_MODELS 硬底线（MODEL-ACCESS）。
-    // settings 热配置 `allowedModels` 应用时覆盖（只能收窄）。
+    // 全局默认模型白名单：默认 = 代码默认 ALLOWED_MODELS（deepseek 两个）。
+    // settings 热配置 `allowedModels` 应用时覆盖（可扩展任意合法模型名）。
     globalAllowedModels: new Set(ALLOWED_MODELS),
     // 面板登录凭证：账号密码（默认 admin/DEFAULT_ADMIN_PASS，默认密码有告警）。
     // 登录成功签发 HttpOnly 会话 cookie（24h），与 API key 并存。
@@ -286,10 +305,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // 两者都支持 0 = 不限制。
     maxBodyBytes: intFromEnv(env.MAX_BODY_BYTES, 64 * 1024 * 1024),
     maxConcurrentRequests: intFromEnv(env.MAX_CONCURRENT_REQUESTS, 400),
+    // 全局 RPM（数据面整体保护）：默认 0 = 关闭（不改变现状行为），
+    // 面板设置页可热配覆盖。见 AppConfig.globalRpmLimit 注释。
+    globalRpmLimit: intFromEnv(env.GLOBAL_RPM_LIMIT, 0),
     maxMessageChars: intFromEnv(env.MAX_MESSAGE_CHARS, 8_000_000),
     // messages 条数上限：默认 4000 —— 2000 对 Claude Code 超长会话太紧
     // （实测线上真实请求超限被 400）。0 = 不限（不推荐）。
     maxMessages: intFromEnv(env.MAX_MESSAGES, 4_000, 0),
+    // 上游级熔断（B1）：默认开。连续 5 次头超时/网络错误才触发 30s 熔断，
+    // 正常流量不受影响（见 upstream.ts circuitShouldReject 注释）。
+    upstreamCircuitBreaker: boolFromEnv(env.UPSTREAM_CIRCUIT_BREAKER, true),
     stripControlChars: boolFromEnv(env.STRIP_CONTROL_CHARS, true),
     trustClaudeCodeHeaders: boolFromEnv(env.TRUST_CLAUDE_CODE_HEADERS, false),
     // 面板含设备信息，只在本机绑定时免鉴权。默认关闭（fail-closed）——

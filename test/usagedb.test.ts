@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { performance } from 'node:perf_hooks';
 import { UsageDb, defaultDbPath, type UsageRow } from '../src/usagedb.js';
 
 /** 每个用例一个独立临时目录，避免 db 文件互相污染。 */
@@ -500,6 +501,74 @@ describe('UsageDb 批量异步落库（热路径优化）', () => {
     const page = db.listRequests(1, 10)!;
     expect(page.items[0]!.client).toBe('Preparsed');
     db.close();
+  });
+
+  it('I-13：flush 首次失败（mock busy）→ 放回队首重试成功 → 行不丢', () => {
+    vi.useFakeTimers();
+    try {
+      const p = path.join(tmpDir, 'flush-retry.db');
+      const db = new UsageDb(p, 30, log);
+      db.recordRequest(row({ at: Date.now() - 1000, keyFingerprint: '****retry' }));
+      const raw = db.sqlite()!;
+      const origExec = raw.exec.bind(raw);
+      // 只让第一次 COMMIT 抛错（模拟 SQLITE_BUSY），事务 ROLLBACK 后整批放回队首。
+      let commitFails = 1;
+      raw.exec = ((sql: string) => {
+        if (typeof sql === 'string' && sql === 'COMMIT' && commitFails > 0) {
+          commitFails -= 1;
+          throw new Error('simulated SQLITE_BUSY on commit');
+        }
+        return origExec(sql);
+      }) as typeof raw.exec;
+
+      db.flush();
+      // 首次失败：行未提交（已回滚），放回队首等 200ms 重试，不丢弃。
+      expect(committedCount(p)).toBe(0);
+      expect(logs.some((l) => l.includes('放回队首'))).toBe(true);
+
+      // 200ms 后重试：busy 消失，重试成功，行落库（修复前整批丢弃）。
+      vi.advanceTimersByTime(250);
+      expect(committedCount(p)).toBe(1);
+      expect(db.history()!.totalRequests).toBe(1);
+      raw.exec = origExec;
+      db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('I-13：连续两次失败 → 丢弃整批 + 记日志（不无限重试）', () => {
+    vi.useFakeTimers();
+    try {
+      const p = path.join(tmpDir, 'flush-drop.db');
+      const db = new UsageDb(p, 30, log);
+      db.recordRequest(row({ at: Date.now() - 1000, keyFingerprint: '****drop2' }));
+      const raw = db.sqlite()!;
+      const origExec = raw.exec.bind(raw);
+      // 连续两次 COMMIT 都失败：首次失败放回队首，重试仍失败才丢弃。
+      let commitFails = 2;
+      raw.exec = ((sql: string) => {
+        if (typeof sql === 'string' && sql === 'COMMIT' && commitFails > 0) {
+          commitFails -= 1;
+          throw new Error('simulated SQLITE_BUSY on commit');
+        }
+        return origExec(sql);
+      }) as typeof raw.exec;
+
+      db.flush(); // 第一次失败 → 放回队首
+      vi.advanceTimersByTime(250); // 重试又失败 → 丢弃整批
+      expect(committedCount(p)).toBe(0);
+      expect(logs.some((l) => l.includes('仍失败') && l.includes('丢 1 条'))).toBe(true);
+      raw.exec = origExec;
+
+      // 丢弃后重试计数清零：后续正常写入不受影响。
+      db.recordRequest(row({ at: Date.now() - 500, keyFingerprint: '****drop2' }));
+      db.flush();
+      expect(committedCount(p)).toBe(1);
+      db.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1294,25 +1363,27 @@ describe('listRequests 关键词搜索（q）', () => {
 describe('statsByIp 按 IP 聚合', () => {
   it('聚合 requests/inputTokens/outputTokens/clients/lastAt，按 requests 倒序', () => {
     const db = new UsageDb(path.join(tmpDir, 'ip1.db'), 30, log);
-    db.recordRequest(row({ at: 1000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27', inputTokens: 10, outputTokens: 20 }));
-    db.recordRequest(row({ at: 2000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27', inputTokens: 30, outputTokens: 40 }));
-    db.recordRequest(row({ at: 3000, ip: '1.2.3.4', ua: 'cursor/0.42', inputTokens: 5, outputTokens: 5 }));
-    db.recordRequest(row({ at: 4000, ip: '5.6.7.8', ua: 'opencode/0.1.0', inputTokens: 1, outputTokens: 1 }));
+    const now = Date.now();
+    db.recordRequest(row({ at: now - 3000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27', inputTokens: 10, outputTokens: 20 }));
+    db.recordRequest(row({ at: now - 2000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27', inputTokens: 30, outputTokens: 40 }));
+    db.recordRequest(row({ at: now - 1000, ip: '1.2.3.4', ua: 'cursor/0.42', inputTokens: 5, outputTokens: 5 }));
+    db.recordRequest(row({ at: now, ip: '5.6.7.8', ua: 'opencode/0.1.0', inputTokens: 1, outputTokens: 1 }));
     const page = db.statsByIp(1, 20)!;
     expect(page.total).toBe(2);
     // 1.2.3.4 有 3 条排第一；clients 去重保序；lastAt 取最大值。
-    expect(page.items[0]).toMatchObject({ ip: '1.2.3.4', requests: 3, inputTokens: 45, outputTokens: 65, lastAt: 3000 });
+    expect(page.items[0]).toMatchObject({ ip: '1.2.3.4', requests: 3, inputTokens: 45, outputTokens: 65, lastAt: now - 1000 });
     expect(page.items[0]!.clients).toEqual(['Claude Code', 'Cursor']);
-    expect(page.items[1]).toMatchObject({ ip: '5.6.7.8', requests: 1, inputTokens: 1, outputTokens: 1, lastAt: 4000 });
+    expect(page.items[1]).toMatchObject({ ip: '5.6.7.8', requests: 1, inputTokens: 1, outputTokens: 1, lastAt: now });
     db.close();
   });
 
   it('排除未落 ip（旧数据 null/空串）与探活', () => {
     const db = new UsageDb(path.join(tmpDir, 'ip2.db'), 30, log);
-    db.recordRequest(row({ at: 1000, ip: null, ua: 'claude-cli/1.0.27' }));
-    db.recordRequest(row({ at: 2000, ip: '', ua: 'claude-cli/1.0.27' }));
-    db.recordRequest(row({ at: 3000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
-    db.recordRequest(row({ at: 4000, ip: '1.2.3.4', endpoint: 'probe', ua: '' }));
+    const now = Date.now();
+    db.recordRequest(row({ at: now - 4000, ip: null, ua: 'claude-cli/1.0.27' }));
+    db.recordRequest(row({ at: now - 3000, ip: '', ua: 'claude-cli/1.0.27' }));
+    db.recordRequest(row({ at: now - 2000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
+    db.recordRequest(row({ at: now - 1000, ip: '1.2.3.4', endpoint: 'probe', ua: '' }));
     const page = db.statsByIp(1, 20)!;
     expect(page.total).toBe(1);
     expect(page.items[0]).toMatchObject({ ip: '1.2.3.4', requests: 1 });
@@ -1321,8 +1392,9 @@ describe('statsByIp 按 IP 聚合', () => {
 
   it('分页与 db 不可用', () => {
     const db = new UsageDb(path.join(tmpDir, 'ip3.db'), 30, log);
+    const now = Date.now();
     for (let i = 1; i <= 3; i++) {
-      db.recordRequest(row({ at: 1000 + i, ip: `10.0.0.${i}`, ua: 'claude-cli/1.0.27' }));
+      db.recordRequest(row({ at: now - 100 + i, ip: `10.0.0.${i}`, ua: 'claude-cli/1.0.27' }));
     }
     const p2 = db.statsByIp(2, 2)!;
     expect(p2.items).toHaveLength(1);
@@ -1335,11 +1407,12 @@ describe('statsByIp 按 IP 聚合', () => {
 
   it('聚合结果缓存（10s TTL）：缓存期内新写入不可见，过期后可见', () => {
     const db = new UsageDb(path.join(tmpDir, 'ip-cache.db'), 30, log);
-    db.recordRequest(row({ at: 1000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
+    const now = Date.now();
+    db.recordRequest(row({ at: now - 2000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
     const first = db.statsByIp(1, 20)!;
     expect(first.total).toBe(1);
     // 缓存期内写入：聚合结果不变（面板 2s 轮询不再每轮全表扫）。
-    db.recordRequest(row({ at: 2000, ip: '5.6.7.8', ua: 'claude-cli/1.0.27' }));
+    db.recordRequest(row({ at: now - 1000, ip: '5.6.7.8', ua: 'claude-cli/1.0.27' }));
     expect(db.statsByIp(1, 20)!.total).toBe(1);
     // 缓存过期后重新聚合（直接改内部缓存时间戳模拟 10s 流逝）。
     (db as unknown as { ipStatsCacheAt: number }).ipStatsCacheAt -= 11_000;
@@ -1382,10 +1455,78 @@ describe('usageByKeyFingerprints 网关实际用量归属', () => {
   });
 });
 
+describe('keyUsageAll 全 key 用量聚合（key 详情服务端数据源）', () => {
+  const now = 1_700_000_000_000;
+
+  it('按 key_fp 聚合：ok/failed 口径、tokens/cost/lastAt，排除 probe/count_tokens/未归属', () => {
+    const db = new UsageDb(path.join(tmpDir, 'ka1.db'), 30, log);
+    // ****0osU：3 条（1 ok + 1 failed 429 + 1 count_tokens），cost 只计真实请求。
+    db.recordRequest(row({ at: now - 2 * 86_400_000, keyFingerprint: '****0osU', status: 200, inputTokens: 10, outputTokens: 20, costMicroCents: 100 }));
+    db.recordRequest(row({ at: now - 1 * 86_400_000, keyFingerprint: '****0osU', status: 429, inputTokens: 0, outputTokens: 0, costMicroCents: 50 }));
+    db.recordRequest(row({ at: now - 1 * 86_400_000, keyFingerprint: '****0osU', endpoint: 'count_tokens', status: 200, inputTokens: 5000, costMicroCents: 999 }));
+    // ****ZOBb：1 条探活（排除）+ 1 条真实。
+    db.recordRequest(row({ at: now - 1 * 86_400_000, keyFingerprint: '****ZOBb', endpoint: 'probe', status: 429, costMicroCents: 777 }));
+    db.recordRequest(row({ at: now - 1 * 86_400_000, keyFingerprint: '****ZOBb', status: 200, inputTokens: 5, outputTokens: 5, costMicroCents: 300 }));
+    // 未归属（key_fp '-'）不算成 key。
+    db.recordRequest(row({ at: now - 1 * 86_400_000, keyFingerprint: '', status: 401 }));
+    // 超窗（30 天前）不算。
+    db.recordRequest(row({ at: now - 30 * 86_400_000, keyFingerprint: '****0osU', costMicroCents: 777 }));
+
+    const rows = db.keyUsageAll(7, now)!;
+    expect(rows).not.toBeNull();
+    const byFp = new Map(rows.map((r) => [r.fingerprint, r]));
+    const a = byFp.get('****0osU')!;
+    expect(a.requests).toBe(2);
+    expect(a.ok).toBe(1);
+    expect(a.failed).toBe(1);
+    expect(a.inputTokens).toBe(10);
+    expect(a.outputTokens).toBe(20);
+    expect(a.tokens).toBe(30);
+    expect(a.costMicroCents).toBe(150); // count_tokens 的 999 不算
+    expect(a.lastAt).toBe(now - 1 * 86_400_000);
+    const b = byFp.get('****ZOBb')!;
+    expect(b.requests).toBe(1);
+    expect(b.ok).toBe(1);
+    expect(b.costMicroCents).toBe(300); // probe 的 777 不算
+    expect(byFp.size).toBe(2);
+    db.close();
+  });
+
+  it('rangeDays 窗口过滤：窗口外的指纹不出现', () => {
+    const db = new UsageDb(path.join(tmpDir, 'ka2.db'), 30, log);
+    db.recordRequest(row({ at: now - 3 * 86_400_000, keyFingerprint: '****oldA', costMicroCents: 1 }));
+    db.recordRequest(row({ at: now - 1 * 86_400_000, keyFingerprint: '****newB', costMicroCents: 2 }));
+    const rows = db.keyUsageAll(2, now)!;
+    const fps = rows.map((r) => r.fingerprint);
+    expect(fps).toEqual(['****newB']);
+    db.close();
+  });
+
+  it('按 rangeDays 分桶缓存 + 命中返回副本（改返回值不污染缓存，I-15 同款）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'ka3.db'), 30, log);
+    db.recordRequest(row({ at: now, keyFingerprint: '****0osU', costMicroCents: 1 }));
+    const first = db.keyUsageAll(7, now)!;
+    expect(first[0]!.requests).toBe(1);
+    first[0]!.requests = 999;
+    // 缓存窗口内（10s）命中缓存，且返回的是副本。
+    const second = db.keyUsageAll(7, now + 1000)!;
+    expect(second).not.toBe(first);
+    expect(second[0]!.requests).toBe(1);
+    db.close();
+  });
+
+  it('降级（db 不可用）返回 null', () => {
+    const off = new UsageDb('', 30, log);
+    expect(off.keyUsageAll(7, now)).toBeNull();
+    off.close();
+  });
+});
+
+
 describe('UsageDb 聚合缓存引用安全（D-P2-4）', () => {
   it('tokenUsageAll 缓存命中返回副本：调用方改 value 不污染缓存', () => {
     const db = new UsageDb(path.join(tmpDir, 'token-cache.db'), 30, log);
-    db.recordRequest(row({ at: 1000, tokenFp: 'abc123' }));
+    db.recordRequest(row({ at: Date.now() - 1000, tokenFp: 'abc123' }));
 
     const first = db.tokenUsageAll();
     expect(first.get('abc123')?.requests).toBe(1);
@@ -1396,6 +1537,28 @@ describe('UsageDb 聚合缓存引用安全（D-P2-4）', () => {
     const second = db.tokenUsageAll();
     expect(second).not.toBe(first);
     expect(second.get('abc123')?.requests).toBe(1);
+    db.close();
+  });
+});
+
+describe('UsageDb tokenUsageAll 观测流量排除（EXCLUDE_OBSERVED）', () => {
+  it('count_tokens 记账与 probe 探活均不计入分发 token 用量（含带 token_fp 的 probe）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'token-usage-observed.db'), 30, log);
+    // 真实分发 token 请求：应计入。
+    db.recordRequest(row({ at: Date.now() - 3000, tokenFp: 'abc123', endpoint: 'subscription' }));
+    // count_tokens 记账请求带 token_fp：不应计入（即使现实里 count_tokens 也走
+    // verifyAuth、token_fp 可能非 null，聚合口径仍排除）。
+    db.recordRequest(row({ at: Date.now() - 2000, tokenFp: 'abc123', endpoint: 'count_tokens', inputTokens: 5000, costMicroCents: 999 }));
+    // probe 探活请求带 token_fp：显式排除的防御场景——现实里 probe 不走 verifyAuth、
+    // token_fp 恒 null 天然排除，但若未来 probe 路径带上 token_fp，显式 endpoint 排除
+    // 保证它不混入 token 用量。
+    db.recordRequest(row({ at: Date.now() - 1000, tokenFp: 'probe-fp', endpoint: 'probe', inputTokens: 50, costMicroCents: 777 }));
+
+    const usage = db.tokenUsageAll();
+    expect(usage.get('abc123')?.requests).toBe(1);
+    expect(usage.get('abc123')?.inputTokens).toBe(100);
+    expect(usage.get('abc123')?.costMicroCents).toBe(0);
+    expect(usage.get('probe-fp')).toBeUndefined();
     db.close();
   });
 });
@@ -1434,7 +1597,7 @@ describe('UsageDb 聚合缓存返回副本（I-15）', () => {
 
   it('statsByIp 返回的元素是副本：改 items 元素不污染缓存', () => {
     const db = new UsageDb(path.join(tmpDir, 'ipstat-cache.db'), 30, log);
-    db.recordRequest(row({ at: 1000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
+    db.recordRequest(row({ at: Date.now() - 1000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
     const p1 = db.statsByIp(1, 20)!;
     expect(p1.items[0]!.requests).toBe(1);
     // 缓存窗口内（10s）第二次调用命中缓存。修复前元素是缓存内同一对象，
@@ -1484,7 +1647,7 @@ describe('requests 表 ip / cost_micro_cents 列', () => {
     // token_fp 列与索引也被补上（分发 token 用量聚合依赖它；旧库迁移回归）。
     const cols = db.sqlite()!.prepare('PRAGMA table_info(requests)').all() as Array<{ name: string }>;
     expect(cols.some((c) => c.name === 'token_fp')).toBe(true);
-    db.recordRequest(row({ at: 2000, tokenFp: 'abc123' }));
+    db.recordRequest(row({ at: Date.now() - 1000, tokenFp: 'abc123' }));
     const usage = db.tokenUsageAll();
     expect(usage.get('abc123')?.requests).toBe(1);
     db.close();
@@ -1661,6 +1824,190 @@ describe('UsageDb 真实趋势聚合（usageTrend）', () => {
     const t3 = db.usageTrend(1, hourStart + H + 11_000)!;
     expect(t3).not.toBeNull();
     expect(t3).not.toBe(t1);
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tokens 表配额列（QUOTA.md §1）迁移
+// ---------------------------------------------------------------------------
+
+describe('tokens 表配额列（QUOTA.md）', () => {
+  it('旧库迁移：无配额列的 tokens 表打开即补列，默认全无限 + 永不过期（幂等）', () => {
+    const p = path.join(tmpDir, 'tokens-quota-legacy.db');
+    // 手工建早期版本的表（无配额列），模拟线上已存在的旧库。
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
+      DatabaseSync: new (p: string, opts?: { readOnly?: boolean }) => any;
+    };
+    const raw = new DatabaseSync(p);
+    raw.exec(`CREATE TABLE tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      token_enc TEXT,
+      fingerprint TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'active',
+      note TEXT,
+      prefix TEXT NOT NULL DEFAULT 'tk',
+      rpm_limit INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );`);
+    raw.close();
+
+    const db = new UsageDb(p, 30, log);
+    expect(db.enabled).toBe(true);
+    const cols = db.sqlite()!.prepare("SELECT name FROM pragma_table_info('tokens')").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((c) => c.name));
+    for (const col of [
+      'quota_usd', 'quota_tokens', 'quota_requests',
+      'quota_used_usd', 'quota_used_tokens', 'quota_used_requests',
+      'quota_cycle', 'quota_reset_at', 'expires_at',
+    ]) {
+      expect(names.has(col)).toBe(true);
+    }
+    db.close();
+
+    // 幂等：再开一次（migrate/补列重复跑）不炸。
+    const db2 = new UsageDb(p, 30, log);
+    expect(db2.enabled).toBe(true);
+    const cols2 = db2.sqlite()!.prepare("SELECT name FROM pragma_table_info('tokens')").all() as Array<{ name: string }>;
+    expect(cols2.length).toBe(cols.length);
+    db2.close();
+  });
+
+  it('新库建表即含配额列（CREATE TABLE 自带，不依赖补列 ALTER）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'tokens-quota-fresh.db'), 30, log);
+    expect(db.enabled).toBe(true);
+    const cols = db.sqlite()!.prepare("SELECT name FROM pragma_table_info('tokens')").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((c) => c.name));
+    for (const col of ['quota_usd', 'quota_tokens', 'quota_requests', 'quota_cycle', 'quota_reset_at', 'expires_at']) {
+      expect(names.has(col)).toBe(true);
+    }
+    db.close();
+  });
+});
+
+describe('B2 面板热查询 at 窗口（retention 内过滤）', () => {
+  it('queryIpStats：超 retention 的旧行不计入，窗口内计入（prune 未跑也生效）', () => {
+    const db = new UsageDb(path.join(tmpDir, 'b2-ip-window.db'), 30, log);
+    const now = Date.now();
+    db.recordRequest(row({ at: now - 60 * 86_400_000, ip: '9.9.9.9', ua: 'claude-cli/1.0.27' }));
+    db.recordRequest(row({ at: now - 3_600_000, ip: '1.2.3.4', ua: 'claude-cli/1.0.27' }));
+    const page = db.statsByIp(1, 20)!;
+    expect(page.total).toBe(1);
+    expect(page.items[0]).toMatchObject({ ip: '1.2.3.4', requests: 1 });
+    db.close();
+  });
+
+  it('queryIpStats：retention=0（永不清理）保持全量，不加窗口', () => {
+    const db = new UsageDb(path.join(tmpDir, 'b2-ip-alltime.db'), 0, log);
+    const now = Date.now();
+    db.recordRequest(row({ at: now - 60 * 86_400_000, ip: '9.9.9.9', ua: 'claude-cli/1.0.27' }));
+    const page = db.statsByIp(1, 20)!;
+    expect(page.total).toBe(1);
+    expect(page.items[0]!.ip).toBe('9.9.9.9');
+    db.close();
+  });
+
+  it('tokenUsageAll：超 retention 的旧行不计入，窗口内计入', () => {
+    const db = new UsageDb(path.join(tmpDir, 'b2-tok-window.db'), 30, log);
+    const now = Date.now();
+    db.recordRequest(row({ at: now - 60 * 86_400_000, tokenFp: 'old-fp' }));
+    db.recordRequest(row({ at: now - 3_600_000, tokenFp: 'new-fp' }));
+    const usage = db.tokenUsageAll();
+    expect(usage.size).toBe(1);
+    expect(usage.has('new-fp')).toBe(true);
+    expect(usage.has('old-fp')).toBe(false);
+    db.close();
+  });
+});
+
+describe('B2 面板热查询性能回归（10 万行，对齐 history 修复做法）', () => {
+  /** 直插（单事务）避免 recordRequest 攒批/UA 解析开销污染计时。 */
+  function bulkSeed(db: UsageDb, n: number, mk: (i: number) => unknown[]): void {
+    const raw = db.sqlite()!;
+    const stmt = raw.prepare(
+      `INSERT INTO requests (at, key_fp, model, upstream_model, endpoint, status,
+        duration_ms, stream, input_tokens, output_tokens, thinking_tokens, error,
+        path, ua, client, ip, cost_micro_cents, token_fp, api_key_fp)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    raw.exec('BEGIN');
+    for (let i = 0; i < n; i++) stmt.run(...mk(i));
+    raw.exec('COMMIT');
+  }
+
+  it('queryIpStats：10 万行窗口内聚合 < 200ms', { timeout: 60_000 }, () => {
+    const db = new UsageDb(path.join(tmpDir, 'b2-perf-ip.db'), 30, log);
+    const now = Date.now();
+    const clients = ['Claude Code', 'Cursor', 'opencode', 'other'];
+    bulkSeed(db, 100_000, (i) => [
+      now - (i % 60_000), // at：全部窗口内
+      '****0osU', // key_fp
+      'claude-mythos-5', // model
+      'deepseek-v4-flash', // upstream_model
+      'subscription', // endpoint
+      200, // status
+      1234, // duration_ms
+      0, // stream
+      i % 500, // input_tokens
+      i % 300, // output_tokens
+      0, // thinking_tokens
+      null, // error
+      '/v1/messages', // path
+      'claude-cli/1.0.27', // ua
+      clients[i % clients.length]!, // client
+      `10.0.${i % 8}.${i % 5}`, // ip → 40 个不同 IP
+      0, // cost_micro_cents
+      null, // token_fp
+      null, // api_key_fp
+    ]);
+    db.flush(); // 清空 pending（直插后无积压，空操作）
+    const query = db as unknown as {
+      queryIpStats(): Array<{ ip: string; requests: number; clients: string[]; lastAt: number }> | null;
+    };
+    // warm 一次（prepare/JIT 不计入计时）。
+    query.queryIpStats();
+    const t0 = performance.now();
+    const rows = query.queryIpStats();
+    const elapsed = performance.now() - t0;
+    expect(rows).not.toBeNull();
+    expect(rows!.length).toBe(40);
+    expect(elapsed).toBeLessThan(500); // 性能回归（单跑 ~86ms；全量并行环境 8GB 机器有 CPU 竞争，500ms 仍能抓秒级冻结）
+    db.close();
+  });
+
+  it('tokenUsageAll：10 万行窗口内聚合 < 200ms', { timeout: 60_000 }, () => {
+    const db = new UsageDb(path.join(tmpDir, 'b2-perf-tok.db'), 30, log);
+    const now = Date.now();
+    bulkSeed(db, 100_000, (i) => [
+      now - (i % 60_000),
+      `****k${i % 50}`,
+      'claude-mythos-5',
+      'deepseek-v4-flash',
+      'subscription',
+      200,
+      1234,
+      0,
+      i % 500,
+      i % 300,
+      0,
+      null,
+      '/v1/messages',
+      'claude-cli/1.0.27',
+      'Claude Code',
+      `10.0.${i % 8}.${i % 5}`,
+      0,
+      `tok${i % 100}`, // token_fp → 100 个不同 token
+      null,
+    ]);
+    db.flush();
+    db.tokenUsageAll(); // warm（prepare + 建缓存）
+    (db as unknown as { tokenUsageCacheAt: number }).tokenUsageCacheAt = 0;
+    const t0 = performance.now();
+    const usage = db.tokenUsageAll();
+    const elapsed = performance.now() - t0;
+    expect(usage.size).toBe(100);
+    expect(elapsed).toBeLessThan(500); // 性能回归（单跑 ~86ms；全量并行环境 8GB 机器有 CPU 竞争，500ms 仍能抓秒级冻结）
     db.close();
   });
 });

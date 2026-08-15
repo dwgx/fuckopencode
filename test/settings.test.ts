@@ -24,6 +24,8 @@ import {
   SettingsStore,
   validateSetting,
   apiKeysMeta,
+  allowedModelsMeta,
+  modelPricesMeta,
 } from '../src/settings.js';
 import { createApp } from '../src/server.js';
 import { DEFAULT_ADMIN_PASS } from '../src/config.js';
@@ -151,6 +153,8 @@ describe('validateSetting / parseSettingValue', () => {
       'compactEnabled',
       'compactTriggerBytes',
       'compactMaxMessageChars',
+      'globalRpmLimit',
+      'modelPrices',
     ]);
     expect(SETTINGS_META.adminUser?.default).toBe('admin');
     // 默认密码与 config.ts 同源（DEFAULT_ADMIN_PASS 常量，改 env 默认值两边不会漂移）。
@@ -159,6 +163,7 @@ describe('validateSetting / parseSettingValue', () => {
     expect(SETTINGS_META.clientTokenScale?.default).toBe(0.6657);
     expect(SETTINGS_META.compactTriggerBytes?.default).toBe(4 * 1024 * 1024);
     expect(SETTINGS_META.compactMaxMessageChars?.default).toBe(8000);
+    expect(SETTINGS_META.globalRpmLimit?.default).toBe(0);
   });
 
   it('字符串：trim、长度边界', () => {
@@ -184,6 +189,11 @@ describe('validateSetting / parseSettingValue', () => {
     expect(validateSetting('compactTriggerBytes', 0).ok).toBe(false);
     expect(validateSetting('compactTriggerBytes', '4096').ok).toBe(false);
     expect(validateSetting('compactTriggerBytes', NaN).ok).toBe(false);
+    // 全局 RPM：0 = 关闭（合法）；负值/字符串/NaN 拒绝。
+    expect(validateSetting('globalRpmLimit', 0)).toEqual({ ok: true, value: 0 });
+    expect(validateSetting('globalRpmLimit', 2000)).toEqual({ ok: true, value: 2000 });
+    expect(validateSetting('globalRpmLimit', -1).ok).toBe(false);
+    expect(validateSetting('globalRpmLimit', '100').ok).toBe(false);
   });
 
   it('apiKeys：字符串数组、trim、去空、去重、上限', () => {
@@ -195,9 +205,52 @@ describe('validateSetting / parseSettingValue', () => {
     expect(validateSetting('apiKeys', new Array(100).fill('a')).ok).toBe(true);
   });
 
+  it('allowedModelsMeta：接受任意合法模型名（含硬底线外 claude-*/gpt-*）', () => {
+    expect(allowedModelsMeta(['claude-opus-5', 'gpt-5.5', 'glm-5.2', 'deepseek-v4-pro'])).toEqual({
+      ok: true,
+      value: ['claude-opus-5', 'gpt-5.5', 'glm-5.2', 'deepseek-v4-pro'],
+    });
+    expect(allowedModelsMeta(['deepseek-v4-flash', 'deepseek-v4-flash-free'])).toEqual({
+      ok: true,
+      value: ['deepseek-v4-flash', 'deepseek-v4-flash-free'],
+    });
+    // 大写/空格/特殊字符/超长 → 拒绝。
+    expect(allowedModelsMeta(['Claude-Opus-5']).ok).toBe(false);
+    expect(allowedModelsMeta(['claude opus']).ok).toBe(false);
+    expect(allowedModelsMeta(['claude@opus']).ok).toBe(false);
+    expect(allowedModelsMeta(['x'.repeat(101)]).ok).toBe(false);
+    expect(allowedModelsMeta('x').ok).toBe(false);
+    expect(allowedModelsMeta([42]).ok).toBe(false);
+  });
+
+  it('allowedModelsMeta：≤50 项、trim 去重、空数组/null 回代码默认', () => {
+    expect(allowedModelsMeta([' a ', 'a', 'b'])).toEqual({ ok: true, value: ['a', 'b'] });
+    expect(allowedModelsMeta(Array.from({ length: 51 }, (_, i) => `m${i}`)).ok).toBe(false);
+    expect(allowedModelsMeta(Array.from({ length: 50 }, (_, i) => `m${i}`)).ok).toBe(true);
+    expect(allowedModelsMeta([])).toEqual({ ok: true, value: null });
+    expect(allowedModelsMeta(null)).toEqual({ ok: true, value: null });
+  });
+
   it('未知键一律拒绝', () => {
     expect(validateSetting('nope', 1).ok).toBe(false);
     expect(validateSetting('apiKey', 'x').ok).toBe(false);
+  });
+
+  it('modelPricesMeta：合法模型名 + 只读 read/write 字段；MINOR m1 放行 "*" 通配', () => {
+    // 常规模型名：input/output/read/write 可选，缺省 0。
+    expect(
+      modelPricesMeta({ 'deepseek-v4-flash': { input: 0.25, output: 1.0, read: 0.5 } }),
+    ).toEqual({
+      ok: true,
+      value: { 'deepseek-v4-flash': { input: 0.25, output: 1.0, read: 0.5, write: 0 } },
+    });
+    // '*' 通配键：QUOTA.md §4 的 resolveModelPrice 兜底分支，校验曾拒绝（MINOR m1）。
+    expect(modelPricesMeta({ '*': { input: 0.1, output: 0.4 } }).ok).toBe(true);
+    // 非法模型名 / 未知字段 / 负值仍拒绝。
+    expect(modelPricesMeta({ 'Bad Model': { input: 1 } }).ok).toBe(false);
+    expect(modelPricesMeta({ 'gpt-4o': { nope: 1 } }).ok).toBe(false);
+    expect(modelPricesMeta({ 'gpt-4o': { input: -1 } }).ok).toBe(false);
+    expect(modelPricesMeta(null)).toEqual({ ok: true, value: null });
   });
 
   it('parseSettingValue：db 字符串往返；坏 JSON / 坏值失败', () => {
@@ -245,7 +298,7 @@ describe('applySettingsToConfig', () => {
   });
 
   it('SETTINGS_META 每个键都能被 applySettingsToConfig 生效（防手工同步漂移）', () => {
-    const cfg = makeCfg({ adminUser: 'u', adminPass: 'p', apiKeys: ['k0'], scaleClientTokens: false, clientTokenScale: 0.9, compactEnabled: false, compactTriggerBytes: 1, compactMaxMessageChars: 1 });
+    const cfg = makeCfg({ adminUser: 'u', adminPass: 'p', apiKeys: ['k0'], scaleClientTokens: false, clientTokenScale: 0.9, compactEnabled: false, compactTriggerBytes: 1, compactMaxMessageChars: 1, globalRpmLimit: 0 });
     applySettingsToConfig(cfg, {
       adminUser: 'u2',
       adminPass: 'p2',
@@ -255,6 +308,7 @@ describe('applySettingsToConfig', () => {
       compactEnabled: true,
       compactTriggerBytes: 999,
       compactMaxMessageChars: 888,
+      globalRpmLimit: 2000,
     });
     expect(cfg.adminUser).toBe('u2');
     expect(cfg.adminPass).toBe('p2');
@@ -264,6 +318,7 @@ describe('applySettingsToConfig', () => {
     expect(cfg.compactEnabled).toBe(true);
     expect(cfg.compactTriggerBytes).toBe(999);
     expect(cfg.compactMaxMessageChars).toBe(888);
+    expect(cfg.globalRpmLimit).toBe(2000);
   });
 });
 
@@ -300,7 +355,7 @@ describe('settings 端点 e2e', () => {
 
   const envKeyHeaders = { 'x-api-key': 'env-key-1' };
 
-  it('GET：默认视图（env 来源、默认值、密码与 apiKeys 明文都不回显）', async () => {
+  it('GET：默认视图（code-default 来源、默认值、密码与 apiKeys 明文都不回显）', async () => {
     const res = await fetch(`${baseUrl}/__admin/api/settings`, { headers: envKeyHeaders });
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -312,18 +367,47 @@ describe('settings 端点 e2e', () => {
     };
     expect(body.ok).toBe(true);
     const s = body.data.settings;
-    expect(s.adminUser).toEqual({ value: 'admin', default: 'admin', source: 'env' });
-    // 密码不回显：value 与 default 都恒空串，source 才是有效信息。
+    // 什么都没配（settings 表空）且 cfg 值 == 代码默认 → code-default（真实来源，
+    // 不再一律标 env——审计 P0：source 不许撒谎）。
+    expect(s.adminUser).toEqual({ value: 'admin', default: 'admin', source: 'code-default' });
+    // 密码不回显：value 与 default 都恒空串，source 才是有效信息。当前生效密码
+    // 是 env 显式值（thankyouopencode，非默认）→ env。
     expect(s.adminPass).toEqual({ value: '', default: '', source: 'env' });
     // 当前生效密码是自定义值（thankyouopencode），不是默认密码 → 标记 false。
     expect(body.data.adminPassIsDefault).toBe(false);
-    // apiKeys 只回掩码（****XXXX），明文不离开 PATCH 请求体。
+    // apiKeys 只回掩码（****XXXX），明文不离开 PATCH 请求体。env 显式配了 key → env。
     expect(s.apiKeys).toEqual({ value: ['****ey-1'], default: [], source: 'env' });
-    expect(s.scaleClientTokens).toEqual({ value: false, default: false, source: 'env' });
-    expect(s.clientTokenScale).toEqual({ value: 0.6657, default: 0.6657, source: 'env' });
-    expect(s.compactEnabled).toEqual({ value: false, default: false, source: 'env' });
-    expect(s.compactTriggerBytes).toEqual({ value: 4 * 1024 * 1024, default: 4 * 1024 * 1024, source: 'env' });
-    expect(s.compactMaxMessageChars).toEqual({ value: 8000, default: 8000, source: 'env' });
+    expect(s.scaleClientTokens).toEqual({ value: false, default: false, source: 'code-default' });
+    expect(s.clientTokenScale).toEqual({ value: 0.6657, default: 0.6657, source: 'code-default' });
+    expect(s.compactEnabled).toEqual({ value: false, default: false, source: 'code-default' });
+    expect(s.compactTriggerBytes).toEqual({ value: 4 * 1024 * 1024, default: 4 * 1024 * 1024, source: 'code-default' });
+    expect(s.compactMaxMessageChars).toEqual({ value: 8000, default: 8000, source: 'code-default' });
+    expect(s.globalRpmLimit).toEqual({ value: 0, default: 0, source: 'code-default' });
+  });
+
+  it('source 三元组：env 显式非默认值标 env；settings 表有键标 db（P0 source 不撒谎）', async () => {
+    // 用「非默认值但不在 db」的 cfg 验证 env 分支：adminUser 改 boss（非默认）不入库。
+    const cfgEnv = makeCfg({ adminUser: 'boss', apiKeys: ['env-key-1'], scaleClientTokens: true });
+    const srv = createApp(cfgEnv, undefined, db);
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const a = srv.address();
+    const url = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+    try {
+      const res = await fetch(`${url}/__admin/api/settings`, { headers: envKeyHeaders });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        data: { settings: Record<string, { value: unknown; default: unknown; source: string }> };
+      };
+      const s = body.data.settings;
+      // env 显式（cfg 值非默认、settings 表无键）→ 'env'。
+      expect(s.adminUser).toEqual({ value: 'boss', default: 'admin', source: 'env' });
+      expect(s.scaleClientTokens).toEqual({ value: true, default: false, source: 'env' });
+      expect(s.apiKeys).toEqual({ value: ['****ey-1'], default: [], source: 'env' });
+      // 未配的仍 code-default。
+      expect(s.compactEnabled!.source).toBe('code-default');
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
   });
 
   it('adminPassIsDefault：生效密码等于默认值时置 true（面板强提示的依据）', async () => {
@@ -500,7 +584,7 @@ describe('settings 端点 e2e', () => {
     const get = await fetch(`${url}/__admin/api/settings`, { headers: { 'x-api-key': 'k' } });
     expect(get.status).toBe(200);
     const body = (await get.json()) as { data: { settings: Record<string, { source: string }> } };
-    expect(body.data.settings.scaleClientTokens?.source).toBe('env');
+    expect(body.data.settings.scaleClientTokens?.source).toBe('code-default');
     const patch = await fetch(`${url}/__admin/api/settings`, {
       method: 'PATCH',
       headers: { 'x-api-key': 'k', 'content-type': 'application/json' },

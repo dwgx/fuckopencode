@@ -93,6 +93,88 @@ describe('管理面板关键渲染入口没有被误删', () => {
   });
 });
 
+describe('数字输入自绘 spinner（kirostudio 风格，隐藏原生步进）', () => {
+  it('隐藏原生 spinner（CSS）+ mountNumSpinners 存在 + data-num-mounted 幂等标记', () => {
+    const code = inlineScript();
+    expect(ADMIN_HTML).toContain('::-webkit-inner-spin-button');
+    expect(ADMIN_HTML).toMatch(/-moz-appearance:\s*textfield/);
+    expect(code).toContain('function mountNumSpinners(');
+    expect(code).toContain("inp.dataset.numMounted === '1'");
+  });
+
+  it('点击走 document 委托：closest .num-spin-up/down → stepUp/stepDown', () => {
+    const code = inlineScript();
+    expect(code).toContain("closest('.num-spin-up, .num-spin-down')");
+    expect(code).toContain("inp.stepUp()");
+    expect(code).toContain("inp.stepDown()");
+  });
+
+  it('渲染入口都会重挂（renderTokens / openConfirm / render / 初始化）', () => {
+    const code = inlineScript();
+    expect(code).toMatch(/tb\.innerHTML\s*=\s*items\.map\(tokenRow\)/);
+    expect(code).toMatch(/mountNumSpinners\(tb\)/);
+    expect(code).toMatch(/confirm-body'\)\.innerHTML[\s\S]{0,120}mountNumSpinners\(\$\(['"]confirm-body['"]\)\)/);
+    expect(code).toMatch(/el\.innerHTML\s*=\s*list\.map\(accountCard\)/);
+    expect(code).toMatch(/mountNumSpinners\(el\)/);
+    expect(code).toContain('mountNumSpinners();');
+  });
+});
+
+describe('账号卡片收起/展开 + localStorage 记忆（fc-collapsed）', () => {
+  it('accountCard 渲染 data-collapsed + 头部收起按钮 + card-bd 包裹', () => {
+    const code = inlineScript();
+    expect(ADMIN_HTML).toContain('.card[data-collapsed="1"] .card-bd');
+    expect(code).toContain('data-collapsed="');
+    expect(code).toContain("collapsed ? '1' : '0'");
+    expect(code).toContain('data-action="toggle-card"');
+    expect(code).toContain("'<div class=\"card-bd\">'");
+  });
+
+  it('toggle 走 accounts 委托 + localStorage 持久化 + 全部收起/展开按钮', () => {
+    const code = inlineScript();
+    expect(code).toContain("if (act === 'toggle-card')");
+    expect(code).toContain("COLLAPSE_KEY = 'fc-collapsed'");
+    expect(ADMIN_HTML).toContain('id="btn-collapse-all"');
+    expect(ADMIN_HTML).toContain('id="btn-expand-all"');
+  });
+
+  it('词条 collapse/expand/collapseAll/expandAll 三语言对称（en/zh/ja）', () => {
+    const code = inlineScript();
+    for (const lang of ['en', 'zh', 'ja']) {
+      const start = code.indexOf(`${lang}:`);
+      expect(start, `${lang} 块存在`).toBeGreaterThan(-1);
+      const slice = code.slice(start);
+      const end = slice.indexOf('\n    }');
+      const body = slice.slice(0, end > 0 ? end : 4000);
+      for (const k of ['collapse', 'expand', 'collapseAll', 'expandAll']) {
+        expect(body, `${lang} 缺 ${k}`).toMatch(new RegExp(`\\b${k}\\s*:`));
+      }
+    }
+  });
+
+  it('收起状态头部渲染「在飞」徽章：pool key 的 inFlight 合计，无在飞隐藏', () => {
+    const code = inlineScript();
+    // 徽章挂 card-hd（收起时 card-bd 隐藏但头部保留，所以收起也能看到请求负载）。
+    const card = fnSource('accountCard');
+    expect(card).toContain('a.keys) for (var ik = 0; ik < a.keys.length; ik++) inflightN += (Number(a.keys[ik].inFlight) || 0)');
+    expect(card).toContain(`class="card-inflight"`);
+    expect(card).toContain(`(inflightN > 0 ? '' : ' hidden')`);
+    expect(card).toContain(`esc(T('inFlight')) + ' ' + inflightN`);
+    expect(ADMIN_HTML).toContain('.card-inflight::before');
+    // CSS 隐藏兜底（display:none 与 [hidden] 一致）。
+    expect(ADMIN_HTML).toContain('.card-inflight[hidden] { display: none; }');
+  });
+
+  it('在飞徽章走就地更新（updateInflightBadges 挂进 2s tick），不重建列表清编辑表单', () => {
+    const code = inlineScript();
+    expect(code).toContain('function updateInflightBadges(');
+    expect(code).toMatch(/\.card\[data-id="' \+ a\.id \+ '"\] \.card-inflight/);
+    expect(code).toContain('badge.hidden = n <= 0;');
+    // renderFingerprint 仍排除 inFlight（活跃流量下不因它重建列表），所以独立更新。
+    expect(code).toContain('updateInflightBadges();');
+  });
+});
+
 describe('重构后的 UI 骨架（tabs / sidebar / dropdown / OAuth 弹层）', () => {
   it('tab 栏与切换逻辑存在（四个视图 + switchView）', () => {
     const code = inlineScript();
@@ -238,6 +320,46 @@ describe('UI v3：账户详情视图（console 数据展示）', () => {
     expect(code).toContain("'detail-cookie-t'");
     // oauth-invalid 是独立分支（不是 cookie 文案）：只有 oauth-invalid 才提示重新授权。
     expect(code).toContain('var oauthOnly = cs === \'oauth-invalid\';');
+  });
+});
+
+describe('详情页 tab 分组（解决 16 区块一直下滑）', () => {
+  it('16 个区块包进 5 个 .detail-group 容器（订阅/工作区/财务/组织/定价）', () => {
+    expect(ADMIN_HTML).toContain('class="detail-group" data-group="sub"');
+    expect(ADMIN_HTML).toContain('class="detail-group" data-group="ws"');
+    expect(ADMIN_HTML).toContain('class="detail-group" data-group="finance"');
+    expect(ADMIN_HTML).toContain('class="detail-group" data-group="org"');
+    expect(ADMIN_HTML).toContain('class="detail-group" data-group="pricing"');
+    // 分组顺序与任务表一致：sub 4 块 / ws 2 块 / finance 6 块 / org 3 块 / pricing 1 块。
+    expect(ADMIN_HTML).toContain('<div class="detail-group" data-group="sub">\n          <div id="detail-go"></div>\n          <div id="detail-legacy-key"></div>\n          <div id="detail-legacy"></div>\n          <div id="detail-legacy-billing"></div>');
+    expect(ADMIN_HTML).toContain('<div class="detail-group" data-group="pricing">\n          <div id="detail-pricing"></div>');
+  });
+
+  it('DETAIL_GROUPS 五组定义 + 默认订阅组 + 显隐切换（tab 只显隐，不改 load 调用）', () => {
+    const code = inlineScript();
+    expect(code).toContain("var detailGroup = 'sub';");
+    expect(code).toContain("['sub', 'detailTabSub', ['detail-go', 'detail-legacy-key', 'detail-legacy', 'detail-legacy-billing']]");
+    expect(code).toContain("['ws', 'detailTabWs', ['detail-workspace', 'detail-models']]");
+    expect(code).toContain("['finance', 'detailTabFinance', ['detail-billing', 'detail-usage', 'detail-models-usage'");
+    expect(code).toContain("['org', 'detailTabOrg', ['detail-members', 'detail-sa', 'detail-providers']]");
+    expect(code).toContain("['pricing', 'detailTabPricing', ['detail-pricing']]");
+    expect(code).toContain('function renderDetailTabs(');
+    expect(code).toContain('function showDetailGroup(');
+    expect(code).toContain('data-detail-group');
+    // 切换 = 显示/隐藏分组容器；进入详情默认订阅组（openAccountDetail 里重置）。
+    expect(code).toContain("groups[i].hidden = groups[i].getAttribute('data-group') !== g;");
+    expect(code).toContain("detailGroup = 'sub';  // 每次进详情默认「订阅 & Keys」组（tab 只显隐，load 全拉）");
+    // loadAccountDetail 里用 showDetailGroup 取代旧锚点导航，load* 全保留。
+    expect(code).toContain('showDetailGroup(detailGroup);');
+  });
+
+  it('详情页 tab 词条 en/zh 都有', () => {
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    for (const k of ['detailTabSub', 'detailTabWs', 'detailTabFinance', 'detailTabOrg', 'detailTabPricing']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
   });
 });
 
@@ -524,7 +646,7 @@ describe('管理面板 i18n 词条 en/zh 对齐', () => {
     const en = new Set(dictKeys('en'));
     const zh = new Set(dictKeys('zh'));
     for (const k of ['createTitle', 'accountsTitle', 'noAccounts', 'balance', 'retryIn',
-                     'confirmDelete', 'refreshed', 'nameRequired', 'cookieClear', 'usedOf']) {
+                     'confirmDelete', 'refreshed', 'nameRequired']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
       expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
     }
@@ -812,17 +934,18 @@ describe('统一容器模板 .panel（opencode 风格：所有区块容器同一
     // 重置时间拼进 go-pct 行内（· 分隔），不再单独占一行。
     expect(code).toContain("' · ' + T('goReset')");
     expect(code).toContain("pctTxt + '<span class=\"go-reset\">' + resetTxt");
-    // 超额百分比钳到 100 画条（与 previewGoBox 同口径；renderGo 内而非 previewGoBox 内）。
+    // 超额百分比钳到 100 画条（renderGo 内与详情页同口径）。
     expect(code).toMatch(/function renderGo[\s\S]{0,1200}Math\.max\(0,\s*Math\.min\(100,\s*w\.usagePercent\)\)/);
   });
 
-  it('容器内小卡去边框（防嵌套双框：preview-box / balance-card / balance-hero 无边框透明）', () => {
-    expect(ADMIN_HTML).toContain('.preview-box { min-width: 0; }');
+  it('容器内小卡去边框（防嵌套双框：balance-card / balance-hero 无边框透明）+ 卡片两栏（card-stats 右侧压缩栏）', () => {
     expect(ADMIN_HTML).toContain('.balance-card { padding: 10px 14px; min-width: 148px; }');
     expect(ADMIN_HTML).toContain('.balance-hero { padding: 4px 0 12px; }');
-    expect(ADMIN_HTML).not.toContain('.preview-box {\n    border: 1px solid var(--border-muted)');
     expect(ADMIN_HTML).not.toContain('.balance-hero {\n    border: 1px solid var(--border)');
     expect(ADMIN_HTML).not.toContain('.balance-card {\n    border: 1px solid var(--border-muted)');
+    // 卡片展开两栏：左侧 .card-main + 右侧 .card-stats（压缩 3 行额度）。
+    expect(ADMIN_HTML).toMatch(/\.card-bd \{[\s\S]*grid-template-columns: minmax\(0, 1fr\) minmax\(200px, 280px\);/);
+    expect(ADMIN_HTML).toContain('.card-stats .st-row {');
   });
 
   it('.card 账号卡与 .stat2 统计卡对齐模板（border + 3px 圆角 + 16/20 内边距）', () => {
@@ -833,19 +956,20 @@ describe('统一容器模板 .panel（opencode 风格：所有区块容器同一
 });
 
 describe('账号不可用时隐藏空容器 + env 卡简化', () => {
-  it('三个控制台字段全 null 时渲染单行提示而非三张「—」卡', () => {
+  it('三个控制台字段全 null 时右侧压缩栏渲染单行提示而非三张「—」卡', () => {
     const code = inlineScript();
-    expect(code).toContain('var noConsole = a.balance == null && a.monthlyLimit == null && a.monthlyUsage == null;');
-    expect(code).toContain('var consoleBlock = noConsole');
-    // 有数据时仍渲染三卡 + 用量条（不破坏正常路径）。
-    expect(code).toContain("'<div class=\"balance-row\">'");
-    expect(code).toContain('<div class="meter"><div class="meter-bg">');
+    expect(code).toContain('function cardStatsHtml(');
+    expect(code).toContain('a.balance == null && a.monthlyLimit == null && a.monthlyUsage == null && a.hasConsole');
+    // 有数据时渲染余额/用量/Go 三行紧凑值（不破坏正常路径）。
+    expect(code).toContain("T('balanceOrg')");
+    expect(code).toContain("+ ' tok</span></div>'");
+    expect(code).toContain("T('previewGo')");
   });
 
   it('env 账号（hasConsole=false）不渲染「未接入 · 缺少控制台登录态」提示', () => {
     const code = inlineScript();
-    // 无控制台凭据的账号：consoleBlock 直接为空串（env 只是 key 池，与控制台无关）。
-    expect(code).toMatch(/a\.hasConsole\s*[\s\S]*?waitingSync[\s\S]*?: ''\)/);
+    // 无控制台凭据的账号：条件带 && a.hasConsole，env 代理账号纯 key 池不提示。
+    expect(code).toMatch(/a\.hasConsole\)\s*\{[\s\S]*?T\('waitingSync'\)/);
     expect(code).not.toContain("' · ' + T('cookieMissing')");
     // 有凭据的账号仍保留「已连接 · 余额随下次探测同步」。
     expect(code).toContain("T('waitingSync')");
@@ -1070,19 +1194,19 @@ describe('账号预览卡容器化（余额/用量/Go 数据区）', () => {
       .filter((k) => k !== lang);
   }
 
-  it('数据区容器：preview-cols 三列 + 余额/用量/Go 三个子容器 CSS 都在', () => {
-    expect(ADMIN_HTML).toContain('.preview-cols {');
-    expect(ADMIN_HTML).toContain('.preview-box {');
-    expect(ADMIN_HTML).toContain('.preview-balance .balance-card {');
-    expect(ADMIN_HTML).toContain('.preview-grid {');
-    expect(ADMIN_HTML).toContain('.p-go-row {');
-    expect(ADMIN_HTML).toContain('.preview-cols .p-note { grid-column: 1 / -1;');
+  it('数据区容器：卡片两栏（.card-main + 右侧 .card-stats 压缩 3 行额度）CSS 都在', () => {
+    expect(ADMIN_HTML).toMatch(/\.card-bd \{[\s\S]*grid-template-columns: minmax\(0, 1fr\) minmax\(200px, 280px\);/);
+    expect(ADMIN_HTML).toContain('.card-main { min-width: 0; }');
+    expect(ADMIN_HTML).toContain('.card-stats { min-width: 0; align-self: start; }');
+    expect(ADMIN_HTML).toContain('.card-stats .st-row {');
+    expect(ADMIN_HTML).toContain('.card-stats .st-k');
+    expect(ADMIN_HTML).toContain('.card-stats .st-v');
     expect(ADMIN_HTML).toMatch(/@media \(max-width: 48rem\)/);
   });
 
   it('预览渲染/加载函数存在（渲染函数 + 加载函数 + 回填函数）', () => {
     const code = inlineScript();
-    for (const fn of ['previewUsageBox', 'previewGoBox', 'fetchPreviewUsage', 'fetchPreviewGo', 'loadPreviewData', 'fillPreviewBox']) {
+    for (const fn of ['cardStatsHtml', 'fetchPreviewUsage', 'fetchPreviewGo', 'loadPreviewData', 'fillCardStats']) {
       expect(code, `缺 ${fn}`).toContain(`function ${fn}(`);
     }
     expect(code).toContain("var previewCache = {};");
@@ -1099,32 +1223,32 @@ describe('账号预览卡容器化（余额/用量/Go 数据区）', () => {
     expect(code).toContain("'/__admin/api/legacy/account/' + id + '/go'");
   });
 
-  it('用量三小格（请求/输出 tokens/成本）与 Go 三窗口（滚动/每周/每月）字段齐全', () => {
+  it('cardStatsHtml 三行紧凑：余额 $ / 用量 tok / Go 周·月；满窗口标红', () => {
     const code = inlineScript();
-    expect(code).toContain("T('requests')");
-    expect(code).toContain("T('outputTokens')");
-    expect(code).toContain("T('cost')");
-    expect(code).toContain("T('goRolling')");
+    expect(code).toContain('function cardStatsHtml(');
+    expect(code).toContain("T('balanceOrg')");
+    expect(code).toContain("+ ' tok</span></div>'");
+    expect(code).toContain("T('previewGo')");
     expect(code).toContain("T('goWeekly')");
     expect(code).toContain("T('goMonthly')");
-    expect(code).toContain('s.totalRequests != null ? fmt(s.totalRequests)');
-    expect(code).toContain('s.totalCostMicroCents != null ? money(s.totalCostMicroCents)');
-    expect(code).toContain('typeof w.usagePercent !== \'number\'');
+    expect(code).toContain('isGoWindowExhausted(w) ? \'s-bad\'');
+    // 网关实际用量优先，回落 org usage 输出 tokens。
+    expect(code).toContain("pc.gw && (pc.gw.inputTokens != null || pc.gw.outputTokens != null)");
+    expect(code).toContain('pc.usage.summary.totalOutputTokens != null');
   });
 
-  it('无数据/失败时容器隐藏（返回空串，fill 不动作），有数据时 render 用缓存回填', () => {
+  it('无数据/失败时压缩栏隐藏（返回空串，fill 不动作），有数据时 render 用缓存回填', () => {
     const code = inlineScript();
-    expect(code).toContain('var usageBox = pc ? previewUsageHtml(pc) : \'\';');
-    expect(code).toContain("var goBox = pc && pc.go ? previewGoBox(pc.go) : '';");
-    expect(code).toContain('if (!rows) return \'\';');
-    expect(code).toContain('if (!html) return;');
-    expect(code).toContain('cols.insertAdjacentHTML(\'beforeend\', html);');
+    expect(code).toContain("if (!rows.length) return '';");
+    expect(code).toContain('box.outerHTML = cardStatsHtml(a, previewCache[id]);');
+    expect(code).toContain('var a = findAccount(id);');
+    expect(code).toContain('if (!box) return;');
   });
 
   it('preview 词条 en/zh 都有', () => {
     const en = new Set(dictKeys('en'));
     const zh = new Set(dictKeys('zh'));
-    for (const k of ['previewBalance', 'previewUsage', 'previewGo']) {
+    for (const k of ['previewUsage', 'previewGo']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
       expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
     }
@@ -1218,11 +1342,11 @@ describe('前端全量改造：删除确认原生化 + 类型下拉 + 请求明�
     expect(code).toContain("aboutEndpointDash: '仪表盘'");
   });
 
-  it('新增词条 en/zh 都有（hClient/hFp/hUa/reqPrev/reqNext/reqPage/detailRequests）', () => {
+  it('新增词条 en/zh 都有（hClient/reqPrev/reqNext/reqPage/detailRequests）', () => {
     const code = inlineScript();
     const en = new Set([...code.slice(code.indexOf('en: {'), code.indexOf('zh: {')).matchAll(/(?:^\s+|,\s*)([A-Za-z][\w]*)\s*:/gm)].map((m) => m[1]!));
     const zh = new Set([...code.slice(code.indexOf('zh: {'), code.indexOf('var lang')).matchAll(/(?:^\s+|,\s*)([A-Za-z][\w]*)\s*:/gm)].map((m) => m[1]!));
-    for (const k of ['hClient', 'hFp', 'hUa', 'reqPrev', 'reqNext', 'reqPage', 'detailRequests', 'aboutEndpointDash']) {
+    for (const k of ['hClient', 'reqPrev', 'reqNext', 'reqPage', 'detailRequests', 'aboutEndpointDash']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
       expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
     }
@@ -1239,36 +1363,16 @@ describe('卡片用量实际化：网关代理用量优先，org 用量回落', 
     expect(code).toContain('gw: null, legacy: null');
   });
 
-  it('previewGwBox 渲染请求/输入+输出 tokens/成本三小格，标题用 previewGwTitle', () => {
+  it('用量数据源：网关实际用量（gw）优先，回落 org usage summary；到达都走 fillCardStats 回填', () => {
     const code = inlineScript();
-    expect(code).toContain('function previewGwBox(');
-    expect(code).toContain("T('previewGwTitle')");
-    expect(code).toContain("fmt((Number(g.inputTokens) || 0) + (Number(g.outputTokens) || 0))");
-    expect(code).toContain("T('tokens')");
-    expect(code).toContain('g.costMicroCents != null ? money(g.costMicroCents)');
-  });
-
-  it('最终选择走 previewUsageHtml：gw 有数据优先，否则回落 org usage', () => {
-    const code = inlineScript();
-    expect(code).toContain('function previewUsageHtml(c)');
-    expect(code).toContain('return c.gw ? previewGwBox(c.gw) : previewUsageBox(c.usage);');
-    // 两个数据源到达都走同一出口，防止先后到达互相覆盖；
-    // accountCard（render 重建）同样走 previewUsageHtml，与回填口径一致。
-    expect(code).toContain("fillPreviewBox(id, 'usage', previewUsageHtml(c));");
-    expect(code).toContain('var usageBox = pc ? previewUsageHtml(pc) : \'\';');
-  });
-
-  it('网关用量词条 en/zh 都有（previewGwTitle）', () => {
-    const en = new Set([...codeOfDict('en')]);
-    const zh = new Set([...codeOfDict('zh')]);
-    for (const k of ['previewGwTitle']) {
-      expect(en.has(k), `en 缺 ${k}`).toBe(true);
-      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
-    }
+    expect(code).toContain('function cardStatsHtml(');
+    expect(code).toContain("pc.gw && (pc.gw.inputTokens != null || pc.gw.outputTokens != null)");
+    expect(code).toContain('pc.usage.summary.totalOutputTokens != null');
+    expect(code).toContain("fillCardStats(id);");
   });
 });
 
-describe('卡片 legacy keys 摘要（数量 + 首个名字）', () => {
+describe('卡片 legacy keys 摘要（逐 key 复制按钮）', () => {
   it('legacy keys 端点被拉取并回填（fetchPreviewLegacy + fillPreviewLegacy）', () => {
     const code = inlineScript();
     expect(code).toContain('function fetchPreviewLegacy(');
@@ -1279,17 +1383,18 @@ describe('卡片 legacy keys 摘要（数量 + 首个名字）', () => {
     expect(code).toContain('Array.isArray(r.json.data.keys)');
   });
 
-  it('legacy 摘要行由 legacyPreviewRow 生成：数量 + 首个名字，无 legacy 返回空串', () => {
+  it('legacy 摘要行由 legacyPreviewRow 生成：逐 key 行带复制按钮，无 legacy 返回空串', () => {
     const code = inlineScript();
     expect(code).toContain('function legacyPreviewRow(');
     expect(code).toContain("if (!keys || !keys.length) return '';");
-    expect(code).toContain("if (keys[i] && keys[i].name) names.push(keys[i].name);");
-    expect(code).toContain("T('legacyCount') + ' ' + keys.length");
-    expect(code).toContain('esc(names[0])');
+    // 每行：名字 + 掩码 + 复制按钮（带账户归属 + keyId，列表页无 detailState.id）。
+    expect(code).toContain('data-action="copy-legacy-key"');
+    expect(code).toContain('data-accountid="\' + accountId');
+    expect(code).toContain("data-keyid=\"' + esc(k.id)");
     // render 重建时 accountCard 也从缓存读 legacy 行（防丢），fill 防重插。
-    expect(code).toContain('var legacyRow = pc ? legacyPreviewRow(pc.legacy) : \'\';');
+    expect(code).toContain('var legacyRow = pc ? legacyPreviewRow(pc.legacy, a.id) : \'\';');
     expect(code).toContain("if (card.querySelector('.keys .legacy-row')) return;");
-    expect(code).toContain('legacyPreviewRow(keys)');
+    expect(code).toContain('legacyPreviewRow(keys, id)');
   });
 
   it('无 legacy keys / 404 时静默（不插行）', () => {
@@ -1297,10 +1402,69 @@ describe('卡片 legacy keys 摘要（数量 + 首个名字）', () => {
     expect(code).toContain('if (!html) return;');
   });
 
-  it('legacy 摘要词条 en/zh 都有（legacyCount/legacyHint）', () => {
+  it('legacy 摘要词条 en/zh 都有（legacyHint/legacyKeyCopyTitle）', () => {
     const en = new Set([...codeOfDict('en')]);
     const zh = new Set([...codeOfDict('zh')]);
-    for (const k of ['legacyCount', 'legacyHint']) {
+    for (const k of ['legacyHint', 'legacyKeyCopyTitle']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
+  });
+});
+
+describe('同 key 共用检测（duplicateKey）与 Go 用量已用尽徽章', () => {
+  it('卡片 dup 徽章：duplicateKey=true 时卡片头渲染 oc-chip-danger，带归属名；false 不渲染', () => {
+    const code = inlineScript();
+    expect(code).toContain("(a.duplicateKey");
+    expect(code).toContain("T('dupKeyBadge') + (a.duplicateKeyWith ? ' · ' + esc(a.duplicateKeyWith) : '')");
+    expect(code).toContain('oc-chip oc-chip-danger');
+  });
+
+  it('详情 legacy-key 区块重复提示（dupWarn）挂在 configured 之后', () => {
+    const code = inlineScript();
+    expect(code).toContain("var dupWarn = a.duplicateKey");
+    expect(code).toContain("'</div>' + configured + dupWarn");
+  });
+
+  it('renderFingerprint 包含 duplicateKey（重复状态变化触发重建）', () => {
+    const code = inlineScript();
+    expect(code).toContain("a.duplicateKey ? (a.duplicateKeyWith || '') : ''");
+  });
+
+  it('cardStatsHtml 用 isGoWindowExhausted 判定 Go 窗口，满窗口标红（s-bad）', () => {
+    const code = inlineScript();
+    expect(code).toContain('function isGoWindowExhausted(');
+    expect(code).toContain('usagePercent >= 100');
+    expect(code).toContain('/rate-?limit|limit_reached|exhausted/i');
+    expect(code).toContain("isGoWindowExhausted(w) ? 's-bad'");
+  });
+
+  it('isGoWindowExhausted 纯函数：100% / status 限流 / 无窗口三态', () => {
+    const ex = evalFn<(w: unknown) => boolean>('isGoWindowExhausted');
+    expect(ex({ usagePercent: 100, status: 'ok' })).toBe(true);
+    expect(ex({ usagePercent: 99, status: 'rate-limit' })).toBe(true);
+    expect(ex({ usagePercent: 99, status: 'limit_reached' })).toBe(true);
+    expect(ex({ usagePercent: 50, status: 'ok' })).toBe(false);
+    expect(ex(null)).toBe(false);
+    expect(ex({ status: 'ok' })).toBe(false);
+  });
+
+  it('cardStatsHtml 纯函数：余额/用量/Go 三行；无数据返回空串', () => {
+    const cs = evalFn<(a: unknown, pc: unknown) => string>('cardStatsHtml', { T: (k: string) => k, fmt: (n: number) => String(n), isGoWindowExhausted: () => false });
+    const html = cs({ balance: 12.34, hasConsole: true }, { gw: { inputTokens: 1200, outputTokens: 300 }, go: { go: { weekly: { usagePercent: 38 }, monthly: { usagePercent: 19 } } } });
+    expect(html).toContain('balanceOrg');
+    expect(html).toContain('$12.34');
+    expect(html).toContain('1500 tok');
+    expect(html).toContain('goWeekly 38%');
+    expect(html).toContain('goMonthly 19%');
+    // 无任何数据（env 代理账号，无 balance/usage/go）→ 空串，右侧栏不渲染。
+    expect(cs({ balance: null, hasConsole: false }, {})).toBe('');
+  });
+
+  it('词条 en/zh 都有（dupKeyBadge/dupKeyHint）', () => {
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    for (const k of ['dupKeyBadge', 'dupKeyHint']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
       expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
     }
@@ -1446,7 +1610,7 @@ describe('模型映射可修改（PUT /model-aliases/:alias）', () => {
 });
 
 /** 提取 i18n 字典（en/zh）的键集合。 */
-function codeOfDict(lang: 'en' | 'zh'): string[] {
+function codeOfDict(lang: 'en' | 'zh' | 'ja'): string[] {
   const code = inlineScript();
   const start = code.indexOf(`${lang}:`);
   if (start < 0) throw new Error(`字典缺 ${lang}`);
@@ -1502,7 +1666,7 @@ describe('波 2：P0 面板 + 旧版计费 + 观测计数 + 实验功能', () =>
   it('波 2 词条 en/zh 都有', () => {
     const en = new Set(codeOfDict('en'));
     const zh = new Set(codeOfDict('zh'));
-    for (const k of ['legacyBilling', 'legacyBillingSub', 'legacyReload', 'paymentHistory', 'amount',
+    for (const k of ['legacyBilling', 'legacyBillingSub', 'legacyReload', 'paymentHistory',
                      'noPayments', 'costTrend', 'noTrend', 'modelUsageTitle', 'modelUsageSub',
                      'userUsageTitle', 'userUsageSub', 'spent', 'exceeded', 'resetsAt',
                      'memberBudgetTitle', 'pricingTitle', 'pricingSub', 'inPerMtok', 'outPerMtok',
@@ -1546,7 +1710,7 @@ describe('批次 2：分发密钥 tab（tokens）', () => {
     const code = inlineScript();
     expect(code).toContain("tokens: 'view-tokens'");
     expect(code).toContain("tokens: [['subTokens', 'sec-tokens']]");
-    expect(code).toContain("if (v === 'tokens') { loadTokens(false); }");
+    expect(code).toContain("if (v === 'tokens') { loadTokens(true); }");
     expect(code).toContain("$('btn-token-create').addEventListener('click', createTokens);");
   });
 
@@ -1559,7 +1723,7 @@ describe('批次 2：分发密钥 tab（tokens）', () => {
     }
     expect(code).toContain("api('GET', '/__admin/api/tokens', null)");
     expect(code).toContain("api('POST', '/__admin/api/tokens', body)");
-    expect(code).toContain("api('PATCH', '/__admin/api/tokens/' + id, { name: name, note: note || null })");
+    expect(code).toContain("api('PATCH', '/__admin/api/tokens/' + id, { name: name, note: note || null, quotaUsd:");
     expect(code).toContain("api('PATCH', '/__admin/api/tokens/' + id, { status: to })");
     expect(code).toContain("api('DELETE', '/__admin/api/tokens/' + id, null)");
     expect(code).toContain('data-action="toggle-token"');
@@ -1627,6 +1791,109 @@ describe('批次 2：分发密钥 tab（tokens）', () => {
     expect(code).toContain('flash(okMsg);');
     expect(code).toContain('loadTokens(true);');
     expect(code).toContain("$('confirm-err').textContent = errMsg(r);");
+  });
+});
+
+describe('配额 UI（QUOTA.md §7）：密钥页每密钥配额配置/展示', () => {
+  it('列表新增「配额」列（表头 data-i18n=quota），行内渲染已用/上限 + 状态徽章', () => {
+    expect(ADMIN_HTML).toContain('<th data-i18n="quota">quota</th>');
+    const code = inlineScript();
+    // quotaParts 读 t.quota（tokens.ts TokenQuotaView 嵌套视图），limit 0 = ∞；
+    // 有上限显示「已用/上限」（$ 直接 toFixed——usedUsd 已是美元，不再过 money()，
+    // 避免把已转好的美元压成 $0.00）。
+    expect(code).toContain('function quotaParts(');
+    expect(code).toContain('var qo = t.quota || {};');
+    expect(code).toContain("qUsd > 0 ? '$' + uUsd.toFixed(2) + '/' + '$' + qUsd.toFixed(2)");
+    expect(code).toContain('qTok > 0 ? fmt(uTok) + \'/\' + fmt(qTok) + \' tok\'');
+    expect(code).toContain('qReq > 0 ? fmt(uReq) + \'/\' + fmt(qReq) + \' req\'');
+    expect(code).toContain('function quotaBadge(');
+    // 状态判定直接读服务端算好的 exhausted/expired（tokens.ts computeQuotaStatus，
+    // 跨周期窗口服务端已按校验口径算好，前端推导会误报）——不再手写 used≥limit。
+    expect(code).toContain('exhausted: !!qo.exhausted,');
+    expect(code).toContain('expired: !!qo.expired,');
+    expect(code).toContain('remainingUsd: qo.remainingUsd == null ? null : Number(qo.remainingUsd),');
+    expect(code).toContain('if (q.expired) return');
+    expect(code).toContain('T(\'quotaBadgeExhausted\')');
+    expect(code).toContain('T(\'quotaBadgeExpired\')');
+    expect(code).toContain('T(\'quotaBadgeOk\')');
+    // 未设配额显示中性占位（quotaNone），且不显示徽章。
+    expect(code).toContain("T('quotaNone')");
+    expect(code).toContain('q.any ? q.parts.join(\' · \')');
+  });
+
+  it('配额变化进入 tokenFingerprint（触发列表重建，不丢行内输入）', () => {
+    const code = inlineScript();
+    expect(code).toContain('JSON.stringify(t.quota || null)');
+  });
+
+  it('编辑弹层加配额表单：$ / tokens / 请求输入 + 周期下拉 + 过期日期', () => {
+    const code = inlineScript();
+    expect(code).toContain("T('quotaUsd')");
+    expect(code).toContain("id=\"tok-edit-qusd\"");
+    expect(code).toContain("id=\"tok-edit-qtok\"");
+    expect(code).toContain("id=\"tok-edit-qreq\"");
+    expect(code).toContain("id=\"tok-edit-cycle\"");
+    expect(code).toContain("id=\"tok-edit-expires\"");
+    // 周期三档：无 / 每日 / 每月。
+    expect(code).toContain("[['none', 'quotaCycleNone'], ['daily', 'quotaCycleDaily'], ['monthly', 'quotaCycleMonthly']]");
+    // 预填读嵌套视图 t.quota。
+    expect(code).toContain('var qo = t.quota || {};');
+    expect(code).toContain("((qo.cycle || 'none') === c[0] ? ' selected' : '')");
+  });
+
+  it('保存 PATCH 全量配额字段（$ 允许小数，token/请求非负整数，空 = 0 = 不限；过期留空 = 0 = 永久）', () => {
+    const code = inlineScript();
+    expect(code).toContain('quotaUsd: qUsdRaw === \'\' ? 0 : qUsd,');
+    expect(code).toContain('quotaTokens: qTokRaw === \'\' ? 0 : qTok,');
+    expect(code).toContain('quotaRequests: qReqRaw === \'\' ? 0 : qReq,');
+    expect(code).toContain('cycle: $(\'tok-edit-cycle\').value,');
+    expect(code).toContain('expiresAt: expTs');
+    expect(code).toContain("var expTs = expRaw ? new Date(expRaw + 'T00:00:00').getTime() : 0;");
+    expect(code).toContain("T('quotaInvalid')");
+    expect(code).toContain("tokDone(r, T('quotaSaved'))");
+  });
+
+  it('配额词条 en/zh 都有', () => {
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    for (const k of ['quota', 'quotaUsd', 'quotaTokens', 'quotaRequests', 'quotaCycle',
+                     'quotaCycleNone', 'quotaCycleDaily', 'quotaCycleMonthly', 'quotaExpires',
+                     'quotaExpiresHint', 'quotaHint', 'quotaNone', 'quotaBadgeOk',
+                     'quotaBadgeExhausted', 'quotaBadgeExpired', 'quotaInvalid', 'quotaSaved']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
+  });
+
+  it('TPM/IP 白名单：列表配额列显示 tpm 已用/上限（∞=无限）+ 词条三语', () => {
+    const code = inlineScript();
+    expect(code).toContain('var qTpm = Number(qo.quotaTpm) || 0;');
+    expect(code).toContain("qTpm > 0 ? fmt(uTpm) + '/' + fmt(qTpm) + ' tpm' : inf");
+    expect(code).toContain('any: qUsd > 0 || qTok > 0 || qReq > 0 || qTpm > 0');
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    const ja = new Set(codeOfDict('ja'));
+    for (const k of ['quotaTpm', 'ipWhitelist', 'ipWhitelistHint']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+      expect(ja.has(k), `ja 缺 ${k}`).toBe(true);
+    }
+  });
+
+  it('编辑弹层渲染 TPM/IP 输入 + 提交字段（quotaTpm 非负整数 / ipWhitelist 逗号分隔数组）', () => {
+    const code = inlineScript();
+    expect(code).toContain('id="tok-edit-qpm"');
+    expect(code).toContain('id="tok-edit-ip"');
+    expect(code).toContain("T('quotaTpm')");
+    expect(code).toContain("T('ipWhitelist')");
+    // 预填读服务端视图：quotaTpm / ipWhitelist（数组 → 逗号拼接显示）。
+    expect(code).toContain("(Number(qo.quotaTpm) || 0)");
+    expect(code).toContain("(qo.ipWhitelist || []).join(', ')");
+    // 校验：TPM 非负整数；提交带 quotaTpm + ipWhitelist（空 → 空数组 = 不限）。
+    expect(code).toContain("if (qpmRaw !== '' && (!isFinite(qpm) || qpm < 0 || Math.floor(qpm) !== qpm))");
+    expect(code).toContain('quotaTpm: qpmRaw === \'\' ? 0 : qpm,');
+    expect(code).toContain("var ipList = ($('tok-edit-ip').value || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);");
+    expect(code).toContain('ipWhitelist: ipList,');
   });
 });
 
@@ -1731,7 +1998,7 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     expect(code).toContain('function loadSettings(');
     expect(code).toContain('function renderSettings(');
     expect(code).toContain('function renderApiKeys(');
-    expect(code).toContain("var srcOf = function (k) { return T(SETTINGS_SRC[(s[k] && s[k].source === 'db') ? 'db' : 'env']); };");
+    expect(code).toContain("var srcOf = function (k) {\n      var src = s[k] && s[k].source;\n      return T(SETTINGS_SRC[src] || 'sourceEnv');\n    };");
   });
 
   it('保存账号密码：密码留空不提交 adminPass（防覆盖成空）；成功 flash 会话失效提示', () => {
@@ -1749,9 +2016,14 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     expect(ADMIN_HTML).toContain('data-i18n="adminPassHint">all logged-in sessions are invalidated immediately after a password change; re-login required</div>');
   });
 
-  it('来源标记：env/db 小字；默认密码强提示读服务端 adminPassIsDefault（非 source 近似）', () => {
+  it('来源标记：env/db/code-default 三元组小字；默认密码强提示读服务端 adminPassIsDefault（非 source 近似）', () => {
     const code = inlineScript();
-    expect(code).toContain("var SETTINGS_SRC = { env: 'sourceEnv', db: 'sourceDb' };");
+    expect(code).toContain("var SETTINGS_SRC = { env: 'sourceEnv', db: 'sourceDb', 'code-default': 'codeDefault' };");
+    expect(code).toContain("T(SETTINGS_SRC[src] || 'sourceEnv')");
+    // 三元组渲染：db→sourceDb、env→sourceEnv、code-default→codeDefault（不再把
+    // code-default 吞成 env）。codeDefault 词条 en/zh 对称。
+    expect(code).toContain("codeDefault: 'code default'");
+    expect(code).toContain("codeDefault: '代码默认'");
     // 回归：修复前用 source==='env' 近似判断（env 显式强密码会误报）；修复后
     // 读服务端顶层 adminPassIsDefault 精确字段驱动徽章 + 行内提示。
     expect(code).toContain('r.json.data.adminPassIsDefault === true');
@@ -1768,6 +2040,26 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     expect(ADMIN_HTML).toContain('.oc-chip.oc-chip-danger');
   });
 
+  it('secret.key 备份提示：关于区高亮警告卡（路径/丢失后果/备份建议）', () => {
+    // 卡片 + 词条挂点都在关于区块。
+    expect(ADMIN_HTML).toContain('class="card backup-warn"');
+    expect(ADMIN_HTML).toContain('data-i18n="secretBackupTitle">back up secret.key');
+    expect(ADMIN_HTML).toContain('data-i18n="secretBackupBody">data/secret.key encrypts every stored secret');
+    expect(ADMIN_HTML).toContain('.backup-warn { border-color: rgba(255, 69, 58, .45); }');
+    expect(ADMIN_HTML).toContain('.backup-warn .bw-title { color: var(--danger); font-weight: 600; }');
+    // 三语对称。
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    const ja = new Set(codeOfDict('ja'));
+    for (const k of ['secretBackupTitle', 'secretBackupBody']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+      expect(ja.has(k), `ja 缺 ${k}`).toBe(true);
+    }
+    expect(zh.has('secretBackupTitle')).toBe(true);
+    expect(inlineScript()).toContain("secretBackupTitle: '请备份 secret.key'");
+  });
+
   it('实验开关 toggle：反值 PATCH（scaleClientTokens / compactEnabled），只读值做后缀', () => {
     const code = inlineScript();
     expect(code).toContain("patchSetting('scaleClientTokens', tg.getAttribute('data-on') !== '1')");
@@ -1775,7 +2067,7 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     expect(code).toContain("api('PATCH', '/__admin/api/settings', body).then");
     expect(code).toContain('scaleOn && s.clientTokenScale ? \'x\' + s.clientTokenScale.value');
     expect(code).toContain("Math.round(Number(s.compactTriggerBytes.value) / 1024) + 'KB'");
-    expect(code).toContain("Number(s.compactMaxMessageChars.value) + ' chars'");
+    expect(code).toContain("Number(s.compactMaxMessageChars.value) + ' ' + T('chars')");
   });
 
   it('API 密钥管理：掩码列表 + 明文缓存（localStorage，mask=末 4 位），无明文删除禁用', () => {
@@ -1805,13 +2097,13 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     const keys = ['tabTokens', 'tokensTitle', 'tokensSub', 'tokensNote', 'tokensEmpty', 'tokensUnavailable',
                   'tokenCreate', 'tokenCount', 'tokenPlainOnlyOnce', 'tokenCopy', 'tokenCopied', 'tokenClose',
                   'tokenActive', 'tokenDisabled', 'tokenUsage', 'tokenCreatedAt', 'tokenEditTitle',
-                  'tokenSaved', 'tokenDeleted', 'tokenEnabled', 'tokenDisabledMsg', 'tokenDisable',
+                  'tokenDeleted', 'tokenEnabled', 'tokenDisabledMsg', 'tokenDisable',
                   'tokenEnable', 'tokenDeleteConfirm',
                   'ovTotalRequests', 'ovSuccessRate', 'ovCostLabel', 'ovKeys', 'statusTitle', 'statusSub',
                   'subStatus', 'stGateway', 'stUpstream', 'stAccounts', 'stDistKeys', 'stFixes', 'stRunning',
                   'ovTrendNote', 'ovTrendFallback',
                   'adminAuthTitle', 'adminAuthSub', 'adminUserLabel', 'adminPassLabel', 'adminPassPlaceholder',
-                  'adminPassHint', 'adminPassEnvWarn', 'adminPassDefaultBadge', 'authSaved', 'aaNothing', 'sourceEnv', 'sourceDb',
+                  'adminPassHint', 'adminPassEnvWarn', 'adminPassDefaultBadge', 'authSaved', 'aaNothing', 'sourceEnv', 'sourceDb', 'codeDefault',
                   'apiKeysTitle', 'apiKeysSub', 'apiKeysEmpty', 'apiKeysAdd', 'apiKeysAddTitle',
                   'apiKeysPasteHint', 'apiKeysNoPlain', 'apiKeysEnvWarn', 'apiKeysDeleteConfirm',
                   'apiKeysSaved', 'settingsSaved', 'subAdminAuth', 'subAdminKeys', 'subExperimental',
@@ -1822,9 +2114,10 @@ describe('批次 2：设置页热改（settings 端点）', () => {
     }
   });
 
-  it('余额来源标注：账号卡余额卡用「余额（org）」词条', () => {
+  it('余额来源标注：账号卡右侧压缩栏余额行用「余额（org）」词条', () => {
     const code = inlineScript();
-    expect(code).toContain("T('balanceOrg') + '</div>'");
+    expect(code).toContain("T('balanceOrg')");
+    expect(code).toContain("$' + Number(a.balance).toFixed(2) + '</span></div>'");
   });
 
   it('实验功能说明改为热改语义（立即生效并持久保存）', () => {
@@ -1927,7 +2220,7 @@ describe('登录页 LOGIN_HTML i18n', () => {
   it('语言跟随面板偏好（同一 localStorage fc-lang），脚本运行时设置 html lang', () => {
     const code = loginScript();
     expect(code).toContain("localStorage.getItem('fc-lang')");
-    expect(code).toContain("document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';");
+    expect(code).toContain("document.documentElement.lang = lang === 'zh' ? 'zh-CN' : lang === 'ja' ? 'ja' : 'en';");
   });
 
   it('登录页 CSS 走 oc-* 模板类', () => {
@@ -2074,8 +2367,10 @@ describe('第二批：legacy key 明文复制按钮', () => {
   it('legacy key 行有复制按钮（copy-legacy-key），点击走 /keys/plain 取明文', () => {
     const code = inlineScript();
     expect(code).toContain('data-action="copy-legacy-key"');
-    expect(code).toContain("'/__admin/api/legacy/account/' + detailState.id + '/keys/plain'");
-    expect(code).toContain('if (act === \'copy-legacy-key\') { copyLegacyKey(btn.getAttribute(\'data-keyid\')); return; }');
+    // 账户归属可空回落 detailState.id（详情页省略 data-accountid），列表页卡片必带。
+    expect(code).toContain("var aid = accountId != null && accountId !== '' ? accountId : detailState.id;");
+    expect(code).toContain("'/__admin/api/legacy/account/' + aid + '/keys/plain'");
+    expect(code).toContain('if (act === \'copy-legacy-key\') { copyLegacyKey(btn.getAttribute(\'data-keyid\'), btn.getAttribute(\'data-accountid\')); return; }');
     expect(code).toContain('function copyLegacyKey(');
   });
 
@@ -2194,8 +2489,8 @@ describe('对抗审查 6 项修复的回归测试', () => {
     expect(src).toContain('Number(data.promotional).toFixed(2)');
     expect(src).not.toContain('money(data.balance)');
     expect(src).not.toContain('money(data.promotional)');
-    // 账户列表页 accountCard 的显示口径没被误改。
-    expect(fnSource('accountCard')).toContain("'$' + Number(a.balance).toFixed(2)");
+    // 账户列表页余额显示口径没被误改（cardStatsHtml 右侧压缩栏内）。
+    expect(fnSource('cardStatsHtml')).toContain("$' + Number(a.balance).toFixed(2) + '</span></div>'");
   });
 
   it('2. renderFingerprint 排除 inFlight/lastUsedAt，保留状态字段', () => {
@@ -2318,23 +2613,28 @@ describe('Model Access 面板（MODEL-ACCESS §6）', () => {
     expect(ADMIN_HTML).toContain('data-tab="access"');
     for (const id of ['view-access', 'sec-access-global', 'sec-access-upstream',
                       'sec-access-token', 'sec-access-apikey', 'ma-global-chips',
-                      'ma-global-save', 'ma-global-reset', 'ma-search', 'ma-filter',
+                      'ma-global-save', 'ma-global-reset', 'ma-global-add', 'ma-global-add-btn',
+                      'ma-global-options', 'ma-search', 'ma-filter',
                       'ma-upstream', 'ma-token', 'ma-apikey', 'ma-refresh']) {
       expect(ADMIN_HTML, `缺挂载点 #${id}`).toContain(`id="${id}"`);
     }
   });
 
-  it('内联 JS 有 model-access 渲染/编辑逻辑（loadModelAccess + 编辑委托 + 端点路径）', () => {
+  it('内联 JS 有 model-access 渲染/编辑逻辑（loadModelAccess + 编辑委托 + 端点路径 + 添加模型）', () => {
     const code = inlineScript();
     expect(code).toContain('function loadModelAccess(');
     expect(code).toContain('function editModelAccess(');
     expect(code).toContain('function renderMaGlobal(');
+    expect(code).toContain('function addMaGlobalModels(');
     expect(code).toContain('data-action="ma-edit"');
     expect(code).toContain("data-subject=\"' + esc(k.subject || k.fingerprint || '')");
     expect(code).toContain("' + type + '/' + encodeURIComponent(subject)");
     expect(code).toContain('/__admin/api/model-access/global');
     expect(code).toContain("access: 'view-access'");
     expect(code).toContain("if (v === 'access') { loadModelAccess(); }");
+    // 添加模型：逗号分隔解析 + 与 settings 同款格式校验（可添加任意合法模型名）。
+    expect(code).toContain("(input.value || '').split(',')");
+    expect(code).toContain('/^[a-z0-9._-]+$/.test(m)');
   });
 
   it('切到 access tab 才拉配置（switchView 分支），2s tick 里不轮询（数据静态）', () => {
@@ -2357,7 +2657,8 @@ describe('Model Access 面板（MODEL-ACCESS §6）', () => {
     const en = keys('en');
     const zh = keys('zh');
     for (const k of ['tabModelAccess', 'subModelAccess', 'maGlobalTitle', 'maGlobalSub',
-                     'maGlobalModels', 'maGlobalFloor', 'maResetGlobal', 'maGlobalSaved',
+                     'maGlobalModels', 'maGlobalFloor', 'maGlobalAdd', 'maGlobalAddHint',
+                     'maGlobalEmpty', 'maAddInvalid', 'maResetGlobal', 'maGlobalSaved',
                      'maSearchPh', 'maFilterAll', 'maFilterUpstream', 'maFilterToken', 'maFilterApiKey',
                      'maRefresh', 'maUpstreamTitle', 'maUpstreamSub', 'maTokenTitle', 'maTokenSub',
                      'maApiKeyTitle', 'maApiKeySub', 'maEmpty', 'maNoMatch', 'maCustomBadge',
@@ -2399,7 +2700,7 @@ describe('Model Access 面板（MODEL-ACCESS §6）', () => {
     for (const k of ['subUpdate', 'otaTitle', 'otaSub', 'otaCurrent', 'otaLatest', 'otaDisabled',
                      'otaCheck', 'otaChecking', 'otaUpdate', 'otaCheckedAt', 'otaCheckFailed',
                      'otaPrevPresent', 'otaRolledBack', 'otaRollbackState', 'otaHint',
-                     'otaConfirmTitle', 'otaConfirmBody',
+                     'otaConfirmTitle',
                      'otaStageCheck', 'otaStageDownload', 'otaStageVerify', 'otaStageSwap', 'otaStageRestart',
                      'otaRestarting', 'otaChangelog', 'otaNoChangelog', 'otaClose']) {
       expect(en.has(k), `en 缺 ${k}`).toBe(true);
@@ -2984,4 +3285,386 @@ describe('go 端点 legacyKey 优先：zen usage 成功走 zen、失败回落 co
     await fetch(`${baseUrl}/__admin/api/accounts/${id}`, { method: 'DELETE' });
   });
 });
+
+describe('需求 1：quota 错误友好文案包装（friendlyQuota）', () => {
+  /** 沙箱求值 friendlyQuota（stub 掉 lang / T，T 返回占位键名以便断言命中分支）。 */
+  function makeQ(lang: 'en' | 'zh') {
+    return evalFn<(msg: string) => string | null>('friendlyQuota', {
+      lang,
+      T: (k: string) =>
+        ({ quotaGo: 'QUOTA_GO', quotaFree: 'QUOTA_FREE', quotaGeneric: 'QUOTA_GENERIC',
+           quotaBalance: 'QUOTA_BALANCE', quotaResetsPre: lang === 'zh' ? '' : 'resets in ',
+           quotaResetsPost: lang === 'zh' ? ' 后重置' : '' } as Record<string, string>)[k] ?? k,
+    });
+  }
+
+  it('GoUsageLimitError → Go 额度分支 + 提取重置时间（en/zh 词序不同）', () => {
+    expect(makeQ('en')('GoUsageLimitError: Weekly usage limit reached. Resets in 3 days. To continue using this model now, enable usage from your available balance: https://opencode.ai/workspace/xxx/go'))
+      .toBe('QUOTA_GO · resets in 3 days');
+    expect(makeQ('zh')('GoUsageLimitError: Weekly usage limit reached. Resets in 3 days.')).toBe('QUOTA_GO · 3 天 后重置');
+    // 无重置时间 → 不带后缀
+    expect(makeQ('en')('GoUsageLimitError: no reset span')).toBe('QUOTA_GO');
+    // 短单位（19hr 22min）
+    expect(makeQ('en')('GoUsageLimitError: Weekly usage limit reached. Resets in 19hr 22min.'))
+      .toBe('QUOTA_GO · resets in 19hr 22min');
+  });
+
+  it('FreeUsageLimitError → 限流分支；余额不足 → quotaBalance 分支', () => {
+    expect(makeQ('en')('FreeUsageLimitError: Rate limit exceeded. Please try again later.')).toBe('QUOTA_FREE');
+    expect(makeQ('zh')('FreeUsageLimitError: Rate limit exceeded.')).toBe('QUOTA_FREE');
+    expect(makeQ('en')('CreditsError: Insufficient balance.')).toBe('QUOTA_BALANCE');
+  });
+
+  it('generic 额度耗尽类（MonthlyLimitError / 用尽）→ quotaGeneric 分支', () => {
+    expect(makeQ('en')('MonthlyLimitError: Monthly usage limit reached.')).toBe('QUOTA_GENERIC');
+    expect(makeQ('zh')('额度已用尽，请充值后重试')).toBe('QUOTA_GENERIC');
+  });
+
+  it('非 quota 错误 → null（调用方保留原文）', () => {
+    expect(makeQ('en')('AuthError: Invalid API key')).toBeNull();
+    expect(makeQ('en')('')).toBeNull();
+    expect(makeQ('en')('network timeout')).toBeNull();
+    expect(makeQ('en')('ModelError: model not found')).toBeNull();
+  });
+
+  it('accountCard / cardStatsHtml / detailErr 都接上 friendlyQuota，原文保留在 title', () => {
+    const card = fnSource('accountCard');
+    expect(card).toContain('friendlyQuota(detailRaw) || detailRaw');
+    expect(card).toContain('title="\' + esc(detailRaw) + \'"');
+    const stats = fnSource('cardStatsHtml');
+    expect(stats).toContain('friendlyQuota(a.statusDetail) || a.statusDetail || T(\'stError\')');
+    const derr = fnSource('detailErr');
+    expect(derr).toContain('esc(friendlyQuota(msg) || msg)');
+    expect(derr).toContain('title="\' + esc(msg) + \'"');
+  });
+
+  it('quota 词条 en/zh 都有（键集合一致）', () => {
+    function dictKeys(lang: 'en' | 'zh'): string[] {
+      const code = inlineScript();
+      const start = code.indexOf(`${lang}:`);
+      expect(start).toBeGreaterThan(-1);
+      const slice = code.slice(start);
+      const end = slice.indexOf('\n    }');
+      const body = slice.slice(0, end > 0 ? end : 4000);
+      return [...body.matchAll(/(?:^\s+|,\s*)([A-Za-z][\w]*)\s*:/gm)]
+        .map((m) => m[1]!)
+        .filter((k) => k !== lang);
+    }
+    const en = new Set(dictKeys('en'));
+    const zh = new Set(dictKeys('zh'));
+    for (const k of ['quotaGo', 'quotaFree', 'quotaGeneric', 'quotaBalance', 'quotaResetsPre', 'quotaResetsPost']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+    }
+  });
+});
+
+describe('表单校验英文中文化（translateServerMsg 扩展映射）', () => {
+  /** 从内联 JS 抠出 SERVER_MSG_KEYS / SERVER_MSG_RE 两个 var 的字面量并求值。 */
+  function serverMsgEnv(): { SERVER_MSG_KEYS: Record<string, string>; SERVER_MSG_RE: Array<[RegExp, string]> } {
+    const code = inlineScript();
+    const grab = (name: string, openCh: string, closeCh: string) => {
+      const start = code.indexOf(`var ${name} = ${openCh}`);
+      if (start < 0) throw new Error(`找不到 ${name}`);
+      let depth = 0;
+      for (let i = start; i < code.length; i++) {
+        if (code[i] === openCh) depth++;
+        else if (code[i] === closeCh) {
+          depth--;
+          if (depth === 0) return code.slice(start, i + 1);
+        }
+      }
+      throw new Error(`${name} 未闭合`);
+    };
+    const keys = grab('SERVER_MSG_KEYS', '{', '}');
+    const re = grab('SERVER_MSG_RE', '[', ']');
+    const fn = new Function(`${keys}\n${re}\nreturn { SERVER_MSG_KEYS, SERVER_MSG_RE };`);
+    return fn() as { SERVER_MSG_KEYS: Record<string, string>; SERVER_MSG_RE: Array<[RegExp, string]> };
+  }
+
+  /** 沙箱求值 translateServerMsg：T 返回词条键名，断言英文消息被正确映射。 */
+  function makeTs() {
+    const env = serverMsgEnv();
+    return evalFn<(m: string) => string>('translateServerMsg', {
+      SERVER_MSG_KEYS: env.SERVER_MSG_KEYS,
+      SERVER_MSG_RE: env.SERVER_MSG_RE,
+      T: (k: string) => k,
+    });
+  }
+
+  it('别名/目标/备注/可用模型/legacy 消息都进映射表（不再原样透传英文）', () => {
+    const ts = makeTs();
+    // alias / target / note
+    expect(ts('alias must be a string')).toBe('serverErrAliasType');
+    expect(ts('alias must be 1-100 characters of letters, digits, dot, dash or underscore')).toBe('serverErrAliasFormat');
+    expect(ts('target must be a string')).toBe('serverErrTargetType');
+    expect(ts('target must be a non-empty string of at most 100 characters')).toBe('serverErrTargetRequired');
+    expect(ts('note must be a string or null')).toBe('serverErrNoteType');
+    // allowedModels 五种
+    expect(ts('allowedModels must be an array of strings')).toBe('serverErrAllowedModelsType');
+    expect(ts('allowedModels must have at most 50 entries')).toBe('serverErrAllowedModelsTooMany');
+    expect(ts('allowedModels must not contain empty entries')).toBe('serverErrAllowedModelsEmpty');
+    expect(ts('each allowed model must be a string')).toBe('serverErrAllowedModelType');
+    expect(ts('each allowed model must be at most 100 characters')).toBe('serverErrAllowedModelTooLong');
+    // legacy 六个
+    expect(ts('legacyWorkspaceId must be a non-empty string or null')).toBe('serverErrLegacyWsRequired');
+    expect(ts('legacyWorkspaceId must be at most 200 characters')).toBe('serverErrLegacyWsTooLong');
+    expect(ts('legacyCookie must be a string or null')).toBe('serverErrLegacyCookieType');
+    expect(ts('legacyCookie must be at most 2048 characters')).toBe('serverErrLegacyCookieTooLong');
+    expect(ts('legacyKey must be a string or null')).toBe('serverErrLegacyKeyType');
+    expect(ts('legacyKey must be at most 2048 characters')).toBe('serverErrLegacyKeyTooLong');
+    // 既有高频项不受影响
+    expect(ts('name is required and must be a non-empty string')).toBe('nameRequired');
+  });
+
+  it('动态数字类消息走正则映射（name 1-N / note 上限 / rpm 0-N）', () => {
+    const ts = makeTs();
+    expect(ts('name must be 1-100 characters')).toBe('serverErrNameRange');
+    expect(ts('note must be at most 200 characters')).toBe('serverErrNoteTooLong');
+    expect(ts('rpmLimit must be an integer 0-1000000')).toBe('serverErrRpm');
+    // 未收录的消息原样透传。
+    expect(ts('some random english')).toBe('some random english');
+  });
+
+  it('token 配额/状态/TPM 校验消息也进映射（server.ts validateTokenPatch）', () => {
+    const ts = makeTs();
+    expect(ts('name must be a string')).toBe('serverErrNameType');
+    expect(ts('status must be active or disabled')).toBe('serverErrStatus');
+    expect(ts('quotaUsd must be a non-negative number')).toBe('serverErrQuotaUsd');
+    expect(ts('quotaTokens must be a non-negative integer')).toBe('serverErrQuotaTokens');
+    expect(ts('quotaTpm must be a non-negative integer')).toBe('serverErrQuotaTpm');
+    expect(ts('expiresAt must be a non-negative integer (epoch ms, 0 = never)')).toBe('serverErrExpires');
+    expect(ts('nickname must be at most 30 characters')).toBe('serverErrNicknameTooLong');
+    expect(ts('models is required')).toBe('serverErrModelsRequired');
+    expect(ts('subject is required')).toBe('serverErrSubjectRequired');
+  });
+
+  it('新增 serverErr 词条 en/zh 都有（键集合一致）', () => {
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    const ja = new Set(codeOfDict('ja'));
+    for (const k of ['serverErrWsTooLong', 'serverErrCookieTooLong', 'serverErrLegacyWsRequired',
+      'serverErrLegacyWsTooLong', 'serverErrLegacyCookieType', 'serverErrLegacyCookieTooLong',
+      'serverErrLegacyKeyType', 'serverErrLegacyKeyTooLong', 'serverErrAllowedModelsType',
+      'serverErrAllowedModelsTooMany', 'serverErrAllowedModelsEmpty', 'serverErrAllowedModelType',
+      'serverErrAllowedModelTooLong', 'serverErrAliasType', 'serverErrAliasFormat',
+      'serverErrTargetType', 'serverErrTargetRequired', 'serverErrNoteType', 'serverErrNoteTooLong',
+      'serverErrNameType', 'serverErrNameRange', 'serverErrStatus', 'serverErrQuotaUsd',
+      'serverErrQuotaTokens', 'serverErrQuotaRequests', 'serverErrQuotaTpm', 'serverErrExpires',
+      'serverErrRpm', 'serverErrTokenPlainType', 'serverErrTokenPlainLen', 'serverErrModelsRequired',
+      'serverErrSubjectRequired', 'serverErrNicknameType', 'serverErrNicknameTooLong', 'serverErrNicknameFailed']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+      expect(ja.has(k), `ja 缺 ${k}`).toBe(true);
+    }
+  });
+});
+
+describe('需求 2：详情页并发闸门（qDetail ≤4）+ billing 前端 TTL', () => {
+  it('qDetail 队列与并发上限存在，loadAccountDetail 的异步 loader 全部走排队', () => {
+    const code = inlineScript();
+    expect(code).toContain('var DETAIL_CONCURRENCY = 4;');
+    expect(code).toContain('function qDetail(');
+    expect(code).toContain('function pumpDetailQueue(');
+    expect(code).toContain('while (detailInFlight < DETAIL_CONCURRENCY');
+    const src = fnSource('loadAccountDetail');
+    expect(src).toContain('qDetail(tasks[i])');
+    for (const call of ['loadGo(id)', 'loadLegacyKeys(id)', 'loadLegacyBilling(id)',
+                        'loadWorkspaces(id)', 'loadBilling(id)', 'loadUsage()',
+                        'loadModelsUsage(id)', 'loadUsersUsage(id)', 'loadBudgets(id)',
+                        'loadMemberBudgets(id)', 'loadMembers(id)', 'loadSa(id)',
+                        'loadProviders(id)', 'loadPricing(id)']) {
+      expect(src, `loadAccountDetail 缺 ${call}`).toContain(call);
+    }
+    // 同步渲染不排队（模型区块读账号列表/目录快照，legacy key 配置读列表）。
+    expect(src).toContain('loadModels(id);');
+    expect(src).toContain('renderLegacyKey();');
+    // 排队任务带 start 守卫：排队期间切账号的旧任务直接放弃。
+    expect(src).toContain('if (detailState.id !== id) return;');
+    // 切账号时清掉未出发的旧任务（防队列堆积）。
+    expect(src).toContain('detailQueue.length = 0;');
+  });
+
+  it('14 个异步 loader 都 return api(...)（队列靠返回的 promise 跟踪完成）', () => {
+    const code = inlineScript();
+    for (const fn of ['loadBilling', 'loadGo', 'loadLegacyKeys', 'loadLegacyBilling',
+                      'loadWorkspaces', 'loadUsage', 'loadModelsUsage', 'loadUsersUsage',
+                      'loadBudgets', 'loadMemberBudgets', 'loadMembers', 'loadSa',
+                      'loadProviders', 'loadPricing']) {
+      expect(fnSource(fn), `${fn} 未 return api(...)`).toMatch(/return api\(/);
+    }
+  });
+
+  it('loadBilling 前端 TTL 门：fromTick 且 30s 内命中跳过，成功渲染打点', () => {
+    expect(inlineScript()).toContain('function billingFresh(');
+    const src = fnSource('loadBilling');
+    expect(src).toContain('if (billingFresh(id, fromTick)) return;');
+    expect(src).toContain('billingDetailAt[id] = Date.now();');
+    // 失败路径不打点（保留 2s 自愈）：detailErr 分支先于打点 return。
+    expect(src.indexOf('detailErr(\'billing\'')).toBeLessThan(src.indexOf('billingDetailAt[id]'));
+  });
+});
+
+describe('UI 重构：key 详情增强 + 设置页分组 + go-toggle 契约（contract guard）', () => {
+  it('key 用量弹层/手动启停接线到服务端 keys 端点（/keys/usage + /keys/:fp/disable|reset）', () => {
+    const code = inlineScript();
+    // 用量弹层：GET /keys/usage（服务端契约 data.keys[]），按 accountId+fingerprint 双条件匹配。
+    expect(code).toContain("'/__admin/api/keys/usage?rangeDays=7'");
+    expect(code).toContain('k.fingerprint === fp && (k.accountId == null || k.accountId === id)');
+    expect(code).toContain('hit.costMicroCents != null ? money(hit.costMicroCents)');
+    // 手动启停：POST /keys/:fp/disable|reset（掩码指纹 ****XXXX，服务端按此校验）。
+    expect(code).toContain("'/__admin/api/keys/' + encodeURIComponent(fp) + (disable ? '/disable' : '/reset')");
+    // 按钮接线（keyRow 产出 + #accounts 委托）。
+    expect(code).toContain('data-action="key-usage"');
+    expect(code).toContain('data-action="disable-key"');
+    expect(code).toContain('data-action="reset-key"');
+    expect(code).toContain('data-action="goto-tokens"');
+    for (const fn of ['keyUsage', 'toggleKeyState']) {
+      expect(code, `缺 ${fn}`).toContain(`function ${fn}(`);
+    }
+  });
+
+  it('go 开关接线到 PUT go-toggle 契约（body 只带被切换键，失败回滚保留）', () => {
+    const code = inlineScript();
+    expect(code).toContain("api('PUT', '/__admin/api/legacy/account/' + id + '/go-toggle', body)");
+    expect(code).toContain("var body = toggle === 'useBalance' ? { useBalance: enabled } : { chinaModels: enabled };");
+    expect(code).toContain('t.checked = !enabled;'); // 失败回滚
+    expect(code).toContain("delete stickyErr['go'];"); // 成功清 sticky
+  });
+
+  it('设置页分组卡片：4 组 .settings-group 包装，全部 section id 保留 + 分组词条 en/zh 都有', () => {
+    for (const id of ['sec-settings-lang', 'sec-modelmap', 'sec-admin-auth', 'sec-admin-keys',
+                      'sec-experimental', 'sec-update', 'sec-about']) {
+      expect(ADMIN_HTML, `缺 section #${id}`).toContain(`id="${id}"`);
+    }
+    expect((ADMIN_HTML.match(/class="settings-group"/g) || []).length).toBe(4);
+    for (const lang of ['en', 'zh'] as const) {
+      const body = codeOfDict(lang);
+      for (const k of ['settingsGroupService', 'settingsGroupSecurity', 'settingsGroupRuntime', 'settingsGroupAbout']) {
+        expect(body, `${lang} 缺 ${k}`).toContain(k);
+      }
+    }
+  });
+
+  it('账号列表是卡片网格：#accounts grid + 空态跨整排 + ≤40rem 单列降级', () => {
+    expect(ADMIN_HTML).toMatch(/#accounts \{[\s\S]*grid-template-columns: repeat\(auto-fill, minmax\(min\(100%, 400px\), 1fr\)\);/);
+    expect(ADMIN_HTML).toContain('#accounts .empty { grid-column: 1 / -1; }');
+    expect(ADMIN_HTML).toMatch(/@media \(max-width: 40rem\) \{[\s\S]*#accounts \{ grid-template-columns: 1fr; \}/);
+  });
+});
+
+describe('总览性能仪表盘（sec-perf + /__admin/api/performance）', () => {
+  it('性能区块骨架存在（总览 section + 容器 + 设置页开关）', () => {
+    expect(ADMIN_HTML).toContain('id="sec-perf"');
+    expect(ADMIN_HTML).toContain('id="perf"');
+    expect(ADMIN_HTML).toContain('id="perf-status"');
+    expect(ADMIN_HTML).toContain('data-i18n="perfTitle"');
+    expect(ADMIN_HTML).toContain('data-i18n="perfSub"');
+    expect(ADMIN_HTML).toContain('id="sec-perf-toggle"');
+    expect(ADMIN_HTML).toContain('id="perf-toggle"');
+    expect(ADMIN_HTML).toContain('id="perf-state-hint"');
+  });
+
+  it('性能词条 en/zh/ja 对称（各一份）且挂在总览 subnav', () => {
+    const keys = ['perfTitle', 'perfSub', 'perfRss', 'perfCpu', 'perfLoad', 'perfConcurrent',
+      'perfLatency', 'perfPool', 'perfUptime', 'perfHide', 'perfShow',
+      'perfPanel', 'perfPanelSub', 'perfPanelNote', 'subPerf'];
+    for (const k of keys) {
+      expect(ADMIN_HTML.split(k + ':').length - 1, `${k} 应 en/zh/ja 各一份`).toBe(3);
+    }
+    // 总览 sidebar 子导航包含性能。
+    expect(ADMIN_HTML).toContain("['subPerf', 'sec-perf']");
+  });
+
+  it('renderPerf/fetchPerf/开关逻辑存在且接进 tick', () => {
+    const code = inlineScript();
+    expect(code).toContain('function renderPerf(');
+    expect(code).toContain('function fetchPerf(');
+    expect(code).toContain("fetch('/__admin/api/performance'");
+    // tick 里每 2s 拉一次（跟随总览轮询节奏）。
+    expect(code).toMatch(/fetchOverviewTrend\(\);[\s\S]*fetchPerf\(\);/);
+    // 开关：localStorage fc-perf 持久化（默认开）+ 显隐 + 重新打开立刻拉一帧。
+    expect(code).toContain("localStorage.getItem('fc-perf')");
+    expect(code).toContain("localStorage.setItem('fc-perf'");
+    expect(code).toContain('function applyPerfVisibility(');
+    expect(code).toContain('sec.hidden = !perfOn');
+    expect(code).toContain('if (perfOn) fetchPerf();');
+    // 关闭时不发请求（fetchPerf 内部早退）。
+    expect(code).toContain("if (!perfOn || curView !== 'overview') return;");
+  });
+
+  it('性能仪表盘卡片渲染挂载点齐全（主题 meter 条 + 语义色）', () => {
+    expect(ADMIN_HTML).toContain('perf-meter-bg');
+    expect(ADMIN_HTML).toContain('perf-meter-fill');
+    expect(ADMIN_HTML).toContain('perf-meter-fill.warn');
+    expect(ADMIN_HTML).toContain('perf-meter-fill.danger');
+    expect(ADMIN_HTML).toContain('perf-cols');
+    expect(ADMIN_HTML).toContain('perf-dots');
+    expect(ADMIN_HTML).toContain('perf-dot.ok');
+    expect(ADMIN_HTML).toContain('perf-dot.bad');
+  });
+});
+
+describe('a11y：表单 label for/id 配对 + 无可见 label 输入框 aria-label', () => {
+  it('创建账号表单 label 全部 for/id 配对（name/workspace/keys/cookie）', () => {
+    expect(ADMIN_HTML).toContain('<label for="c-name"');
+    expect(ADMIN_HTML).toContain('<label for="c-ws"');
+    expect(ADMIN_HTML).toContain('<label for="c-keys"');
+    expect(ADMIN_HTML).toContain('<label for="c-cookie"');
+  });
+
+  it('模型映射 / 管理账号 / 登录页 label 都 for/id 配对', () => {
+    expect(ADMIN_HTML).toContain('<label for="mm-alias"');
+    expect(ADMIN_HTML).toContain('<label for="mm-target"');
+    expect(ADMIN_HTML).toContain('<label for="mm-note"');
+    expect(ADMIN_HTML).toContain('<label for="aa-user"');
+    expect(ADMIN_HTML).toContain('<label for="aa-pass"');
+    // 登录页（LOGIN_HTML 独立模板）。
+    expect(LOGIN_HTML).toContain('<label for="lg-user"');
+    expect(LOGIN_HTML).toContain('<label for="lg-pass"');
+  });
+
+  it('无可见 label 的输入框（搜索/分页/白名单/粘贴）有 aria-label', () => {
+    expect(ADMIN_HTML).toContain('id="req-q"');
+    expect(ADMIN_HTML).toMatch(/id="req-q"[\s\S]*?aria-label="search requests"/);
+    expect(ADMIN_HTML).toMatch(/id="req-size"[\s\S]*?aria-label="page size"/);
+    expect(ADMIN_HTML).toMatch(/id="req-page"[\s\S]*?aria-label="jump to page"/);
+    expect(ADMIN_HTML).toMatch(/id="ma-global-add"[\s\S]*?aria-label="add model"/);
+    expect(ADMIN_HTML).toMatch(/id="ma-avail-search"[\s\S]*?aria-label="search available models"/);
+    expect(ADMIN_HTML).toMatch(/id="ma-search"[\s\S]*?aria-label="search model access"/);
+    expect(ADMIN_HTML).toMatch(/id="ma-filter"[\s\S]*?aria-label="filter by type"/);
+    expect(ADMIN_HTML).toContain('id="detail-cookie-paste"');
+    expect(ADMIN_HTML).toMatch(/id="detail-cookie-paste"[\s\S]*?aria-label="cookie"/);
+  });
+
+  it('动态弹层输入框 for/id 配对（token 编辑 / 改名 / key 添加 / legacy key 粘贴）', () => {
+    const code = inlineScript();
+    // token 编辑弹层配额输入（含 TPM/IP）label 都 for 配对。
+    for (const id of ['tok-edit-name', 'tok-edit-note', 'tok-edit-qusd', 'tok-edit-qtok',
+                      'tok-edit-qreq', 'tok-edit-cycle', 'tok-edit-expires', 'tok-edit-qpm', 'tok-edit-ip']) {
+      expect(code, `缺 for=${id}`).toContain(`for="${id}"`);
+    }
+    expect(code).toContain('for="rk-nickname"');
+    expect(code).toContain('for="sa-name"');
+    expect(code).toContain('for="legacy-key-name"');
+    expect(code).toContain(`aria-label="' + T('addKey') + '"`);
+    expect(code).toContain(`aria-label="' + esc(T('legacyKeyTitle')) + '"`);
+  });
+
+  it('aria-label 语言切换同步更新（applyLang alMap）', () => {
+    const code = inlineScript();
+    expect(code).toContain("var alMap = { 'req-q': 'reqSearchPh', 'req-size': 'reqPageSize', 'req-page': 'reqJumpTo',");
+    expect(code).toContain("aEl.setAttribute('aria-label', T(alMap[alk]))");
+    // maFilter 词条三语对称（供 ma-filter select 的 aria-label）。
+    const en = new Set(codeOfDict('en'));
+    const zh = new Set(codeOfDict('zh'));
+    const ja = new Set(codeOfDict('ja'));
+    for (const k of ['maFilter']) {
+      expect(en.has(k), `en 缺 ${k}`).toBe(true);
+      expect(zh.has(k), `zh 缺 ${k}`).toBe(true);
+      expect(ja.has(k), `ja 缺 ${k}`).toBe(true);
+    }
+  });
+});
+
 

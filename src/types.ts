@@ -233,6 +233,9 @@ export type AnthropicStreamEvent =
       usage?: {
         output_tokens: number;
         input_tokens?: number;
+        // M2：缓存读 token（Anthropic 路径记账用）—— 与 input_tokens 同源折算
+        // （prompt 减缓存进 input_tokens，缓存单列），server settle 侧补计。
+        cache_read_input_tokens?: number;
         output_tokens_details?: { thinking_tokens?: number };
       };
     }

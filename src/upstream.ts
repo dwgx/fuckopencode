@@ -18,6 +18,131 @@ const UPSTREAM_IDLE_TIMEOUT_MS = 90_000;
  */
 const UPSTREAM_NONSTREAM_TOTAL_MS = 150_000;
 
+// ---------------------------------------------------------------------------
+// 上游级熔断（B1）进程内状态机。区别于 keypool 的 key 级 transient 冷却：
+// key 级对短瞬 5xx 正确（单 key 失败换号），但上游整体挂起（TCP 通、无响应）
+// 时每个请求都白等 120s，400 并发槽被挂起占满 → 新请求全撞 503 墙。熔断是
+// 上游级保护：连续「头超时/网络错误」达到阈值 → 熔断，数据面请求在 server 层
+// 直接 502 + Retry-After（不占用并发槽、不发上游），半开放 1 个探测请求验证恢复。
+//
+// 统计点只在 postUpstreamChat：fetch **抛错**（头超时/网络错误）计入；上游
+// 4xx/5xx 响应不计入（那是上游正常响应，说明它没挂）。状态进程内，重启清零
+// （可接受 —— 熔断是为防单次挂起，不是持久健康状态）。
+// ---------------------------------------------------------------------------
+
+/** 连续多少次「头超时/网络错误」触发熔断。 */
+const CIRCUIT_FAIL_THRESHOLD = 5;
+/** 熔断期：打开后持续多久拒绝数据面请求。 */
+const CIRCUIT_OPEN_MS = 30_000;
+/**
+ * 半开探测的最长等待：超过该时长探测仍无结论（探测请求被 auth/配额提前拒绝
+ * 等边缘场景没走到 postUpstreamChat），放行下一个请求重试 —— 熔断不会卡死
+ * 在半开态。正常探测（能到 postUpstreamChat）远快于此，由成功/失败直接转移。
+ */
+const CIRCUIT_PROBE_MAX_MS = 60_000;
+
+type CircuitStateName = 'closed' | 'open' | 'half-open';
+
+interface CircuitState {
+  state: CircuitStateName;
+  /** closed 态的连续失败计数（成功清零，达到阈值触发 open）。 */
+  consecutiveFailures: number;
+  /** open 态熔断截止时刻；半开态下一次探测放行的最早时刻。 */
+  openUntil: number;
+  /** 半开态：当前探测请求的放行时刻。 */
+  probeStartedAt: number;
+}
+
+const circuit: CircuitState = {
+  state: 'closed',
+  consecutiveFailures: 0,
+  openUntil: 0,
+  probeStartedAt: 0,
+};
+
+/** 熔断开关生效值：默认开（保护性，失败才触发），配置项可显式关。 */
+function breakerEnabled(cfg: AppConfig): boolean {
+  return cfg.upstreamCircuitBreaker !== false;
+}
+
+/**
+ * 数据面请求入口判定（server.ts 并发门前调用）：返回 true = 当前应直接 502。
+ *
+ * - closed：放行。
+ * - open：熔断期内拒绝；到期转为 half-open 并放行**这一个**请求当探测。
+ * - half-open：探测进行中拒绝；探测超时（CIRCUIT_PROBE_MAX_MS）后放行下一个
+ *   重试。探测结论由 postUpstreamChat 的 circuitRecordSuccess/Failure 转移状态。
+ */
+export function circuitShouldReject(cfg: AppConfig): boolean {
+  if (!breakerEnabled(cfg)) return false;
+  const now = Date.now();
+  if (circuit.state === 'open') {
+    if (now >= circuit.openUntil) {
+      circuit.state = 'half-open';
+      circuit.probeStartedAt = now;
+      console.info(`[circuit] half-open：放行探测请求（上一轮熔断 ${CIRCUIT_OPEN_MS / 1000}s 已过）`);
+      return false;
+    }
+    return true;
+  }
+  if (circuit.state === 'half-open') {
+    if (now - circuit.probeStartedAt >= CIRCUIT_PROBE_MAX_MS) {
+      circuit.probeStartedAt = now;
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/** 头超时/网络错误（postUpstreamChat 的 fetch 抛错）→ 计入熔断计数。 */
+export function circuitRecordFailure(cfg: AppConfig): void {
+  if (!breakerEnabled(cfg)) return;
+  if (circuit.state === 'closed') {
+    circuit.consecutiveFailures++;
+    if (circuit.consecutiveFailures >= CIRCUIT_FAIL_THRESHOLD) {
+      circuit.state = 'open';
+      circuit.openUntil = Date.now() + CIRCUIT_OPEN_MS;
+      console.warn(
+        `[circuit] open：连续 ${CIRCUIT_FAIL_THRESHOLD} 次头超时/网络错误，熔断 ${CIRCUIT_OPEN_MS / 1000}s`,
+      );
+    }
+  } else if (circuit.state === 'half-open') {
+    circuit.state = 'open';
+    circuit.openUntil = Date.now() + CIRCUIT_OPEN_MS;
+    circuit.consecutiveFailures = 0;
+    console.warn(`[circuit] 探测失败，重新 open（${CIRCUIT_OPEN_MS / 1000}s）`);
+  }
+}
+
+/**
+ * fetch 成功 resolve（任意状态码，含 4xx/5xx —— 上游在响应就说明没挂）。
+ * closed 态成功清零连续失败；half-open 态成功 = 探测通过 → close。
+ */
+export function circuitRecordSuccess(cfg: AppConfig): void {
+  if (!breakerEnabled(cfg)) return;
+  if (circuit.state === 'closed') {
+    circuit.consecutiveFailures = 0;
+  } else if (circuit.state === 'half-open') {
+    circuit.state = 'closed';
+    circuit.consecutiveFailures = 0;
+    console.info('[circuit] closed：探测成功，恢复');
+  }
+}
+
+/** 测试用：清空熔断状态（模块级单例，跨用例隔离）。 */
+export function circuitReset(): void {
+  circuit.state = 'closed';
+  circuit.consecutiveFailures = 0;
+  circuit.openUntil = 0;
+  circuit.probeStartedAt = 0;
+}
+
+/** 测试用：读取熔断状态快照。 */
+export function circuitSnapshot(): { state: CircuitStateName; consecutiveFailures: number } {
+  return { state: circuit.state, consecutiveFailures: circuit.consecutiveFailures };
+}
+
 /**
  * 上游调用句柄：Response + key 释放/失败上报。
  *
@@ -193,6 +318,9 @@ export async function postUpstreamChat(
     if (isStream) {
       resetIdle();
     }
+    // 响应头已到（fetch resolve，任意状态码）：上游在响应 = 没挂 → 熔断计数清零
+    // / 半开探测通过（B1）。4xx/5xx 不计入熔断，正是靠这里只认 resolve。
+    circuitRecordSuccess(cfg);
     return {
       response,
       key,
@@ -216,7 +344,11 @@ export async function postUpstreamChat(
     // 那才是 key/上游的真实失败信号。AbortSignal.any 不会把 abort 传播回源，
     // 所以用两个源各自的 aborted 标志区分谁先 abort。
     const clientAbort = signal?.aborted === true && controller.signal.aborted !== true;
-    if (!clientAbort) pool.markFailure(key, 'transient');
+    if (!clientAbort) {
+      pool.markFailure(key, 'transient');
+      // 头超时/网络错误计入上游级熔断（B1）：连续阈值次 → 数据面熔断 502。
+      circuitRecordFailure(cfg);
+    }
     throw err;
   }
 }

@@ -124,6 +124,71 @@ describe('resolveModel（全局模型门：白名单外明确拒绝）', () => {
     expect(resolveModelName('claude-opus-4-6', {}, 'deepseek-v4-flash')).toBe('deepseek-v4-flash');
     expect(resolveModelName('claude-opus-4-6', {}, 'claude-opus-5')).toBe('deepseek-v4-flash');
   });
+
+  it('自定义 allowedModels：硬底线外模型放行（扩展全局白名单后 resolveModel 门开）', () => {
+    const expanded = new Set(['deepseek-v4-flash', 'deepseek-v4-flash-free', 'claude-opus-5', 'gpt-5.5']);
+    expect(resolveModel('claude-opus-5', {}, 'deepseek-v4-flash', undefined, expanded)).toEqual({
+      ok: true,
+      model: 'claude-opus-5',
+    });
+    expect(resolveModel('gpt-5.5', {}, 'deepseek-v4-flash', undefined, expanded)).toEqual({ ok: true, model: 'gpt-5.5' });
+    // 仍拒绝扩展集外的模型（含默认 fallback 之外的）。
+    expect(resolveModel('glm-5.2', {}, 'deepseek-v4-flash', undefined, expanded)).toEqual({
+      ok: false,
+      reason: 'not-allowed',
+    });
+  });
+
+  it('自定义 allowedModels：默认模型不受影响（默认集是 ALLOWED_MODELS 超集）', () => {
+    const expanded = new Set(['claude-opus-5']);
+    expect(resolveModel('claude-opus-5', {}, 'deepseek-v4-flash', undefined, expanded)).toEqual({
+      ok: true,
+      model: 'claude-opus-5',
+    });
+    expect(resolveModel('deepseek-v4-flash', {}, 'deepseek-v4-flash', undefined, expanded)).toEqual({
+      ok: false,
+      reason: 'not-allowed',
+    });
+  });
+
+  it('自定义 allowedModels 下目录门只对代码默认模型生效（添加模型透传上游）', () => {
+    // claude-opus-5 是用户添加的（∉ ALLOWED_MODELS）：跳过目录门，即使 catalog 不含它。
+    const expanded = new Set(['deepseek-v4-flash', 'claude-opus-5']);
+    expect(resolveModel('claude-opus-5', {}, 'deepseek-v4-flash', new Set(['deepseek-v4-flash']), expanded)).toEqual({
+      ok: true,
+      model: 'claude-opus-5',
+    });
+    // deepseek-v4-flash 是代码默认模型：目录门仍生效。
+    expect(resolveModel('deepseek-v4-flash', {}, 'deepseek-v4-flash', new Set(['claude-opus-5']), expanded)).toEqual({
+      ok: false,
+      reason: 'not-in-catalog',
+    });
+  });
+
+  it('resolveModelName 传自定义 allowedModels：扩展集内模型直传，不再回落 fallback', () => {
+    const expanded = new Set(['claude-opus-5', 'deepseek-v4-flash']);
+    expect(resolveModelName('claude-opus-5', {}, 'deepseek-v4-flash', undefined, expanded)).toBe('claude-opus-5');
+    expect(resolveModelName('gpt-5.5', {}, 'deepseek-v4-flash', undefined, expanded)).toBe('deepseek-v4-flash');
+  });
+
+  it('normalizeAnthropicRequest 传自定义 allowedModels：添加的模型不被静默改写为 fallback', () => {
+    const expanded = new Set(['claude-opus-5', 'deepseek-v4-flash']);
+    const out = normalizeAnthropicRequest(
+      { model: 'claude-opus-5', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+      undefined,
+      expanded,
+    );
+    expect(out.model).toBe('claude-opus-5');
+    // 默认（未传扩展集）仍回落 flash —— 旧行为不变。
+    const def = normalizeAnthropicRequest(
+      { model: 'claude-opus-5', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(def.model).toBe('deepseek-v4-flash');
+  });
 });
 
 describe('normalizeAnthropicRequest', () => {
@@ -352,6 +417,16 @@ describe('normalizeAnthropicRequest', () => {
       DEFAULT_FALLBACK_MODEL,
     );
     expect(out.max_tokens).toBe(4096);
+  });
+
+  it('max_tokens 上限钳制：超上游合法范围（393216）钳到 390000（不再白撞 400）', () => {
+    // 实测上游报错 "Invalid max_tokens value, the valid range of max_tokens is [1, 393216]"
+    const out = normalizeAnthropicRequest(
+      { model: 'm', thinking: { type: 'enabled' }, max_tokens: 500000 },
+      EMPTY_MAP,
+      DEFAULT_FALLBACK_MODEL,
+    );
+    expect(out.max_tokens).toBe(390000);
   });
 
   it('adaptive thinking 归一化后同样抬升 max_tokens', () => {

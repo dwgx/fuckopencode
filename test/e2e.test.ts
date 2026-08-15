@@ -2,16 +2,17 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, request as httpRequest, type Server } from 'node:http';
+import type { Socket } from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApp, MAX_LOGIN_FAIL_KEYS, MAX_REVOKED_SESSIONS, loginFailKeyCount, pruneRevokedSessions, revokedSessionCount, revokeSessionForTest, LegacyTtlCache, LEGACY_TTL_MS, type ConsoleClientLike, type ConsoleWriteResult, type LegacyBilling, type LegacyBillingReadResult, type LegacyClientLike, type LegacyGoReadResult, type LegacyGoStatus, type LegacyPlainKey, type LegacyReadResult, type LegacyWriteResult } from '../src/server.js';
+import { createApp, MAX_LOGIN_FAIL_KEYS, MAX_REVOKED_SESSIONS, configureRevokedSessions, loginFailKeyCount, pruneRevokedSessions, resetRevokedSessionsForTest, revokedSessionCount, revokeSessionForTest, LegacyTtlCache, LEGACY_TTL_MS, type ConsoleClientLike, type ConsoleWriteResult, type LegacyBilling, type LegacyBillingReadResult, type LegacyClientLike, type LegacyGoReadResult, type LegacyGoStatus, type LegacyPlainKey, type LegacyReadResult, type LegacyWriteResult } from '../src/server.js';
 import { AccountsStore } from '../src/accounts.js';
 import { LegacyPlainCache } from '../src/legacy.js';
-import { UsageDb } from '../src/usagedb.js';
+import { UsageDb, type UsageRow } from '../src/usagedb.js';
 import { loadSecret } from '../src/secrets.js';
 import { KeyPool, keyFingerprint } from '../src/keypool.js';
-import { postUpstreamChat } from '../src/upstream.js';
+import { circuitRecordFailure, circuitRecordSuccess, circuitReset, circuitShouldReject, circuitSnapshot, postUpstreamChat, type UpstreamCall } from '../src/upstream.js';
 import { resolveModelName, ALLOWED_MODELS } from '../src/deepseek.js';
 import { ModelAccessStore } from '../src/modelaccess.js';
 import { TokensStore } from '../src/tokens.js';
@@ -449,6 +450,49 @@ describe('v1 代理端到端', () => {
   it('错误 key 返回 401', async () => {
     const res = await call({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }, 'wrong');
     expect(res.status).toBe(401);
+  });
+
+  it('401 早退消费请求体并关连接（I-14）：带 body 的未鉴权请求响应带 connection: close', async () => {
+    // 回归：修复前纯鉴权 401 裸 sendJson 早退，不 resume + 不 close —— 带 body 的
+    // 失败请求会污染 keep-alive（body 残留被当成下一条请求解析，假 400）。
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const res = await rawRequest(port, '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers['connection']).toBe('close');
+    // 新连接上服务照常（无残留污染）。
+    const ok = await rawRequest(port, '/v1/models', { method: 'GET', headers: { authorization: 'Bearer test-key' } });
+    expect(ok.status).toBe(200);
+  });
+
+  it('415 早退消费请求体并关连接（I-14）：非 JSON Content-Type 带 body → 415 + connection: close', async () => {
+    // 415 在 readBody 前返回（同 401 的 keep-alive 污染问题）。
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const res = await rawRequest(port, '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(415);
+    expect(res.headers['connection']).toBe('close');
+    const ok = await rawRequest(port, '/v1/models', { method: 'GET', headers: { authorization: 'Bearer test-key' } });
+    expect(ok.status).toBe(200);
+  });
+
+  it('兜底 404 早退消费请求体并关连接（I-14）：未知路径带 body → 404 + connection: close', async () => {
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const res = await rawRequest(port, '/v1/unknown-path', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({ hello: 'world' }),
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers['connection']).toBe('close');
+    const ok = await rawRequest(port, '/v1/models', { method: 'GET', headers: { authorization: 'Bearer test-key' } });
+    expect(ok.status).toBe(200);
   });
 
   it('非流式：OpenAI 请求原样转发上游（同协议），响应回显请求的模型名', async () => {
@@ -1156,18 +1200,26 @@ describe('未鉴权放行模式的安全加固', () => {
     expect(raw).toMatch(/HTTP\/1\.1 200/);
   });
 
-  it('静态路径 204 消费请求体（S-P2-3 升级）：POST /favicon.ico 带 body → 204 + connection: close（不污染 keep-alive）', async () => {
-    // favicon 等浏览器自动请求的静态资源：204 静默（无内容）+ connection: close
-    // （与限流路径同款双保险：resume 消费残余 body + 干脆关连接，杜绝 keep-alive
-    // 污染）——浏览器 console 不再报 favicon 404 error。connection:close 语义下
-    // 连接不复用（真实浏览器 GET 无 body，无复用需求），用 fetch 验证 204 + 头。
+  it('静态路径：favicon 返回 opencode logo（200 svg）；其他静态资源 204 消费请求体', async () => {
+    // favicon：返回 opencode logo（svg，content-type image/svg+xml），浏览器不再报
+    // 404/空白；connection: close 排空残余 body（防 keep-alive 污染）。
     const res = await fetch(`${baseUrl}/favicon.ico`, {
       method: 'POST',
       headers: { 'content-type': 'text/plain' },
       body: 'x'.repeat(1024),
     });
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(200);
+    expect(String(res.headers.get('content-type') ?? '')).toContain('image/svg+xml');
+    expect(await res.text()).toContain('<svg');
     expect(String(res.headers.get('connection') ?? '').toLowerCase()).toContain('close');
+    // 其他静态资源（apple-touch-icon 等）：204 静默（无内容），不污染 keep-alive。
+    const res2 = await fetch(`${baseUrl}/apple-touch-icon.png`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: 'x'.repeat(1024),
+    });
+    expect(res2.status).toBe(204);
+    expect(String(res2.headers.get('connection') ?? '').toLowerCase()).toContain('close');
     // 新连接上服务照常
     const models = await fetch(`${baseUrl}/v1/models`);
     expect(models.status).toBe(200);
@@ -2041,6 +2093,172 @@ describe('用量持久化接线（真实请求 -> sqlite -> /__metrics）', () =
       expect(row!.error).toContain('413');
     } finally {
       db.close();
+    }
+  });
+
+  it('count_tokens body 上限下调为 8MB（F3）：超过 8MB 但低于 maxBodyBytes 也 413', async () => {
+    // 回归：修复前 count_tokens 用数据面 maxBodyBytes（10MB）读 body —— 本地
+    // 估算用不上那么大，认证客户端洪泛时读 body 代价无界。下调到 8MB 后 9MB
+    // body（< 10MB maxBodyBytes）也应被拒。
+    const big = 'x'.repeat(9 * 1024 * 1024);
+    await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: big }] }),
+    }).catch(() => {});  // socket close 是预期的（readBody 超限 req.destroy）
+
+    if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    usageDb.flush();
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
+    try {
+      const row = db
+        .prepare(
+          `SELECT status, error FROM requests
+            WHERE path = '/v1/messages/count_tokens' AND status = 413 ORDER BY id DESC LIMIT 1`,
+        )
+        .get() as { status: number; error: string | null } | undefined;
+      expect(row).toBeDefined();
+      expect(row!.error).toContain('413');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('FurCDN-OriginRecovery 回源探针归入观测口径（endpoint=probe，不入失败率聚合）', async () => {
+    // 回归：修复前 FurCDN 回源探针（UA 特征，无鉴权，每 ~12s 一次）落 requests
+    // 表 404/401，把 24h 失败率虚高到 32%。归入 probe 口径后聚合排除，详细页仍可见。
+    const res = await fetch(`${baseUrl}/`, {
+      method: 'GET',
+      headers: { 'user-agent': 'FurCDN-OriginRecovery/1.0' },
+    });
+    // 探针会拿到 404（无此路由）——重点不是状态码，是它被标成 probe。
+    expect([401, 404, 200]).toContain(res.status);
+
+    if (!fs.existsSync(dbCfg.usageDbPath)) return;  // Node 20 无 sqlite
+    usageDb.flush();
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbCfg.usageDbPath, { readOnly: true });
+    try {
+      const row = db
+        .prepare(`SELECT endpoint, ua FROM requests WHERE ua LIKE '%FurCDN-OriginRecovery%' ORDER BY id DESC LIMIT 1`)
+        .get() as { endpoint: string; ua: string } | undefined;
+      expect(row).toBeDefined();
+      expect(row!.endpoint).toBe('probe');
+      // 聚合口径里 probe 被排除：请求行在「非观测流量」计数里不可见。
+      const agg = db
+        .prepare(`SELECT COUNT(*) AS n FROM requests WHERE endpoint NOT IN ('probe','count_tokens') AND ua LIKE '%FurCDN-OriginRecovery%'`)
+        .get() as { n: number };
+      expect(agg.n).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe('count_tokens 轻量并发门（F3：10 在飞，超限 429 + Retry-After）', () => {
+  let proxy: Server;
+  let baseUrl: string;
+
+  const ctCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: [],
+    anthropicApiKey: 'sk-ant-fake',
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: true,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    proxy = createApp(ctCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+  });
+
+  it('10 个 count_tokens 在飞（readBody 挂起）时，第 11 个 429 + retry-after，释放后恢复', async () => {
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const net = require('node:net') as typeof import('node:net');
+    // 挂起请求：声明大 Content-Length 但只发头部 + 少量 body —— readBody 等 end
+    // 30s 超时，请求保持「在飞」，占住 count_tokens 并发门。
+    const hangCount = 10;
+    const sockPromise = (): Promise<Socket> =>
+      new Promise((resolve, reject) => {
+        const s = net.connect({ host: '127.0.0.1', port }, () => {
+          s.write(
+            `POST /v1/messages/count_tokens HTTP/1.1\r\n` +
+              `Host: 127.0.0.1\r\n` +
+              `Content-Type: application/json\r\n` +
+              `Content-Length: 100000\r\n` +
+              `\r\n` +
+              `{"model":"gpt-4o","messages":[{"role":"user","content":"`,
+          );
+          resolve(s);
+        });
+        s.on('error', reject);
+      });
+    const socks: Socket[] = [];
+    try {
+      for (let i = 0; i < hangCount; i++) {
+        socks.push(await sockPromise());
+      }      // 等所有挂起请求都进入 readBody（在飞计数已到 10）。
+      await new Promise((r) => setTimeout(r, 100));
+
+      // 第 11 个 → 429 + retry-after + connection: close（限流语义）。
+      const over = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'over' }] }),
+      });
+      expect(over.status).toBe(429);
+      expect(over.headers.get('retry-after')).toBe('1');
+      expect(String(over.headers.get('connection') ?? '').toLowerCase()).toContain('close');
+
+      // 释放一个挂起 → 计数回落，新请求恢复 200。
+      socks.pop()!.destroy();
+      await new Promise((r) => setTimeout(r, 150));
+      const ok = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'after-release' }] }),
+      });
+      expect(ok.status).toBe(200);
+    } finally {
+      for (const s of socks) s.destroy();
     }
   });
 });
@@ -4725,6 +4943,87 @@ describe('面板账号密码登录（/__admin/api/login）', () => {
     }
   });
 
+  it('m3：登出撤销持久化 —— 模拟重启（清空内存黑名单）后已登出的旧会话仍被拒（data/revoked-sessions.json）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-revoke-persist-'));
+    let a: Server | null = null;
+    let b: Server | null = null;
+    try {
+      const cfg = startLoginStack();
+      // 稳定会话密钥：重启后旧签名仍可验签（否则 401 是「密钥换了」不是「撤销生效」）。
+      cfg.gatewaySecret = 'revoke-persist-test-secret';
+      // 非空 usageDbPath → createApp 把撤销黑名单持久化到 dir/revoked-sessions.json。
+      cfg.usageDbPath = path.join(dir, 'usage.db');
+      const ip = '203.0.113.90'; // 唯一 IP，防登录限速键与其它用例串。
+
+      // 第一进程：登录 → 拿会话 → 登出（撤销写盘）。
+      a = createApp(cfg, undefined, undefined, null);
+      await new Promise<void>((resolve) => a!.listen(0, '127.0.0.1', resolve));
+      baseUrl = `http://127.0.0.1:${(a!.address() as { port: number }).port}`;
+      const login = await loginPost({ username: 'admin', password: 'thankyouopencode' }, { 'cf-connecting-ip': ip });
+      expect(login.status).toBe(200);
+      const token = /fc_admin_session=([0-9a-f]{64}\.\d+)/.exec(login.headers.get('set-cookie') ?? '')?.[1]!;
+      expect(token).toBeTruthy();
+      expect(
+        (await fetch(`${baseUrl}/__admin/api/accounts`, { headers: { cookie: `fc_admin_session=${token}` } })).status,
+      ).toBe(200);
+      await fetch(`${baseUrl}/__admin/api/logout`, { method: 'POST', headers: { cookie: `fc_admin_session=${token}` } });
+      await new Promise<void>((resolve) => a!.close(() => resolve()));
+      a = null;
+
+      // 模拟进程重启：内存黑名单清空（持久化文件不动）。旧实现（纯内存）此时会「复活」token。
+      resetRevokedSessionsForTest();
+
+      // 第二进程：启动时从 revoked-sessions.json 读回撤销 → 旧会话仍被拒。
+      b = createApp(cfg, undefined, undefined, null);
+      await new Promise<void>((resolve) => b!.listen(0, '127.0.0.1', resolve));
+      baseUrl = `http://127.0.0.1:${(b!.address() as { port: number }).port}`;
+      const after = await fetch(`${baseUrl}/__admin/api/accounts`, { headers: { cookie: `fc_admin_session=${token}` } });
+      expect(after.status).toBe(401);
+    } finally {
+      configureRevokedSessions(null); // 恢复内存态：后续用例的登出不再写这个已删的 tmp 目录
+      if (a) { const srv = a; await new Promise<void>((resolve) => srv.close(() => resolve())); }
+      if (b) { const srv = b; await new Promise<void>((resolve) => srv.close(() => resolve())); }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('m3.5：persistDir 路径统一 —— 撤销落到 <persistDir>/revoked-sessions.json，不随 USAGE_DB_PATH（关 DB 仍持久化）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-revoke-persistdir-'));
+    let a: Server | null = null;
+    try {
+      const cfg = startLoginStack();
+      // 稳定会话密钥：保证签名可复现（本次只在单进程内断言文件内容，密钥稳定更严谨）。
+      cfg.gatewaySecret = 'revoke-persistdir-test-secret';
+      // 关 DB（usageDbPath=''）：旧实现会静默关闭撤销持久化；传 persistDir 后仍落盘。
+      cfg.usageDbPath = '';
+      const ip = '203.0.113.99'; // 唯一 IP，防登录限速键与其它用例串。
+      const persistDir = path.join(dir, 'data'); // 与 pool-disabled/model-blocks 同目录语义
+
+      a = createApp(
+        cfg, undefined, undefined, null,
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, persistDir, // 第 13 个参数 otaRootOverride 之后：persistDir
+      );
+      await new Promise<void>((resolve) => a!.listen(0, '127.0.0.1', resolve));
+      baseUrl = `http://127.0.0.1:${(a!.address() as { port: number }).port}`;
+      const login = await loginPost({ username: 'admin', password: 'thankyouopencode' }, { 'cf-connecting-ip': ip });
+      expect(login.status).toBe(200);
+      const token = /fc_admin_session=([0-9a-f]{64}\.\d+)/.exec(login.headers.get('set-cookie') ?? '')?.[1]!;
+      expect(token).toBeTruthy();
+      await fetch(`${baseUrl}/__admin/api/logout`, { method: 'POST', headers: { cookie: `fc_admin_session=${token}` } });
+
+      // 文件在 persistDir 下（usageDbPath='' 时 usage.db 目录不存在 —— 正是旧行为的分裂点）。
+      const file = path.join(persistDir, 'revoked-sessions.json');
+      expect(fs.existsSync(file)).toBe(true);
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, number>;
+      expect(Object.keys(parsed)).toContain(token.split('.')[0]!);
+    } finally {
+      configureRevokedSessions(null); // 恢复内存态：后续用例的登出不再写这个已删的 tmp 目录
+      if (a) { const srv = a; await new Promise<void>((resolve) => srv.close(() => resolve())); }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('m4：跨站表单登录被 Origin 校验拒绝（不能锁受害者 IP）', async () => {
     const cfg = startLoginStack();
     proxy = createApp(cfg, undefined, undefined, null);
@@ -5567,6 +5866,51 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
     });
   });
 
+  it('PUT go-toggle（前端契约）：单键 200 + 透传；双键/无键 400', async () => {
+    client.calls = [];
+    // 只带 useBalance
+    const r1 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go-toggle`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ useBalance: true }),
+    });
+    expect(r1.status).toBe(200);
+    expect(client.calls[0]).toEqual({
+      method: 'setGoToggle', cookie: 'auth=legacy-secret', ws: 'wrk_01KZEQCBJ59Y3T34CSJNRVQJV7', toggle: 'useBalance', value: true,
+    });
+    // 只带 chinaModels
+    client.calls = [];
+    const r2 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go-toggle`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chinaModels: false }),
+    });
+    expect(r2.status).toBe(200);
+    expect(client.calls[0]!.toggle).toBe('chinaModels');
+    expect(client.calls[0]!.value).toBe(false);
+    // 双键 → 400
+    const r3 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go-toggle`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ useBalance: true, chinaModels: true }),
+    });
+    expect(r3.status).toBe(400);
+    // 无键 → 400
+    const r4 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go-toggle`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(r4.status).toBe(400);
+    // 非 JSON body → 400
+    const r5 = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go-toggle`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: 'not-json',
+    });
+    expect(r5.status).toBe(400);
+  });
+
   it('Go 写操作跨源 Origin → 403；GET go 读不受 Origin 限制', async () => {
     const evil = await fetch(`${baseUrl}/__admin/api/legacy/account/${aId}/go/use-balance`, {
       method: 'POST',
@@ -5804,6 +6148,254 @@ describe('旧版控制台 key 端点（/__admin/api/legacy）', () => {
     expect(badId.status).toBe(400);
   });
 });
+
+describe('key 详情服务端（/__admin/api/keys/usage + 手动启停）', () => {
+  let proxy: Server;
+  let baseUrl: string;
+  let tmpDir: string;
+  let db: UsageDb;
+  let store: AccountsStore;
+  let pool: KeyPool;
+  /** 池 key / 池外 legacy key / 未归属池 key 的明文与指纹。 */
+  const KEY_A = 'sk-key-a-0osU';      // 入池 + 归 acc1
+  const KEY_B = 'sk-key-b-7qpF';      // 入池 + 未归属（accountId 0 → env）
+  const KEY_LEGACY = 'sk-legacy-9zXc'; // 池外 legacy key（acc1 的 Default API Key）
+  const KEY_Z = 'sk-key-z-0000';      // 入池 + 无任何请求（补零验证）
+  const FP_A = '****0osU';
+  const FP_B = '****7qpF';
+  const FP_LEGACY = '****9zXc';
+  const FP_Z = '****0000';
+  let accId = 0;
+
+  const keyCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['admin-key'],
+    anthropicApiKey: null,
+    upstreamKeys: [],
+    keyFailThreshold: 5,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: true,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: 'e2e-keydetail-secret',
+    secretFilePath: '/dev/null',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  function seed(at: number, fp: string, over: Partial<UsageRow> = {}): void {
+    db.recordRequest({
+      at,
+      keyFingerprint: fp,
+      model: 'claude-mythos-5',
+      upstreamModel: 'deepseek-v4-flash',
+      endpoint: 'subscription',
+      status: 200,
+      durationMs: 10,
+      stream: false,
+      inputTokens: 10,
+      outputTokens: 20,
+      thinkingTokens: 0,
+      error: null,
+      path: '/v1/messages',
+      ua: 'claude-cli/1.0.27',
+      ...over,
+    });
+  }
+
+  beforeAll(async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-e2e-keydetail-'));
+    const db0 = new UsageDb(path.join(tmpDir, 'keydetail.db'), 30, () => {});
+    const secret = loadSecret({ gatewaySecret: 'e2e-keydetail-secret', secretFilePath: '/dev/null' } as unknown as AppConfig)!;
+    const store0 = new AccountsStore(db0, secret, keyCfg, () => {});
+    const pool0 = new KeyPool([], {
+      cooldownMs: keyCfg.keyCooldownMs,
+      failThreshold: keyCfg.keyFailThreshold,
+    });
+    db = db0;
+    store = store0;
+    pool = pool0;
+    // 账户 1：入池 key A + 池外 legacy key。
+    const created = store.create({ name: '主力号', kind: 'unknown', workspaceId: null, keys: [KEY_A], cookie: null });
+    accId = created.ok ? created.value.id : 0;
+    expect(store.setLegacyKey(accId, KEY_LEGACY)).toBe(true);
+    pool.addKey(KEY_A, accId);
+    pool.addKey(KEY_B, 0);
+    pool.addKey(KEY_Z, accId);
+    proxy = createApp(keyCfg, pool0, db0, store0);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    db.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('GET /keys/usage：池 key + 池外 legacy key 全量列出，用量聚合排除 probe/count_tokens/超窗/未知指纹', async () => {
+    const now = Date.now();
+    // ****0osU（池 key）：1 ok + 1 failed(429) + 1 count_tokens（排除）+ 1 超窗（排除）。
+    seed(now - 2 * 86_400_000, FP_A, { status: 200, inputTokens: 10, outputTokens: 20, costMicroCents: 100 });
+    seed(now - 1 * 86_400_000, FP_A, { status: 429, inputTokens: 0, outputTokens: 0, costMicroCents: 50 });
+    seed(now - 1 * 86_400_000, FP_A, { endpoint: 'count_tokens', status: 200, inputTokens: 5000, costMicroCents: 999 });
+    seed(now - 30 * 86_400_000, FP_A, { costMicroCents: 777 });
+    // ****7qpF（未归属池 key）：1 ok + 1 probe（排除）。
+    seed(now - 1 * 86_400_000, FP_B, { inputTokens: 5, outputTokens: 5, costMicroCents: 300 });
+    seed(now - 1 * 86_400_000, FP_B, { endpoint: 'probe', status: 429, costMicroCents: 888 });
+    // ****9zXc（池外 legacy key）：1 ok。
+    seed(now - 1 * 86_400_000, FP_LEGACY, { inputTokens: 1, outputTokens: 1, costMicroCents: 7 });
+    // 未知指纹（不在池也不在 legacy）：不该出现在列表。
+    seed(now - 1 * 86_400_000, '****nope', { costMicroCents: 666 });
+
+    const res = await fetch(`${baseUrl}/__admin/api/keys/usage?rangeDays=7`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      data: { rangeDays: number; sinceMs: number; keys: Array<Record<string, unknown>> };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.data.rangeDays).toBe(7);
+    const byFp = new Map(body.data.keys.map((k) => [k.fingerprint, k]));
+    // 池 3 key（A/B/Z）+ 池外 legacy 1 = 4。Z 无请求也列出（补零）。
+    expect(byFp.size).toBe(4);
+    expect(body.data.keys.map((k) => k.fingerprint).sort()).toEqual([FP_A, FP_B, FP_Z, FP_LEGACY].sort());
+
+    const a = byFp.get(FP_A)!;
+    expect(a.accountId).toBe(accId);
+    expect(a.accountName).toBe('主力号');
+    expect(a.healthy).toBe(true);
+    expect(a.requests).toBe(2);
+    expect(a.ok).toBe(1);
+    expect(a.failed).toBe(1);
+    expect(a.inputTokens).toBe(10);
+    expect(a.outputTokens).toBe(20);
+    expect(a.tokens).toBe(30);
+    expect(a.costMicroCents).toBe(150);
+    expect(typeof a.lastAt).toBe('number');
+
+    const b = byFp.get(FP_B)!;
+    expect(b.accountId).toBe(0);
+    expect(b.accountName).toBe('env');
+    expect(b.requests).toBe(1);
+    expect(b.ok).toBe(1);
+    expect(b.costMicroCents).toBe(300); // probe 的 888 不算
+
+    const lg = byFp.get(FP_LEGACY)!;
+    expect(lg.accountId).toBe(accId);
+    expect(lg.accountName).toBe('主力号');
+    expect(lg.healthy).toBeNull(); // 池外 legacy key 无 pool 健康态
+    expect(lg.recoverInMs).toBe(0);
+    expect(lg.requests).toBe(1);
+    expect(lg.costMicroCents).toBe(7);
+  });
+
+  it('GET /keys/usage：窗口内无请求的 key 补零（lastAt=0），rangeDays 上限/非法兜底', async () => {
+    const res = await fetch(`${baseUrl}/__admin/api/keys/usage?rangeDays=90`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { rangeDays: number; keys: Array<Record<string, unknown>> } };
+    expect(body.data.rangeDays).toBe(90);
+    // ****0000 无任何请求：仍列出但补零（前端 key 详情能看到所有池 key）。
+    const z = body.data.keys.find((k) => k.fingerprint === FP_Z);
+    expect(z).toBeDefined();
+    expect(z!.requests).toBe(0);
+    expect(z!.tokens).toBe(0);
+    expect(z!.costMicroCents).toBe(0);
+    expect(z!.lastAt).toBe(0);
+    expect(z!.accountName).toBe('主力号');
+    // 非法 rangeDays → 兜底 7。
+    const bad = await fetch(`${baseUrl}/__admin/api/keys/usage?rangeDays=0`);
+    expect(((await bad.json()) as { data: { rangeDays: number } }).data.rangeDays).toBe(7);
+  });
+
+  it('GET /keys/usage：非 GET → 404；跨源 Origin → 403（读也防跨站，用量是财务级）', async () => {
+    const post = await fetch(`${baseUrl}/__admin/api/keys/usage`, { method: 'POST' });
+    expect(post.status).toBe(404);
+    const evil = await fetch(`${baseUrl}/__admin/api/keys/usage`, {
+      headers: { origin: 'https://evil.example' },
+    });
+    expect(evil.status).toBe(403);
+  });
+
+  it('POST /keys/:fp/disable：200 + 池内立即禁用（reason=manual）+ 审计；跨源 403 / 非法 fp 400 / 未知 fp 404', async () => {
+    const res = await fetch(`${baseUrl}/__admin/api/keys/${encodeURIComponent(FP_A)}/disable`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    // 池内立即生效：快照 healthy=false，reason=manual，不再参与选号。
+    const snapA = pool.snapshot().find((k) => k.fingerprint === FP_A)!;
+    expect(snapA.healthy).toBe(false);
+    expect(snapA.disabledReason).toBe('manual');
+    // 其余 key 仍健康可用，被禁的 A 不再被选中。
+    expect(pool.healthyCount).toBe(2);
+    const picked = pool.acquire();
+    expect(picked).not.toBe(KEY_A);
+    pool.release(picked);
+
+    // 审计落表（op=key.disable，accountId=key 归属账号）。
+    const { DatabaseSync } = await import('node:sqlite');
+    const raw = new DatabaseSync(path.join(tmpDir, 'keydetail.db'), { readOnly: true });
+    const rows = raw
+      .prepare("SELECT op, account_id, ok, note FROM admin_audit WHERE op = 'key.disable' ORDER BY id DESC LIMIT 1")
+      .all() as Array<{ op: string; account_id: number; ok: number; note: string }>;
+    raw.close();
+    expect(rows[0]).toEqual({ op: 'key.disable', account_id: accId, ok: 1, note: FP_A });
+
+    // 跨源写 → 403。
+    const evil = await fetch(`${baseUrl}/__admin/api/keys/${encodeURIComponent(FP_B)}/disable`, {
+      method: 'POST',
+      headers: { origin: 'https://evil.example' },
+    });
+    expect(evil.status).toBe(403);
+    // 非法指纹格式 → 400。
+    const bad = await fetch(`${baseUrl}/__admin/api/keys/nope/disable`, { method: 'POST' });
+    expect(bad.status).toBe(400);
+    // 未知指纹 → 404。
+    const missing = await fetch(`${baseUrl}/__admin/api/keys/****nope/disable`, { method: 'POST' });
+    expect(missing.status).toBe(404);
+  });
+
+  it('POST /keys/:fp/reset：200 + 池内恢复健康 + 审计', async () => {
+    const res = await fetch(`${baseUrl}/__admin/api/keys/${encodeURIComponent(FP_A)}/reset`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    const snapA = pool.snapshot().find((k) => k.fingerprint === FP_A)!;
+    expect(snapA.healthy).toBe(true);
+    expect(snapA.disabledReason).toBeUndefined();
+
+    const { DatabaseSync } = await import('node:sqlite');
+    const raw = new DatabaseSync(path.join(tmpDir, 'keydetail.db'), { readOnly: true });
+    const rows = raw
+      .prepare("SELECT op, account_id, ok, note FROM admin_audit WHERE op = 'key.reset' ORDER BY id DESC LIMIT 1")
+      .all() as Array<{ op: string; account_id: number; ok: number; note: string }>;
+    raw.close();
+    expect(rows[0]).toEqual({ op: 'key.reset', account_id: accId, ok: 1, note: FP_A });
+  });
+});
+
 
 describe('上游 key 泄漏防护（M1）', () => {
   let fake: FakeUpstream;
@@ -6114,6 +6706,249 @@ describe('postUpstreamChat 超时语义（B1：头超时不误伤长流，body �
     controller.abort();
     await expect(p).rejects.toThrow('aborted by client');
     expect(pool.snapshot()[0]!.failCount).toBe(before);
+  });
+
+  it('客户端在响应头阶段断开：不记熔断（consecutiveFailures 不变，B1）', async () => {
+    // 与「不记 transient」同源：客户端断开不是上游挂死的信号，不该累计熔断。
+    const controller = new AbortController();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('aborted by client')));
+        });
+      }),
+    );
+    circuitReset();
+    const p = postUpstreamChat(upCfg, makePool(), { model: 'deepseek-v4-flash' }, controller.signal, {}, '/v1/chat/completions', {
+      timeouts: { headerMs: 10_000, idleMs: 10_000 },
+    });
+    controller.abort();
+    await expect(p).rejects.toThrow('aborted by client');
+    expect(circuitSnapshot().consecutiveFailures).toBe(0);
+  });
+});
+
+describe('上游级熔断（B1：连续失败 trip / 4xx-5xx 不计 / 半开探测恢复）', () => {
+  beforeEach(() => {
+    circuitReset();
+    vi.unstubAllGlobals();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  // 与 postUpstreamChat 超时语义 describe 同款的 cfg（熔断默认开：字段缺省）。
+  const upCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: [],
+    anthropicApiKey: 'sk-ant-fake',
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 5,
+    keyCooldownMs: 60_000,
+    anthropicBaseUrl: 'http://upstream.invalid',
+    payAsYouGoBaseUrl: 'http://payg.invalid',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  const poolFor = (): KeyPool => new KeyPool(['sk-ant-fake'], { cooldownMs: 60_000, failThreshold: 100 });
+  const failCall = (cfg: AppConfig = upCfg, pool = poolFor()): Promise<UpstreamCall> =>
+    postUpstreamChat(cfg, pool, { model: 'deepseek-v4-flash' }, undefined, {}, '/v1/chat/completions', {
+      timeouts: { headerMs: 10_000, idleMs: 10_000 },
+    });
+
+  it('连续 5 次头超时/网络错误 → 熔断 open；少于阈值不 open', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('network down'))));
+    for (let i = 0; i < 4; i++) {
+      await expect(failCall()).rejects.toThrow('network down');
+    }
+    expect(circuitSnapshot()).toEqual({ state: 'closed', consecutiveFailures: 4 });
+    await expect(failCall()).rejects.toThrow('network down');
+    expect(circuitSnapshot().state).toBe('open');
+    // 熔断期内数据面入口判定：拒绝（server 层据此回 502）。
+    expect(circuitShouldReject(upCfg)).toBe(true);
+  });
+
+  it('上游 4xx/5xx 响应不计入熔断（fetch resolve 即算成功，只有抛错才计）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('oops', { status: 500 })));
+    for (let i = 0; i < 10; i++) {
+      const call = await postUpstreamChat(upCfg, poolFor(), { model: 'deepseek-v4-flash' }, undefined, {}, '/v1/chat/completions', {
+        timeouts: { headerMs: 10_000, idleMs: 10_000 },
+      });
+      expect(call.response.status).toBe(500);
+      call.release();
+    }
+    expect(circuitSnapshot()).toEqual({ state: 'closed', consecutiveFailures: 0 });
+    expect(circuitShouldReject(upCfg)).toBe(false);
+  });
+
+  it('熔断期过后放行一个探测请求，其余继续拒绝；探测成功 → close 恢复', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('network down'))));
+    for (let i = 0; i < 5; i++) {
+      await expect(failCall()).rejects.toThrow('network down');
+    }
+    expect(circuitSnapshot().state).toBe('open');
+    // 熔断期内（还没到期）：全拒绝。
+    expect(circuitShouldReject(upCfg)).toBe(true);
+    // 越过熔断期：放行这一个请求当探测（转入 half-open），其余继续拒绝。
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 31_000);
+    expect(circuitShouldReject(upCfg)).toBe(false);
+    expect(circuitSnapshot().state).toBe('half-open');
+    expect(circuitShouldReject(upCfg)).toBe(true);
+    // 探测请求 fetch 成功（任意状态码）→ close。
+    circuitRecordSuccess(upCfg);
+    expect(circuitSnapshot().state).toBe('closed');
+    expect(circuitShouldReject(upCfg)).toBe(false);
+  });
+
+  it('半开探测失败 → 重新 open（不回到 closed）', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('network down'))));
+    for (let i = 0; i < 5; i++) {
+      await expect(failCall()).rejects.toThrow('network down');
+    }
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 31_000);
+    expect(circuitShouldReject(upCfg)).toBe(false); // 探测放行
+    circuitRecordFailure(upCfg); // 探测请求头超时/网络错误
+    expect(circuitSnapshot().state).toBe('open');
+    expect(circuitShouldReject(upCfg)).toBe(true); // 重新熔断
+  });
+
+  it('熔断关闭（upstreamCircuitBreaker: false）：失败不累计、不 open', async () => {
+    const offCfg = { ...upCfg, upstreamCircuitBreaker: false };
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('network down'))));
+    for (let i = 0; i < 6; i++) {
+      await expect(failCall(offCfg)).rejects.toThrow('network down');
+    }
+    expect(circuitSnapshot()).toEqual({ state: 'closed', consecutiveFailures: 0 });
+    expect(circuitShouldReject(offCfg)).toBe(false);
+  });
+});
+
+describe('熔断 502 门（B1：open 期数据面请求直接 502 + Retry-After，不再打上游）', () => {
+  let proxy: Server;
+  let baseUrl: string;
+  let fetchCalls: number;
+
+  const cbCfg: AppConfig = {
+    host: '127.0.0.1',
+    port: 0,
+    apiKeys: ['test-key'],
+    anthropicApiKey: 'sk-ant-fake',
+    upstreamKeys: ['sk-ant-fake'],
+    keyFailThreshold: 100,
+    keyCooldownMs: 300_000,
+    anthropicBaseUrl: 'http://placeholder',
+    payAsYouGoBaseUrl: 'http://placeholder-payg',
+    modelMap: {},
+    fallbackModel: 'deepseek-v4-flash',
+    injectionMode: 'block',
+    allowUnauthenticated: false,
+    maxBodyBytes: 10 * 1024 * 1024,
+    maxMessageChars: 200_000, maxMessages: 4_000,
+    stripControlChars: true,
+    trustClaudeCodeHeaders: false,
+    dashboardOpen: false,
+    dashboardPublic: false,
+    usageDbPath: '',
+    usageDbRetentionDays: 30,
+    keyProbeIntervalMs: 0,
+    keyProbeIdleMs: 1_800_000,
+    keyProbeTimeoutMs: 5_000,
+    gatewaySecret: null,
+    secretFilePath: 'data/secret.key',
+    billingIntervalMs: 1_800_000,
+    billingTimeoutMs: 20_000,
+    oauthClientId: 'opencode-cli',
+    oauthConsoleUrl: 'https://console.opencode.ai',
+    scaleClientTokens: false,
+    clientTokenScale: 0.6657,
+    compactEnabled: false,
+    compactTriggerBytes: 4 * 1024 * 1024,
+    compactMaxMessageChars: 8000,
+    adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+  };
+
+  beforeAll(async () => {
+    circuitReset();
+    fetchCalls = 0;
+    proxy = createApp(cbCfg);
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const a = proxy.address();
+    baseUrl = `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    vi.unstubAllGlobals();
+    circuitReset();
+  });
+
+  it('连续 5 次上游网络错误后熔断：数据面请求 502 + retry-after: 30，且不再打上游', async () => {
+    // 客户端走 node:http（rawRequest），stub 只影响服务器侧的上游 fetch。
+    // 上游「挂死」：fetch reject（头超时/网络错误信号）。启动时的模型目录拉取
+    // 已完成（beforeAll），fetchCalls 从 0 起只数数据面上游调用。
+    fetchCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(() => {
+      fetchCalls++;
+      return Promise.reject(new Error('upstream down'));
+    }));
+    const port = Number(baseUrl.slice(baseUrl.lastIndexOf(':') + 1));
+    const body = JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] });
+    const H = { 'content-type': 'application/json', authorization: 'Bearer test-key' };
+    const chatCall = (): Promise<{ status: number; headers: Record<string, string | string[] | undefined> }> =>
+      rawRequest(port, '/v1/chat/completions', { method: 'POST', headers: H, body });
+    const before = fetchCalls;
+    for (let i = 0; i < 5; i++) {
+      const r = await chatCall();
+      expect(r.status).toBe(502); // 前 5 次：普通上游网络错误 → handler 502
+      expect(r.headers['retry-after']).toBeUndefined(); // 不是熔断门（无 retry-after）
+    }
+    expect(fetchCalls - before).toBe(5);
+    // 第 6 次：熔断门拦截 —— 502 + retry-after，且不再打上游。
+    const r6 = await chatCall();
+    expect(r6.status).toBe(502);
+    expect(r6.headers['retry-after']).toBe('30');
+    expect(fetchCalls - before).toBe(5); // 上游没被打
+    // messages 路径同样被拦（同一熔断）。
+    const m = await rawRequest(port, '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(m.status).toBe(502);
+    expect(m.headers['retry-after']).toBe('30');
+    expect(fetchCalls - before).toBe(5);
   });
 });
 
@@ -6793,19 +7628,38 @@ describe('密钥-模型授权数据面（MODEL-ACCESS §4）', () => {
     modelAccess.setCustom('api-key', sha256(API_KEY), null);
   });
 
-  it('settings 全局收窄 {free}：无自定义密钥打 flash 400（for this key）、打 free 200', async () => {
+  it('settings 全局收窄 {free}：无自定义密钥打 flash 400（message 列全局白名单）、打 free 200', async () => {
     resetConfig();
     applySettingsToConfig(cfg, { allowedModels: ['deepseek-v4-flash-free'] });
 
+    // 全局收窄后 flash 在 resolveModel 的全局门就被拒（不再走到密钥级门，
+    // message 列生效全局白名单；「for this key」路径由 token/api-key 自定义用例覆盖）。
     const denied = await chat({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }, API_KEY);
     expect(denied.status).toBe(400);
     const json = (await denied.json()) as { error: { message: string } };
-    expect(json.error.message).toContain('for this key');
+    expect(json.error.message).toContain('model "deepseek-v4-flash" is not allowed');
+    expect(json.error.message).toContain('deepseek-v4-flash-free');
 
     const ok = await chat({ model: 'deepseek-v4-flash-free', messages: [{ role: 'user', content: 'hi' }] }, API_KEY);
     expect(ok.status).toBe(200);
 
-    // 恢复：清 settings 键回硬底线。
+    // 恢复：清 settings 键回代码默认。
+    applySettingsToConfig(cfg, { allowedModels: null });
+  });
+
+  it('settings 全局扩展 {claude-opus-5}：添加的非硬底线模型过模型门、打到上游（上游裁决支持与否）', async () => {
+    resetConfig();
+    applySettingsToConfig(cfg, { allowedModels: ['deepseek-v4-flash', 'deepseek-v4-flash-free', 'claude-opus-5'] });
+
+    const before = fake.received.length;
+    const res = await chat({ model: 'claude-opus-5', messages: [{ role: 'user', content: 'hi' }] }, API_KEY);
+    expect(res.status).toBe(200);
+    // 已打到上游（fake 上游对任意模型回 200；真实上游不支持会 400/404，网关透传）。
+    expect(fake.received.length).toBe(before + 1);
+    expect(fake.received[before]!.model).toBe('claude-opus-5');
+    // 目录门不拦添加的模型（claude-opus-5 ∉ ALLOWED_MODELS，跳过 catalog gate）。
+
+    // 恢复：清 settings 键回代码默认。
     applySettingsToConfig(cfg, { allowedModels: null });
   });
 
@@ -6916,12 +7770,19 @@ describe('密钥-模型授权数据面（MODEL-ACCESS §4）', () => {
       expect(data.global.models).toEqual(['deepseek-v4-flash']);
     });
 
-    it('PUT global 硬底线外 400（不落库）；空数组等价清键回代码默认', async () => {
-      const bad = await adminPut('/__admin/api/model-access/global', { models: ['glm-5'] });
+    it('PUT global 非法格式 400（不落库）；非硬底线模型可扩展 200；空数组等价清键回代码默认', async () => {
+      // 非法格式（大写/空格）→ 400；glm-5 现在是合法模型名（可扩展），200。
+      const bad = await adminPut('/__admin/api/model-access/global', { models: ['Glm-5'] });
       expect(bad.status).toBe(400);
       expect((await bad.json()) as { error: { message: string } }).toMatchObject({
-        error: { message: expect.stringContaining('hard allowlist') },
+        error: { message: expect.stringContaining('invalid model name') },
       });
+      expect(settings.get('allowedModels')).toBeNull();
+
+      const expand = await adminPut('/__admin/api/model-access/global', { models: ['glm-5'] });
+      expect(expand.status).toBe(200);
+      expect(settings.get('allowedModels')).toBe(JSON.stringify(['glm-5']));
+      await adminPut('/__admin/api/model-access/global', { models: null });
       expect(settings.get('allowedModels')).toBeNull();
 
       const empty = await adminPut('/__admin/api/model-access/global', { models: [] });
@@ -6959,14 +7820,17 @@ describe('密钥-模型授权数据面（MODEL-ACCESS §4）', () => {
       expect(modelAccess.getCustom('token', fp)).toBeNull();
     });
 
-    it('PUT keys api-key：合法 200；硬底线外 400；清除', async () => {
+    it('PUT keys api-key：合法 200；非法格式 400；清除', async () => {
       const subject = sha256(API_KEY);
       const res = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: ['deepseek-v4-flash-free'] });
       expect(res.status).toBe(200);
       expect(modelAccess.getCustom('api-key', subject)).toEqual(['deepseek-v4-flash-free']);
       expect(lastAudit('model-access.key')).toMatchObject({ ok: 1, note: `api-key:${subject.slice(-8)}` });
 
-      const bad = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: ['glm-5'] });
+      // 非硬底线模型（glm-5）现在可授权；非法格式（大写）才 400。
+      const okExpand = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: ['glm-5'] });
+      expect(okExpand.status).toBe(200);
+      const bad = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: ['Glm-5'] });
       expect(bad.status).toBe(400);
 
       const clear = await adminPut(`/__admin/api/model-access/keys/api-key/${subject}`, { models: null });
@@ -6997,5 +7861,166 @@ describe('密钥-模型授权数据面（MODEL-ACCESS §4）', () => {
       const res = await adminPut('/__admin/api/model-access/keys/bogus/xyz', { models: ['deepseek-v4-flash'] });
       expect(res.status).toBe(400);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 本地 429 语义（审计 P1）：RPM 限流 / 分发配额耗尽的 429（两路径 body 不变，
+// Anthropic 客户端仍认 rate_limit_error）。X-Error-Scope 头已删 —— 全仓库零
+// 消费者（Claude Code / kirostudio 不读自定义头），只保留 retry-after 与 body。
+// ---------------------------------------------------------------------------
+
+describe('本地 429 端到端（RPM / 配额 × chat / messages）', () => {
+  let fake: FakeUpstream;
+  let tmpDir: string;
+
+  beforeAll(async () => {
+    fake = await startFakeUpstream();
+  });
+  afterAll(async () => {
+    await new Promise<void>((r) => fake.server.close(() => r()));
+  });
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-e2e-scope-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** 新库新 app：限流/配额实例独立，用例间不串值。 */
+  async function freshStack() {
+    const db = new UsageDb(path.join(tmpDir, `u-${Math.random().toString(36).slice(2)}.db`), 30, () => {});
+    const cfg: AppConfig = {
+      host: '127.0.0.1',
+      port: 0,
+      apiKeys: ['scope-admin-key'],
+      anthropicApiKey: 'sk-ant-fake',
+      upstreamKeys: ['sk-ant-fake'],
+      keyFailThreshold: 5,
+      keyCooldownMs: 300_000,
+      anthropicBaseUrl: fake.baseUrl,
+      payAsYouGoBaseUrl: fake.baseUrl,
+      modelMap: { 'gpt-4o': 'deepseek-v4-flash' },
+      fallbackModel: 'deepseek-v4-flash',
+      injectionMode: 'block',
+      allowUnauthenticated: false,
+      maxBodyBytes: 10 * 1024 * 1024,
+      maxMessageChars: 200_000, maxMessages: 4_000,
+      stripControlChars: true,
+      trustClaudeCodeHeaders: false,
+      dashboardOpen: false,
+      dashboardPublic: false,
+      usageDbPath: '',
+      usageDbRetentionDays: 30,
+      keyProbeIntervalMs: 0,
+      keyProbeIdleMs: 1_800_000,
+      keyProbeTimeoutMs: 5_000,
+      gatewaySecret: null,
+      secretFilePath: '/dev/null',
+      billingIntervalMs: 1_800_000,
+      billingTimeoutMs: 20_000,
+      oauthClientId: 'opencode-cli',
+      oauthConsoleUrl: 'https://console.opencode.ai',
+      scaleClientTokens: false,
+      clientTokenScale: 0.6657,
+      compactEnabled: false,
+      compactTriggerBytes: 4 * 1024 * 1024,
+      compactMaxMessageChars: 8000,
+      adminUser: 'admin', adminPass: 'thankyouopencode', adminSessionTtlMs: 86_400_000, adminLoginFailLimit: 5, adminLoginLockMs: 300_000,
+    };
+    const store = new TokensStore(db);
+    const server = createApp(cfg, undefined, db, null, undefined, undefined, undefined, undefined, store);
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const a = server.address();
+    return {
+      db,
+      store,
+      server,
+      baseUrl: `http://127.0.0.1:${typeof a === 'object' && a ? a.port : 0}`,
+      close: async () => {
+        await new Promise<void>((r) => server.close(() => r()));
+        db.close();
+      },
+    };
+  }
+
+  const chatReq = (token: string, baseUrl: string): Promise<Response> =>
+    fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'x-api-key': token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+  const messagesReq = (token: string, baseUrl: string): Promise<Response> =>
+    fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'x-api-key': token, 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'gpt-4o', max_tokens: 50, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+  const waitFor = async (cond: () => boolean, ms = 2000): Promise<void> => {
+    const start = Date.now();
+    while (!cond()) {
+      if (Date.now() - start > ms) throw new Error('waitFor timeout');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+
+  it('RPM 超限：chat 与 messages 的 429 都带 retry-after（body 协议对应不变）', async () => {
+    const s = await freshStack();
+    try {
+      const created = s.store.create('scope-rpm', null);
+      if (!created.ok) throw new Error('create failed');
+      const { id, token } = created.value;
+      const patch = await fetch(`${s.baseUrl}/__admin/api/tokens/${id}`, {
+        method: 'PATCH',
+        headers: { 'x-api-key': 'scope-admin-key', 'content-type': 'application/json' },
+        body: JSON.stringify({ rpmLimit: 1 }),
+      });
+      expect(patch.status).toBe(200);
+
+      // 占掉唯一的窗口槽位（chat 200 打到 fake 上游），再请求必 429。
+      expect((await chatReq(token, s.baseUrl)).status).toBe(200);
+      const chat429 = await chatReq(token, s.baseUrl);
+      expect(chat429.status).toBe(429);
+      expect(Number(chat429.headers.get('retry-after'))).toBeGreaterThan(0);
+      const chatBody = (await chat429.json()) as { error: { type: string } };
+      expect(chatBody.error.type).toBe('rate_limit_error');
+
+      // messages 路径：独立限流窗口（新 token）—— 同一 token 已经撞 RPM，直接 429。
+      const m429 = await messagesReq(token, s.baseUrl);
+      expect(m429.status).toBe(429);
+      const mBody = (await m429.json()) as { type: string; error: { type: string } };
+      expect(mBody.type).toBe('error');
+      expect(mBody.error.type).toBe('rate_limit_error');
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('配额耗尽：chat 与 messages 的 429 body 按协议分形', async () => {
+    const s = await freshStack();
+    try {
+      const created = s.store.create('scope-quota', null, undefined, { quotaRequests: 1 });
+      if (!created.ok) throw new Error('create failed');
+      const { id, token } = created.value;
+
+      // chat：配额内 200，耗尽后再打 429。
+      expect((await chatReq(token, s.baseUrl)).status).toBe(200);
+      await waitFor(() => s.store.get(id)!.quota.usedRequests === 1);
+      const chat429 = await chatReq(token, s.baseUrl);
+      expect(chat429.status).toBe(429);
+      const chatBody = (await chat429.json()) as { error: { type: string } };
+      expect(chatBody.error.type).toBe('insufficient_quota');
+
+      // messages：同一个已耗尽的 token，429，body 仍是 Anthropic 兼容的 rate_limit_error。
+      const m429 = await messagesReq(token, s.baseUrl);
+      expect(m429.status).toBe(429);
+      const mBody = (await m429.json()) as { type: string; error: { type: string } };
+      expect(mBody.type).toBe('error');
+      expect(mBody.error.type).toBe('rate_limit_error');
+    } finally {
+      await s.close();
+    }
   });
 });
