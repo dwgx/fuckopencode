@@ -215,6 +215,13 @@ CLIENT_FAULT_BODY_MARKERS = (
     "message content violates content policy",
     # 网关 JSON 解析失败：请求体本身就坏，重试不会变好。
     "invalid JSON body",
+    # 模型门确定性拒绝（MODEL-ACCESS / 全局白名单 / 账号级）：`model "xxx"
+    # is not allowed (supported models: ...)`。换号/重试多少次都是同一个 400
+    # —— 2026-08-15 日志深挖：这类 400 曾落进 auth/risk 长窗（90s 预算，
+    # 5s→32.8s 升档）被吸收，客户端挂 90 秒才收到错误（claude-fable-5 被拒
+    # 时段 19:22-19:31 连续 3 个 auth-wait 窗口）。归 client 超短窗快速收敛。
+    # "is not allowed" 与跨站 403 的 "are not allowed" 措辞区分，只命中模型门。
+    "is not allowed",
 )
 
 # 这些 4xx 是**客户端自己**的问题，与上游无关，永不重试。

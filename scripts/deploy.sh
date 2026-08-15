@@ -20,7 +20,7 @@ REMOTE="/root/fuckopencode"
 rollback() {
   echo ">> 回滚到上一个 dist.prev ..."
   ssh ${SSHOPTS} "${HOST}" \
-    "cd ${REMOTE} && test -d dist.prev && rm -rf dist && mv dist.prev dist && systemctl restart fuckopencode && sleep 3 && systemctl is-active fuckopencode" \
+    "cd ${REMOTE} && test -d dist.prev && test -f dist.prev/keypool.js || { echo 'FATAL: dist.prev 缺失或不完整（缺 keypool.js），中止回滚'; exit 1; } && rm -rf dist && mv dist.prev dist && rm -f fuckopencode.boot_attempts && systemctl restart fuckopencode && sleep 3 && systemctl is-active fuckopencode" \
     || die "回滚失败"
   echo "  OK 回滚完成"
   exit 0
@@ -67,17 +67,19 @@ test -f dist.new/dsml.js || { echo "FATAL: dsml.js 缺失"; exit 1; }
 rm -rf dist.prev
 if [ -d dist ]; then mv dist dist.prev; fi
 mv dist.new dist
+# 审查 M-2：主部署也清 boot 计数 —— 否则 OTA 后新版本曾崩过 2 次（计数 2），
+# 手动部署 restart 触发 ExecStartPre 计数变 3 + 刚造出的 dist.prev，
+# 守卫会把刚部署的新版当坏版回滚掉。
+rm -f fuckopencode.boot_attempts
 systemctl restart fuckopencode
 sleep 3
 systemctl is-active fuckopencode || { echo "FATAL: 服务未起来"; exit 1; }
 EOF
 
 echo ">> 健康检查 ..."
-# 8788 是网关本体，8787 是盾（盾在网关前面，见 .claude/docs/SHIELD.md）。
-# 两处都查：网关单独 OK 才说明这次部署没问题，经盾 OK 才说明整条公网链路通。
-ssh ${SSHOPTS} "${HOST}" "curl -s -m 5 http://127.0.0.1:8788/healthz" | grep -q ok \
-  || die "网关 8788 健康检查失败"
-echo "  OK 网关 8788"
-ssh ${SSHOPTS} "${HOST}" "curl -s -m 8 http://127.0.0.1:8787/healthz" | grep -q ok \
-  || echo "  WARN 经盾 8787 未通 —— 盾可能没起来，查 systemctl status fuckopencode-shield"
+# 去盾后（2026-08-15）：fuckopencode-shield 已停，网关监听 0.0.0.0:8787（原盾端口），
+# FurCDN 直连网关，链路里不再有盾。只查 8787 网关即可。
+ssh ${SSHOPTS} "${HOST}" "curl -s -m 5 http://127.0.0.1:8787/healthz" | grep -q ok \
+  || die "网关 8787 健康检查失败"
+echo "  OK 网关 8787"
 echo "  OK 部署完成"

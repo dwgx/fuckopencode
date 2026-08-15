@@ -224,6 +224,32 @@ def case_content_policy_fast():
         shield.kill(); up.shutdown()
 
 
+MODEL_NOT_ALLOWED = json.dumps({
+    "error": {
+        "message": 'model "claude-fable-5" is not allowed (supported models: deepseek-v4-flash, deepseek-v4-flash-free)',
+        "type": "invalid_request_error",
+    },
+})
+
+
+def case_model_not_allowed_fast():
+    """模型门确定性拒绝（400 is not allowed）不该被 auth/risk 长窗拖 90 秒。
+
+    2026-08-15 日志深挖：claude-fable-5 被模型门拒的时段，盾把这类 400 当
+    auth/risk 吸收（90s 预算，5s→32.8s 升档），客户端每个请求挂 ~90s 才收到
+    错误。模型拒绝换号/重试多少次都是同一个 400，必须归 client 超短窗。
+    """
+    up, up_port = start_fake([(400, MODEL_NOT_ALLOWED)] * 20)
+    shield, sh_port = start_shield(up_port)
+    try:
+        status, body, elapsed = call(sh_port)
+        check("400 模型门拒绝快速收敛（不拖 auth 长窗）",
+              elapsed < 15,
+              f"status={status} 耗时={elapsed:.1f}s（auth 长窗会是 25s+）")
+    finally:
+        shield.kill(); up.shutdown()
+
+
 def case_quota_passthrough():
     """上游额度耗尽（GoUsageLimitError）必须原样透传，不吸收不重试。
 
@@ -615,6 +641,7 @@ def main():
     case_403_client_fault_message_delivered()
     case_403_no_body_fallback()
     case_content_policy_fast()
+    case_model_not_allowed_fast()
     case_quota_passthrough()
     case_admin_401_passthrough()
     case_inference_401_still_converged()
