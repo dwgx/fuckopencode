@@ -547,3 +547,11 @@ typecheck 干净；`tokens+ratelimit+server+settings+e2e` 395/395 绿 + usagedb+
 - **待办推进**：ZOBb 已彻底移除（env 0 + 7 天零请求）✓；OTA 验收（守卫 3 场景真实环境对 + 检查链 latest=v0.3.0 已最新，真实 OTA 更新待 v0.3.1 发版后触发）；claude-fable-5 无流量（客户端已切走，保持现状）
 - **验证**：全量 **1700/1700** + typecheck + 部署 + smoke 19/19（性能回归阈值 500ms 容并行负载）
 - **遗留**：key_events 缺口待验证（下次真实 disable 核对落行）；verifyCache 惰性清理（tokens 侧）；settings PATCH 校验消息 ~8 条英文；a11y 部分
+
+### 三十三、v0.3.1 发版 + 会话收尾交接（2026-08-16）
+- **v0.3.1 已发版**：4+1 commit（feat 核心 34 文件 / chore 脚本 / docs 同步 / chore 版本号 0.3.1）全推 + tag v0.3.1 + release（dist tarball + sha256）+ **CI 全绿**（Release/CI/pages-build 全 success）+ 线上已部署 0.3.1（dist/version.txt=0.3.1、OTA current=0.3.1 latest=v0.3.1 hasUpdate=false、网关 active 健康、smoke 19/19）
+- **git 认证变更（关键交接）**：SSH key 被用户 revoke → remote 改 HTTPS + `credential.https://github.com.helper=!gh auth git-credential` + 全局 `url.git@github.com:.insteadof` 已删 → **push 直接可用（gh token）**；可选 SSH key 已生成 id_ed25519_github（pub 待用户加 GitHub）
+- **v0.3.1 内容**：配额计费 / 上游熔断（默认开）/ 全局 RPM / TPM / IP 白名单 / count_tokens 门 / 性能面板+实测 / UI 重构（收展/在飞/3行额度/spinner/a11y）/ i18n en/zh/ja 614 词条 / 三平台安装（install.ps1）/ favicon opencode logo / 绊脚石根治 / 文档同步（WORKFLOW/QUOTA/PERFORMANCE）
+- **待办推进**：ZOBb 彻底移除 ✓、OTA 验收（守卫真实环境 3 场景对）✓、claude-fable-5 无流量（保持）✓、深度研究修复（B1 熔断/B2 聚合/I-13/I-14/FurCDN）✓
+- **剩余低优先**：key_events 缺口核实（下次 disable 核对）、verifyCache 惰性清理、settings 校验英文 8 条、a11y 剩余、SSH key 可选配置
+- **交接**：新会话先读 .claude/state/CURRENT.md（已重写 v0.3.1 交接版）+ .claude/docs/WORKFLOW.md；git push 直接用（HTTPS+gh token）
